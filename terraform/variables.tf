@@ -222,3 +222,21 @@ variable "debug_user_enabled" {
   type        = bool
   default     = true
 }
+
+variable "buildkite_org" {
+  description = "Buildkite organization slug hosting the build-request pipeline."
+  type        = string
+  default     = "julialang"
+}
+
+variable "buildkite_pipeline" {
+  description = "Pipeline slug the farm may trigger to build a commit CI has not staged. Empty disables the build-request Lambda entirely."
+  type        = string
+  default     = ""
+}
+
+variable "buildkite_token_parameter" {
+  description = "SSM parameter holding the Buildkite API token. Terraform creates it with a placeholder and never manages the value — set it with `aws ssm put-parameter --overwrite` so no token enters state. Use a machine user whose team access is limited to the build-request pipeline."
+  type        = string
+  default     = "/pkgeval/buildkite-token"
+}

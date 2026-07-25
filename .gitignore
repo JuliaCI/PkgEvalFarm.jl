@@ -8,3 +8,6 @@ terraform/.terraform/
 bot/build/stage/
 bot/build/bootstrap.zip
 lite/Manifest.toml
+buildreq/build/stage/
+buildreq/build/bootstrap.zip
+buildreq/Manifest.toml

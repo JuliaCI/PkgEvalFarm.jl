@@ -143,11 +143,12 @@ function service_url(ctx::LiteCtx, service::String)
 end
 
 "Signed POST of an `x-amz-json-1.0` operation (DynamoDB, SQS)."
-function aws_json(ctx::LiteCtx, service::String, target::String, payload::String)
+function aws_json(ctx::LiteCtx, service::String, target::String, payload::String;
+                  content_type::String="application/x-amz-json-1.0")
     url = service_url(ctx, service)
     headers = sigv4_headers(; method="POST", host=host_of(url), path="/", body=payload,
                             region=ctx.region, service, creds=ctx.creds,
-                            content_type="application/x-amz-json-1.0",
+                            content_type,
                             extra_headers=["x-amz-target" => target])
     resp = http_request("POST", url; headers, body=payload)
     resp.status == 200 ||
@@ -359,6 +360,52 @@ function json_item(item::Item)
     end
     print(io, "}")
     return String(take!(io))
+end
+
+
+## SSM (parameters hold credentials that must never reach a worker)
+
+struct SsmParameterValue
+    Value::Union{Nothing,String}
+end
+struct SsmGetParameterResult
+    Parameter::Union{Nothing,SsmParameterValue}
+end
+
+function json_make(::Type{SsmParameterValue}, x::LazyVal)
+    value = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "Value"
+            s, p = json_string(v); value[] = s; return p
+        end
+        return nothing
+    end
+    return SsmParameterValue(value[]), pos::Int
+end
+
+function json_make(::Type{SsmGetParameterResult}, x::LazyVal)
+    param = Ref{Union{Nothing,SsmParameterValue}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "Parameter"
+            p_, p = json_make(SsmParameterValue, v); param[] = p_; return p
+        end
+        return nothing
+    end
+    return SsmGetParameterResult(param[]), pos::Int
+end
+
+"Read a (SecureString) parameter. SSM speaks JSON 1.1, unlike DynamoDB/SQS."
+function ssm_parameter(ctx::LiteCtx, name::String)
+    payload = "{\"Name\":$(JSON.json(name)),\"WithDecryption\":true}"
+    body = aws_json(ctx, "ssm", "AmazonSSM.GetParameter", payload;
+                    content_type="application/x-amz-json-1.1")
+    result = parse_json(body, SsmGetParameterResult)
+    result.Parameter === nothing && error("no such SSM parameter: $name")
+    value = something(result.Parameter).Value
+    value === nothing && error("SSM parameter has no value: $name")
+    return something(value)
 end
 
 
