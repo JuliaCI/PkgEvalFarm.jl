@@ -77,7 +77,10 @@ jobs:
     # only from the deploy branch of this repo — never from forks or PRs, which
     # is also what the role's OIDC `sub` condition enforces on the AWS side
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    environment: production
+    # NOTE: deliberately no `environment:` — declaring one changes the OIDC
+    # `sub` claim to repo:OWNER/REPO:environment:NAME, which would no longer
+    # match the role's trust policy. To add manual approval, set an environment
+    # here *and* update github_deploy_subjects to the environment form.
     permissions:
       contents: read
       id-token: write        # required to mint the OIDC token

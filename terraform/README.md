@@ -192,8 +192,36 @@ Actions → Variables) from the terraform outputs:
 | `NAME_PREFIX` | `name_prefix` (optional; defaults to `pkgeval`) |
 | `BROKER_URL` | `broker_function_url` output (optional; enables the post-deploy smoke test) |
 
-If the account already has a GitHub OIDC provider, pass its ARN as
-`github_oidc_provider_arn` — an account may only have one per issuer URL.
+Check whether the account already has a GitHub OIDC provider (only one per
+issuer URL is allowed; pass its ARN as `github_oidc_provider_arn` if so):
+
+```sh
+aws iam list-open-id-connect-providers \
+  --query "OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')].Arn" \
+  --output text
+```
+
+### What the trust policy is keyed on
+
+| Claim | Condition | Why |
+| ----- | --------- | --- |
+| `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
+| `repository_id` | `= github_repository_id` | numeric and immutable: survives renames, and a deleted repo's name being re-registered by someone else does not inherit the grant |
+| `sub` | `∈ github_deploy_subjects` | pins repo **and trigger context** |
+
+The `sub` claim is what keeps forks out. A push to master is
+`repo:OWNER/REPO:ref:refs/heads/master`; a pull request — including one from a
+fork, which runs in *this* repo's context but with the fork's workflow file — is
+`repo:OWNER/REPO:pull_request`, which matches nothing here. Belt and braces:
+GitHub caps fork-PR permissions at read-only, so such a job cannot obtain
+`id-token: write` to mint a token at all, and the workflow's own `if:` refuses
+to run the deploy job outside a master push.
+
+Caveat worth remembering: adding `environment: NAME` to the deploy job changes
+the subject to `repo:OWNER/REPO:environment:NAME`. That form is fine (and lets
+you require manual approval), but `github_deploy_subjects` must then match it,
+and the branch restriction moves into the environment's deployment branch
+policy.
 
 Terraform bootstraps the initial bundles and then defers to CI: the zip objects
 and the functions' `source_code_hash` carry `ignore_changes`, so a later

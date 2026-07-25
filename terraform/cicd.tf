@@ -31,10 +31,25 @@ resource "aws_iam_role" "deploy" {
         Principal = { Federated = local.github_oidc_arn }
         Action    = "sts:AssumeRoleWithWebIdentity"
         Condition = {
-          StringEquals = {
-            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          # only the deploy branch of the deploy repo — not forks, not PRs
+          # `aud` is pinned so a token minted for some other audience can't be
+          # replayed here; `repository_id` is the numeric repo id, which (unlike
+          # the name in `sub`) survives renames and cannot be re-claimed by
+          # deleting and re-creating a repo with the same path.
+          StringEquals = merge(
+            { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" },
+            var.github_repository_id == null ? {} :
+            { "token.actions.githubusercontent.com:repository_id" = var.github_repository_id }
+          )
+          # `sub` encodes repo + trigger context. A push to master is
+          #   repo:OWNER/REPO:ref:refs/heads/master
+          # while a pull request — including one from a fork, which runs in this
+          # repo's context with the *fork's* workflow file — is
+          #   repo:OWNER/REPO:pull_request
+          # so fork PRs cannot match this condition even if they could mint a
+          # token (GitHub also caps fork-PR permissions at read-only, so
+          # `id-token: write` is unavailable to them in the first place).
+          # NOTE: a job with `environment: X` gets sub `repo:OWNER/REPO:environment:X`
+          # instead — if you add an environment to the deploy job, this must change.
           StringLike = {
             "token.actions.githubusercontent.com:sub" = var.github_deploy_subjects
           }

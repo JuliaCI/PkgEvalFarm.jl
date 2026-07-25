@@ -159,7 +159,14 @@ variable "github_oidc_provider_arn" {
 }
 
 variable "github_deploy_subjects" {
-  description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles."
+  description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles. Push-to-branch subjects look like repo:OWNER/REPO:ref:refs/heads/BRANCH; if the deploy job declares an `environment`, the subject becomes repo:OWNER/REPO:environment:NAME instead."
   type        = list(string)
   default     = ["repo:KenoAIStaging/PkgEvalFarm.jl:ref:refs/heads/master"]
+}
+
+variable "github_repository_id" {
+  description = "Numeric id of the deploy repository, pinned in the OIDC trust policy so the grant cannot be inherited by a renamed or re-created repository of the same name. null omits the condition."
+  type        = string
+  default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
+  nullable    = true
 }
