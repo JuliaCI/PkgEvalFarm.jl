@@ -146,12 +146,32 @@ resource "aws_lambda_function" "build_request" {
   }
 }
 
-# AWS_IAM: only principals holding lambda:InvokeFunctionUrl on this function can
-# call it, which is how workers are authorized without a shared secret.
+# AWS_IAM: unauthenticated callers get 403 outright. Authorization is then
+# two-sided -- the identity policy below grants workers the action, and the
+# resource policy here names the only principals allowed to use it, so a stray
+# grant elsewhere in the account cannot reach this function.
 resource "aws_lambda_function_url" "build_request" {
   count              = local.build_request_enabled
   function_name      = aws_lambda_function.build_request[0].function_name
   authorization_type = "AWS_IAM"
+}
+
+locals {
+  # every identity that runs jobs, and nothing else
+  build_request_callers = local.build_request_enabled == 0 ? {} : merge(
+    { worker = aws_iam_role.worker.arn },
+    local.ec2_workers == 0 ? {} : { ec2_worker = aws_iam_role.ec2_worker[0].arn },
+  )
+}
+
+resource "aws_lambda_permission" "build_request_workers" {
+  for_each = local.build_request_callers
+
+  statement_id           = "AllowInvokeFrom${title(each.key)}"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.build_request[0].function_name
+  principal              = each.value
+  function_url_auth_type = "AWS_IAM"
 }
 
 resource "aws_iam_policy" "request_builds" {
