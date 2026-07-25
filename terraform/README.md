@@ -20,6 +20,10 @@ temporary AWS credentials to authorized GitHub users.
   membership in `github_org`, and vends temporary credentials by assuming the
   `<prefix>-worker` or `<prefix>-submitter` IAM role (scoped to exactly the
   queue/tables/bucket operations each side needs).
+- **`<prefix>-bot` (Lambda, optional)** — the `@nanosoldier2` bot, invoked by
+  an EventBridge schedule (`bot_schedule`, default every minute). Created only
+  when `github_bot_token` is set. Its execution role carries the submitter
+  policy directly, so it needs neither the broker nor team membership.
 
 ## Enrollment and authorization
 
@@ -52,18 +56,22 @@ There is no per-machine registration and no long-lived secrets:
 | `github_client_id` | **yes** | — | Client ID of the public GitHub OAuth app used for the device flow. |
 | `cred_duration_seconds` | no | `3600` | Lifetime of the temporary credentials the broker vends. |
 | `public_reports` | no | `true` | Make `runs/*/report/*` and `runs/*/logs/*` publicly readable. |
+| `github_bot_token` | no | `""` | Token of the bot's GitHub account; empty disables the bot Lambda. |
+| `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
+| `bot_schedule` | no | `"rate(1 minute)"` | EventBridge schedule for bot polls. |
 
 ## Deploying
 
-1. **Build the broker Lambda zip first.** The Lambda resource packages
-   `broker/build/bootstrap.zip`, which is not checked in; from the repository
-   root run:
+1. **Build the Lambda zips first.** The Lambda resources package
+   `broker/build/bootstrap.zip` (and `bot/build/bootstrap.zip` when the bot is
+   enabled), which are not checked in; from the repository root run:
 
    ```sh
-   julia --project=broker broker/build/build.jl
+   julia +1.13 --project=broker broker/build/build.jl
+   julia +1.13 --project=bot bot/build/build.jl        # only if enabling the bot
    ```
 
-   (`tofu validate` works without the zip, but `plan`/`apply` require it.)
+   (`tofu validate` works without the zips, but `plan`/`apply` require them.)
 
 2. Deploy:
 

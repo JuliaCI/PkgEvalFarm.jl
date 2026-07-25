@@ -1,6 +1,7 @@
 #!/bin/sh
-# CLI for PkgEvalFarm; see `farm help`.
+# CLI for PkgEvalFarm; see `farm help`. Set JULIA to pick a specific julia, e.g.
+# JULIA="julia +1.12".
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec julia --project="$SCRIPT_DIR" --startup-file=no -e '
+exec ${JULIA:-julia} --project="$SCRIPT_DIR" --startup-file=no -e '
     using PkgEvalFarm
     exit(PkgEvalFarm.main(collect(String, ARGS)))' -- "$@"
