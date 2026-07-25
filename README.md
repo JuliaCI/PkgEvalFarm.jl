@@ -116,11 +116,23 @@ The `broker_function_url` output is the only thing workers and the bot need
 
 ## Running the bot
 
-The `@nanosoldier2` bot is a second juliac-compiled Lambda, invoked by an EventBridge
-schedule (default: every minute); each invocation polls the bot account's GitHub
-notifications for commands and posts reports for finished runs. It is created by the
-same terraform when `github_bot_token` is set, and its execution role carries the
-submitter policy directly — no broker hop, no long-running server, no inbound network.
+The `@nanosoldier2` bot is a second juliac-compiled Lambda with three triggers:
+
+1. a **GitHub webhook** (`issue_comment` events, HMAC-verified against
+   `github_webhook_secret`) delivered to its Function URL — commands are handled the
+   moment they are posted;
+2. the **DynamoDB stream** of the runs table, filtered to runs flipping to `done` —
+   reports are posted the moment the last job finishes;
+3. an infrequent **scheduled poll** of the bot account's notifications (default:
+   hourly) as a fallback for missed webhook/stream deliveries — and as the sole
+   mechanism when no webhook can be registered (a webhook needs admin on the target
+   repo/org; polling needs no permissions there at all, which is why the original
+   Nanosoldier polled).
+
+It is created by the same terraform when `github_bot_token` is set (register the
+`bot_webhook_url` output as an `issue_comment` webhook, content type JSON, with the
+same secret). Its execution role carries the submitter policy directly — no broker
+hop, no long-running server.
 
 Mention it on a PR: `@nanosoldier2 runtests()`, `runtests(["Foo"])`, or
 `runtests(vs = ":master")`.

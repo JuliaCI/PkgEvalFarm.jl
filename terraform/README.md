@@ -20,10 +20,15 @@ temporary AWS credentials to authorized GitHub users.
   membership in `github_org`, and vends temporary credentials by assuming the
   `<prefix>-worker` or `<prefix>-submitter` IAM role (scoped to exactly the
   queue/tables/bucket operations each side needs).
-- **`<prefix>-bot` (Lambda, optional)** — the `@nanosoldier2` bot, invoked by
-  an EventBridge schedule (`bot_schedule`, default every minute). Created only
+- **`<prefix>-bot` (Lambda, optional)** — the `@nanosoldier2` bot. Created only
   when `github_bot_token` is set. Its execution role carries the submitter
   policy directly, so it needs neither the broker nor team membership.
+  Triggers: a Function URL receiving HMAC-verified GitHub `issue_comment`
+  webhooks (when `github_webhook_secret` is set; register the
+  `bot_webhook_url` output on the target repo/org — requires admin there), the
+  runs table's DynamoDB stream (filtered to `status = "done"`) for report
+  posting, and an EventBridge schedule (`bot_schedule`, default hourly) as a
+  notifications-polling fallback.
 
 ## Enrollment and authorization
 
@@ -57,8 +62,9 @@ There is no per-machine registration and no long-lived secrets:
 | `cred_duration_seconds` | no | `3600` | Lifetime of the temporary credentials the broker vends. |
 | `public_reports` | no | `true` | Make `runs/*/report/*` and `runs/*/logs/*` publicly readable. |
 | `github_bot_token` | no | `""` | Token of the bot's GitHub account; empty disables the bot Lambda. |
+| `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
-| `bot_schedule` | no | `"rate(1 minute)"` | EventBridge schedule for bot polls. |
+| `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
 
 ## Deploying
 

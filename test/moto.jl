@@ -338,6 +338,69 @@ try
             # 4. and does not double-post
             PEF.FarmBot.handle_invocation(lite, gh)
             @test length(posted) == 2
+
+            # 5. webhook path: an issue_comment delivery submits a run with a
+            #    single GitHub call (no notifications involved)
+            secret = "hooksecret"
+            payload = JSON.json(Dict(
+                "action" => "created",
+                "comment" => Dict("body" => "@nanosoldier2 runtests([\"Example\"])",
+                                  "user" => Dict("login" => "keno")),
+                "issue" => Dict("number" => 12345,
+                                "pull_request" => Dict("url" => "$(gh_base[])/repos/JuliaLang/julia/pulls/12345")),
+                "repository" => Dict("full_name" => "JuliaLang/julia")))
+            sign(body) = "sha256=" * bytes2hex(PEF.FarmLite.hmac(Vector{UInt8}(secret), body))
+            webhook_event(body, sig) = JSON.json(Dict(
+                "requestContext" => Dict("http" => Dict("method" => "POST")),
+                "rawPath" => "/",
+                "headers" => Dict("x-hub-signature-256" => sig,
+                                  "x-github-event" => "issue_comment"),
+                "body" => body, "isBase64Encoded" => false))
+            with_env(Dict("GITHUB_WEBHOOK_SECRET" => secret)) do
+                # bad signature is rejected without side effects
+                resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign("evil")), lite, gh))
+                @test resp["statusCode"] == 401
+                @test length(posted) == 2
+
+                resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign(payload)), lite, gh))
+                @test resp["statusCode"] == 200
+            end
+            @test length(posted) == 3
+            @test occursin("has been submitted as run", posted[3])
+            webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
+            run = PEF.get_run(ctx, webhook_run_id)
+            @test run["packages"] == ["Example"]
+            @test run["submitter"] == "keno via @nanosoldier2"
+
+            # 6. stream path: a run flipping to done triggers the report directly
+            expand_claim = PEF.claim_job(ctx; wait=1)
+            @test expand_claim isa PEF.ClaimedExpand
+            PEF.expand_run(ctx, webhook_run_id, ["Example"])
+            SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
+            for _ in 1:20
+                PEF.get_run(ctx, webhook_run_id)["status"] == "done" && break
+                c = PEF.claim_job(ctx; wait=1)
+                c isa PEF.ClaimedJob || continue
+                PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+            end
+            @test PEF.get_run(ctx, webhook_run_id)["status"] == "done"
+
+            run_item = PEF.FarmBot.get_run(lite, String(webhook_run_id))
+            stream_event = JSON.json(Dict("Records" => [Dict(
+                "eventName" => "MODIFY",
+                "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item))))]))
+            @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
+            @test length(posted) == 4
+            @test occursin("@keno: run `$webhook_run_id` finished", posted[4])
+
+            # duplicate stream delivery does not double-post
+            @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
+            @test length(posted) == 4
+
+            # 7. an unrecognized event falls back to the scheduled poll
+            notifications[] = "[]"
+            @test JSON.parse(PEF.FarmBot.handle_event("{}", lite, gh))["ok"] == true
+            @test length(posted) == 4
         finally
             close(server)
         end

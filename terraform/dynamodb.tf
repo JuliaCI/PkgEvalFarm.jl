@@ -9,6 +9,11 @@ resource "aws_dynamodb_table" "runs" {
     name = "run_id"
     type = "S"
   }
+
+  # the bot Lambda subscribes to this stream (filtered to runs flipping to
+  # "done") to post reports without polling
+  stream_enabled   = true
+  stream_view_type = "NEW_IMAGE"
 }
 
 resource "aws_dynamodb_table" "jobs" {

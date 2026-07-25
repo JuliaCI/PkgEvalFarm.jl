@@ -42,3 +42,8 @@ output "bot_function_name" {
   description = "Name of the bot Lambda (empty when the bot is disabled)."
   value       = length(aws_lambda_function.bot) > 0 ? aws_lambda_function.bot[0].function_name : ""
 }
+
+output "bot_webhook_url" {
+  description = "URL to register as a GitHub issue_comment webhook (empty when disabled)."
+  value       = length(aws_lambda_function_url.bot) > 0 ? aws_lambda_function_url.bot[0].function_url : ""
+}

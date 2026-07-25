@@ -63,7 +63,14 @@ variable "bot_name" {
 }
 
 variable "bot_schedule" {
-  description = "EventBridge schedule expression for bot polls."
+  description = "EventBridge schedule for fallback bot polls (webhook + stream are the primary triggers)."
   type        = string
-  default     = "rate(1 minute)"
+  default     = "rate(1 hour)"
+}
+
+variable "github_webhook_secret" {
+  description = "Secret for verifying GitHub issue_comment webhooks. Empty disables the webhook endpoint (the bot then relies on the scheduled poll)."
+  type        = string
+  default     = ""
+  sensitive   = true
 }

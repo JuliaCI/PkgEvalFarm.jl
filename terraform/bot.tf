@@ -67,6 +67,7 @@ resource "aws_lambda_function" "bot" {
   environment {
     variables = {
       NANOSOLDIER2_GITHUB_TOKEN = var.github_bot_token
+      GITHUB_WEBHOOK_SECRET     = var.github_webhook_secret
       BOT_NAME                  = var.bot_name
       PKGEVAL_QUEUE_URL         = aws_sqs_queue.jobs.url
       PKGEVAL_RUNS_TABLE        = aws_dynamodb_table.runs.name
@@ -76,6 +77,60 @@ resource "aws_lambda_function" "bot" {
     }
   }
 }
+
+# --- Trigger 1: GitHub issue_comment webhook (HMAC-verified in the bot) --------
+
+resource "aws_lambda_function_url" "bot" {
+  count              = var.github_webhook_secret == "" ? 0 : local.bot_enabled
+  function_name      = aws_lambda_function.bot[0].function_name
+  authorization_type = "NONE"
+}
+
+# --- Trigger 2: runs flipping to "done" via the DynamoDB stream ----------------
+
+resource "aws_iam_role_policy" "bot_stream" {
+  count = local.bot_enabled
+  name  = "runs-stream-read"
+  role  = aws_iam_role.bot[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetRecords",
+          "dynamodb:GetShardIterator",
+          "dynamodb:DescribeStream",
+          "dynamodb:ListStreams",
+        ]
+        Resource = aws_dynamodb_table.runs.stream_arn
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_event_source_mapping" "bot_runs_stream" {
+  count             = local.bot_enabled
+  event_source_arn  = aws_dynamodb_table.runs.stream_arn
+  function_name     = aws_lambda_function.bot[0].arn
+  starting_position = "LATEST"
+  batch_size        = 10
+
+  # only invoke for runs reaching "done"; per-job counter updates are filtered
+  # out for free at the event-source level
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        dynamodb = { NewImage = { status = { S = ["done"] } } }
+      })
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.bot_stream]
+}
+
+# --- Trigger 3: infrequent scheduled poll as a fallback ------------------------
 
 resource "aws_cloudwatch_event_rule" "bot_schedule" {
   count               = local.bot_enabled

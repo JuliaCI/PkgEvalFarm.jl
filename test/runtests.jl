@@ -75,6 +75,20 @@ end
     @test resolve_vs("v1.12.0", "JuliaLang/julia") == "v1.12.0"
 end
 
+@testset "webhook signatures" begin
+    valid = PEF.FarmLite.valid_signature
+    secret, body = "s3cret", "{\"zen\":\"Design for failure.\"}"
+    sig = "sha256=" * bytes2hex(PEF.FarmLite.hmac(Vector{UInt8}(secret), body))
+    @test valid(secret, body, sig)
+    @test !valid(secret, body * " ", sig)          # tampered body
+    @test !valid("wrong", body, sig)               # wrong secret
+    @test !valid(secret, body, nothing)            # missing header
+    @test !valid(secret, body, "sha256=abcd")      # wrong length
+    @test !valid("", body, sig)                    # webhook disabled
+
+    @test String(PEF.FarmLite.base64decode_lite("eyJ4Ijoi8J+SqSJ9")) == "{\"x\":\"💩\"}"
+end
+
 @testset "broker unit tests" begin
     include("broker.jl")
 end

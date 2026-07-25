@@ -362,6 +362,48 @@ function json_item(item::Item)
 end
 
 
+## GitHub webhook verification
+
+"""
+    valid_signature(secret, body, signature) -> Bool
+
+Verify a GitHub webhook `X-Hub-Signature-256` header (constant-time comparison).
+"""
+function valid_signature(secret::String, body::String,
+                         signature::Union{Nothing,String})
+    (isempty(secret) || signature === nothing) && return false
+    sig = something(signature)
+    expected = "sha256=" * bytes2hex(hmac_sha256(Vector{UInt8}(secret), body))
+    ncodeunits(sig) == ncodeunits(expected) || return false
+    diff = UInt8(0)
+    for (a, b) in zip(codeunits(sig), codeunits(expected))
+        diff |= a ⊻ b
+    end
+    return diff == 0x00
+end
+
+# Base64 without the Base64 stdlib's IO machinery (juliac-friendly)
+function base64decode_lite(s::AbstractString)
+    lookup = fill(0xff, 256)
+    for (i, c) in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+        lookup[Int(c)+1] = UInt8(i - 1)
+    end
+    out = UInt8[]
+    acc = 0; nbits = 0
+    for c in s
+        c in ('=', '\n', '\r') && continue
+        v = lookup[Int(c)+1]
+        v == 0xff && error("invalid base64")
+        acc = (acc << 6) | v; nbits += 6
+        if nbits >= 8
+            nbits -= 8
+            push!(out, UInt8((acc >> nbits) & 0xff))
+        end
+    end
+    return out
+end
+
+
 ## Lambda custom runtime loop
 
 """

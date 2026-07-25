@@ -390,6 +390,7 @@ function post_comment(gh::GitHubCtx, repo::String, number::Int, body::String)
     return nothing
 end
 
+"Notifications-driven path: resolve the thread to a comment/issue, then run the command."
 function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
                         subject::NotificationSubject)
     comment_url = subject.latest_comment_url
@@ -399,9 +400,6 @@ function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
     comment = parse_json(resp.body, GhComment)
     comment_body = comment.body
     comment_body === nothing && return
-    occursin("@$name", something(comment_body)) || return
-    command = parse_command(something(comment_body))
-    command === nothing && return
     requester = comment.user === nothing ? "unknown" :
                 something(something(comment.user).login, "unknown")
 
@@ -413,18 +411,33 @@ function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
     (issue.number === nothing || issue.repository_url === nothing) && return
     number = something(issue.number)
     repo = replace(something(issue.repository_url), gh.api_base * "/repos/" => "")
+    pr_url = issue.pull_request === nothing ? nothing : something(issue.pull_request).url
+
+    handle_command(ctx, gh, name, repo, number, something(comment_body), requester, pr_url)
+end
+
+"""
+Execute a `runtests` command found in a comment (from either the webhook or the
+notifications path): validate it, resolve the PR, submit the run, and acknowledge.
+"""
+function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
+                        number::Int, comment_body::String, requester::String,
+                        pr_url::Union{Nothing,String})
+    occursin("@$name", comment_body) || return
+    command = parse_command(comment_body)
+    command === nothing && return
 
     if command.error !== nothing
         post_comment(gh, repo, number,
                      "Sorry @$requester, I couldn't parse that: $(something(command.error))")
         return
     end
-    if issue.pull_request === nothing || something(issue.pull_request).url === nothing
+    if pr_url === nothing
         post_comment(gh, repo, number, "`runtests` only works on pull requests.")
         return
     end
 
-    resp = github_request(gh, "GET", something(something(issue.pull_request).url))
+    resp = github_request(gh, "GET", something(pr_url))
     resp.status == 200 || error("failed to fetch PR (HTTP $(resp.status))")
     pr = parse_json(resp.body, GhPr)
     (pr.head === nothing || something(pr.head).sha === nothing) && error("PR without head sha")
@@ -769,12 +782,189 @@ function run_bot(ctx_provider=ctx_from_env, gh::GitHubCtx=bot_gh();
     end
 end
 
-"Lambda entry: each scheduled event triggers one poll iteration."
-function lambda_main()
-    lambda_loop() do event
-        handle_invocation()
+## Lambda event dispatch
+#
+# One Lambda, three triggers:
+#   - Function URL: GitHub `issue_comment` webhooks (HMAC-verified) -> handle_command
+#   - DynamoDB stream on the runs table (filtered to status = "done") -> post report
+#   - EventBridge schedule (infrequent fallback) -> full notifications poll
+#
+# The webhook payload carries the comment/issue/repo inline, so the webhook path
+# costs a single GitHub call (the PR fetch) instead of the notifications dance.
+
+struct GhRepoFull
+    full_name::Union{Nothing,String}
+end
+
+"GitHub `issue_comment` webhook payload (the parts we use)."
+struct WebhookPayload
+    action::Union{Nothing,String}
+    comment::Union{Nothing,GhComment}
+    issue::Union{Nothing,GhIssue}
+    repository::Union{Nothing,GhRepoFull}
+end
+
+"One Lambda invocation event, whatever its trigger (fields absent when N/A)."
+struct TopEvent
+    new_images::Vector{Item}            # DynamoDB stream records (runs items)
+    method::Union{Nothing,String}       # Function URL fields
+    signature::Union{Nothing,String}    # x-hub-signature-256
+    ghevent::Union{Nothing,String}      # x-github-event
+    body::Union{Nothing,String}
+    is_base64::Bool
+end
+
+function json_make(::Type{GhRepoFull}, x::LazyVal)
+    full_name = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "full_name"
+            s, p = json_string(v); full_name[] = s; return p
+        end
+        return nothing
+    end
+    return GhRepoFull(full_name[]), pos::Int
+end
+
+function json_make(::Type{WebhookPayload}, x::LazyVal)
+    action = Ref{Union{Nothing,String}}(nothing)
+    comment = Ref{Union{Nothing,GhComment}}(nothing)
+    issue = Ref{Union{Nothing,GhIssue}}(nothing)
+    repository = Ref{Union{Nothing,GhRepoFull}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "action"
+            s, p = json_string(v); action[] = s; return p
+        elseif k == "comment"
+            c, p = json_make(GhComment, v); comment[] = c; return p
+        elseif k == "issue"
+            i, p = json_make(GhIssue, v); issue[] = i; return p
+        elseif k == "repository"
+            r, p = json_make(GhRepoFull, v); repository[] = r; return p
+        end
+        return nothing
+    end
+    return WebhookPayload(action[], comment[], issue[], repository[]), pos::Int
+end
+
+function json_make(::Type{TopEvent}, x::LazyVal)
+    new_images = Item[]
+    method = Ref{Union{Nothing,String}}(nothing)
+    signature = Ref{Union{Nothing,String}}(nothing)
+    ghevent = Ref{Union{Nothing,String}}(nothing)
+    body = Ref{Union{Nothing,String}}(nothing)
+    is_base64 = Ref(false)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "Records"
+            return JSON.applyarray(v) do i, record
+                jsontype(record) == JSON.JSONTypes.OBJECT || json_expected("stream record")
+                JSON.applyobject(record) do rk, rv
+                    isnullval(rv) && return nothing
+                    rk == "dynamodb" || return nothing
+                    JSON.applyobject(rv) do dk, dv
+                        isnullval(dv) && return nothing
+                        dk == "NewImage" || return nothing
+                        item, p = json_make(Item, dv)
+                        push!(new_images, item)
+                        return p
+                    end
+                end
+            end
+        elseif k == "requestContext"
+            return JSON.applyobject(v) do rk, rv
+                rk == "http" || return nothing
+                JSON.applyobject(rv) do hk, hv
+                    if hk == "method"
+                        s, p = json_string(hv); method[] = s; return p
+                    end
+                    return nothing
+                end
+            end
+        elseif k == "headers"
+            return JSON.applyobject(v) do hk, hv
+                isnullval(hv) && return nothing
+                header = lowercase(convert(String, hk)::String)  # hk is a lazy PtrString
+                if header == "x-hub-signature-256"
+                    s, p = json_string(hv); signature[] = s; return p
+                elseif header == "x-github-event"
+                    s, p = json_string(hv); ghevent[] = s; return p
+                end
+                return nothing
+            end
+        elseif k == "body"
+            s, p = json_string(v); body[] = s; return p
+        elseif k == "isBase64Encoded"
+            b, p = json_bool(v); is_base64[] = b; return p
+        end
+        return nothing
+    end
+    return TopEvent(new_images, method[], signature[], ghevent[], body[], is_base64[]),
+           pos::Int
+end
+
+fnurl_response(status::Int, payload::String) =
+    "{\"statusCode\":$status,\"headers\":{\"Content-Type\":\"application/json\"}," *
+    "\"body\":$(JSON.json(payload))}"
+
+"Handle a verified GitHub webhook delivery."
+function handle_webhook(ctx::LiteCtx, gh::GitHubCtx, event::TopEvent)
+    secret = get(ENV, "GITHUB_WEBHOOK_SECRET", "")
+    raw = something(event.body, "")
+    event.is_base64 && (raw = String(FarmLite.base64decode_lite(raw)))
+    if !FarmLite.valid_signature(secret, raw, event.signature)
+        return fnurl_response(401, "{\"error\":\"invalid signature\"}")
+    end
+    # ping etc. are accepted but ignored
+    event.ghevent == "issue_comment" ||
+        return fnurl_response(200, "{\"ignored\":true}")
+
+    payload = parse_json(raw, WebhookPayload)
+    (payload.action == "created" && payload.comment !== nothing &&
+     payload.issue !== nothing && payload.repository !== nothing) ||
+        return fnurl_response(200, "{\"ignored\":true}")
+    comment = something(payload.comment)
+    issue = something(payload.issue)
+    repo = something(payload.repository).full_name
+    (comment.body === nothing || issue.number === nothing || repo === nothing) &&
+        return fnurl_response(200, "{\"ignored\":true}")
+    requester = comment.user === nothing ? "unknown" :
+                something(something(comment.user).login, "unknown")
+    pr_url = issue.pull_request === nothing ? nothing : something(issue.pull_request).url
+
+    handle_command(ctx, gh, bot_name(), something(repo), something(issue.number),
+                   something(comment.body), requester, pr_url)
+    return fnurl_response(200, "{\"ok\":true}")
+end
+
+"""
+    handle_event(event_body::String, ctx=ctx_from_env(), gh=bot_gh()) -> String
+
+Dispatch one Lambda invocation: webhook delivery, DynamoDB stream batch, or the
+scheduled fallback poll. Returns the response JSON.
+"""
+function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
+                      gh::GitHubCtx=bot_gh())
+    event = parse_json(event_body, TopEvent)
+    if !isempty(event.new_images)
+        # runs that just flipped to done (event source mapping filters on status)
+        for run in event.new_images
+            str(run, "status", "") == "done" || continue
+            report_finished_run(ctx, gh, run)
+        end
+        return "{\"ok\":true}"
+    elseif event.method !== nothing
+        return handle_webhook(ctx, gh, event)
+    else
+        # scheduled fallback: full poll (also catches missed webhook/stream events)
+        handle_invocation(ctx, gh)
         return "{\"ok\":true}"
     end
+end
+
+"Lambda entry."
+function lambda_main()
+    lambda_loop(handle_event)
 end
 
 end # module
