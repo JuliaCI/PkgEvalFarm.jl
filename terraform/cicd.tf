@@ -18,6 +18,49 @@ resource "aws_iam_openid_connect_provider" "github" {
 locals {
   github_oidc_arn = coalesce(var.github_oidc_provider_arn,
   try(aws_iam_openid_connect_provider.github[0].arn, null))
+
+  oidc = "token.actions.githubusercontent.com"
+
+  # Claims a deploy token must carry. Everything here is exact-match; see
+  # `.github/workflows/ci.yml` for the corresponding job-level guards.
+  deploy_claims = merge(
+    # a token minted for another audience cannot be replayed against AWS
+    { "${local.oidc}:aud" = "sts.amazonaws.com" },
+    # the repository, by immutable numeric id: survives renames and cannot be
+    # re-claimed by deleting the repo and re-registering the same path
+    var.github_repository_id == null ? {} :
+    { "${local.oidc}:repository_id" = var.github_repository_id },
+    # the branch. Pinned via `ref` rather than `sub`, because the *format* of
+    # `sub` is org-configurable: with the immutable variant enabled it reads
+    # repo:OWNER@<id>/REPO@<id>:ref:... and silently stops matching a policy
+    # written against the documented repo:OWNER/REPO:ref:... form.
+    var.github_deploy_ref == null ? {} :
+    { "${local.oidc}:ref" = var.github_deploy_ref },
+    # the exact workflow file: a *new* workflow added to the branch (or a
+    # reusable workflow called from elsewhere) does not inherit this grant
+    var.github_deploy_workflow_ref == null ? {} :
+    { "${local.oidc}:job_workflow_ref" = var.github_deploy_workflow_ref },
+    # the trigger: only a push, so workflow_dispatch/schedule/pull_request runs
+    # of the very same file cannot deploy. Pull requests — including those from
+    # forks, which run in this repo's context but with the fork's workflow file
+    # — carry event_name=pull_request and a refs/pull/N/merge ref, so they match
+    # neither this nor the ref condition. (GitHub also caps fork-PR permissions
+    # at read-only, so such a job cannot mint a token in the first place.)
+    var.github_deploy_event_name == null ? {} :
+    { "${local.oidc}:event_name" = var.github_deploy_event_name },
+    # refuse tokens minted on self-hosted runners, whose environment is not
+    # controlled by GitHub
+    var.github_require_hosted_runner ?
+    { "${local.oidc}:runner_environment" = "github-hosted" } : {},
+  )
+
+  # `sub` is opt-in only (see github_deploy_subjects); the claims above are
+  # strictly more precise and do not depend on its format.
+  deploy_condition = merge(
+    { StringEquals = local.deploy_claims },
+    length(var.github_deploy_subjects) == 0 ? {} :
+    { StringLike = { "${local.oidc}:sub" = var.github_deploy_subjects } },
+  )
 }
 
 resource "aws_iam_role" "deploy" {
@@ -30,43 +73,7 @@ resource "aws_iam_role" "deploy" {
         Effect    = "Allow"
         Principal = { Federated = local.github_oidc_arn }
         Action    = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          # `aud` is pinned so a token minted for some other audience can't be
-          # replayed here; `repository_id` is the numeric repo id, which (unlike
-          # the name in `sub`) survives renames and cannot be re-claimed by
-          # deleting and re-creating a repo with the same path.
-          StringEquals = merge(
-            { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" },
-            var.github_repository_id == null ? {} :
-            { "token.actions.githubusercontent.com:repository_id" = var.github_repository_id },
-            # the exact workflow file that may deploy: a *new* workflow added to
-            # master (or a reusable workflow called from elsewhere) does not
-            # inherit this grant
-            var.github_deploy_workflow_ref == null ? {} :
-            { "token.actions.githubusercontent.com:job_workflow_ref" = var.github_deploy_workflow_ref },
-            # the trigger: only a push, so workflow_dispatch/schedule/PR runs of
-            # the same file cannot deploy (mirrors the job's own `if:`)
-            var.github_deploy_event_name == null ? {} :
-            { "token.actions.githubusercontent.com:event_name" = var.github_deploy_event_name },
-            # refuse tokens minted on self-hosted runners, whose environment is
-            # not controlled by GitHub
-            var.github_require_hosted_runner ?
-            { "token.actions.githubusercontent.com:runner_environment" = "github-hosted" } : {}
-          )
-          # `sub` encodes repo + trigger context. A push to master is
-          #   repo:OWNER/REPO:ref:refs/heads/master
-          # while a pull request — including one from a fork, which runs in this
-          # repo's context with the *fork's* workflow file — is
-          #   repo:OWNER/REPO:pull_request
-          # so fork PRs cannot match this condition even if they could mint a
-          # token (GitHub also caps fork-PR permissions at read-only, so
-          # `id-token: write` is unavailable to them in the first place).
-          # NOTE: a job with `environment: X` gets sub `repo:OWNER/REPO:environment:X`
-          # instead — if you add an environment to the deploy job, this must change.
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = var.github_deploy_subjects
-          }
-        }
+        Condition = local.deploy_condition
       }
     ]
   })

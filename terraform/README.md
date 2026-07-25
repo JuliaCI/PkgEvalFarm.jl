@@ -209,7 +209,7 @@ aws iam list-open-id-connect-providers \
 | ----- | --------- | --- |
 | `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
 | `repository_id` | `= github_repository_id` | numeric and immutable: survives renames, and a deleted repo's name being re-registered by someone else does not inherit the grant |
-| `sub` | `∈ github_deploy_subjects` | pins repo **and trigger context** |
+| `ref` | `= github_deploy_ref` | only the deploy branch |
 | `job_workflow_ref` | `= github_deploy_workflow_ref` | only *this* workflow file at this ref; a newly added workflow on master does not inherit the grant |
 | `event_name` | `= github_deploy_event_name` (`push`) | `workflow_dispatch`/`schedule`/PR runs of the same file cannot deploy |
 | `runner_environment` | `= github-hosted` | refuses tokens minted on self-hosted runners |
@@ -224,10 +224,18 @@ add a step to the workflow:
     echo "$tok" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
 ```
 
-The `sub` claim is what keeps forks out. A push to master is
-`repo:OWNER/REPO:ref:refs/heads/master`; a pull request — including one from a
-fork, which runs in *this* repo's context but with the fork's workflow file — is
-`repo:OWNER/REPO:pull_request`, which matches nothing here. Belt and braces:
+`sub` is deliberately **not** used: its format is org-configurable, and with
+GitHub's immutable variant enabled it reads
+`repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master` — a policy written
+against the documented `repo:OWNER/REPO:...` form then fails with an opaque
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`. The `ref`,
+`repository_id` and `job_workflow_ref` claims say the same thing in a stable
+format. (`github_deploy_subjects` still exists if you want to pin `sub` too.)
+
+Forks are excluded by `event_name` and `ref`: a pull request — including one
+from a fork, which runs in *this* repo's context but with the fork's workflow
+file — carries `event_name=pull_request` and `ref=refs/pull/N/merge`. Belt and
+braces:
 GitHub caps fork-PR permissions at read-only, so such a job cannot obtain
 `id-token: write` to mint a token at all, and the workflow's own `if:` refuses
 to run the deploy job outside a master push.

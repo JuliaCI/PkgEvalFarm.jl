@@ -161,7 +161,18 @@ variable "github_oidc_provider_arn" {
 variable "github_deploy_subjects" {
   description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles. Push-to-branch subjects look like repo:OWNER/REPO:ref:refs/heads/BRANCH; if the deploy job declares an `environment`, the subject becomes repo:OWNER/REPO:environment:NAME instead."
   type        = list(string)
-  default     = ["repo:KenoAIStaging/PkgEvalFarm.jl:ref:refs/heads/master"]
+  # empty by default: `sub`'s format is org-configurable (the immutable variant
+  # embeds numeric ids), so the branch is pinned via the stable `ref` claim and
+  # the repo via `repository_id` instead. Set this only if you know the exact
+  # subject your org mints.
+  default = []
+}
+
+variable "github_deploy_ref" {
+  description = "Git ref allowed to deploy, matched against the OIDC `ref` claim. null omits the condition."
+  type        = string
+  default     = "refs/heads/master"
+  nullable    = true
 }
 
 variable "github_repository_id" {
