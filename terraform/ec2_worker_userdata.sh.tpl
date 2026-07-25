@@ -23,6 +23,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl
 
 useradd --create-home --shell /bin/bash worker
 
+# PkgEval drives containers with `crun --systemd-cgroup`, which for a rootless
+# container asks the *user's* systemd (over its session D-Bus) to create the
+# transient scope. A `User=` system service has neither, so every container --
+# starting with the shared Xvfb one -- dies instantly with the error discarded.
+# Lingering starts a persistent `systemd --user` for the worker at boot, which
+# creates /run/user/<uid> and its bus.
+loginctl enable-linger worker
+WORKER_UID=$(id -u worker)
+
 sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
 sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
 sudo -u worker -H bash -c 'cd ~/PkgEvalFarm.jl && ~/.juliaup/bin/julia --project=. -e "using Pkg; Pkg.instantiate()"'
@@ -113,8 +122,8 @@ UNIT
 cat >/etc/systemd/system/pkgeval-worker.service <<UNIT
 [Unit]
 Description=PkgEval farm worker
-After=network-online.target pkgeval-imds-proxy.service
-Wants=network-online.target
+After=network-online.target pkgeval-imds-proxy.service user@$WORKER_UID.service
+Wants=network-online.target user@$WORKER_UID.service
 Requires=pkgeval-imds-proxy.service
 
 [Service]
@@ -124,6 +133,9 @@ Delegate=yes
 TasksMax=infinity
 LimitNOFILE=1048576
 Environment=HOME=/home/worker
+# crun --systemd-cgroup talks to the user manager over this bus
+Environment=XDG_RUNTIME_DIR=/run/user/$WORKER_UID
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$WORKER_UID/bus
 Environment=JULIA=/home/worker/.juliaup/bin/julia
 Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
