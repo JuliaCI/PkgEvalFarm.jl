@@ -230,9 +230,9 @@ variable "buildkite_org" {
 }
 
 variable "buildkite_pipeline" {
-  description = "Pipeline slug the farm may trigger to build a commit CI has not staged. Empty disables the build-request Lambda entirely."
+  description = "Pipeline slug the farm may trigger to build a commit CI has not staged (see the julia-buildkite PR adding it). Empty disables the build-request Lambda entirely."
   type        = string
-  default     = ""
+  default     = "julia-build-request"
 }
 
 variable "buildkite_token_parameter" {

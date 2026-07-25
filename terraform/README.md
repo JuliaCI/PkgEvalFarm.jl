@@ -176,6 +176,43 @@ Target 0 (znver4): Rejecting this target due to use of runtime-disabled features
 Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
 — it must be 0.
 
+## Requesting builds from CI
+
+PkgEval fetches Julia binaries that CI has already staged, so workers normally
+never compile anything. When a commit has no staged artifact — a closed PR, an
+expired ephemeral artifact, a commit CI never built — the farm asks the
+`julia-build-request` pipeline to build it.
+
+Workers must be able to trigger that, but must not hold the credential that
+does: they run arbitrary package code. So the Buildkite token lives in an SSM
+parameter (`buildkite_token_parameter`) that only `${prefix}-build-request` can
+read, and workers reach that Lambda through a Function URL with `AWS_IAM`
+authorization — SigV4 with the credentials they already have. Authorization is
+two-sided: the worker roles hold `lambda:InvokeFunctionUrl`, and the function's
+resource policy names those roles as the only permitted callers.
+
+The Lambda validates before acting (repo must be `JuliaLang/julia`, a 40-hex
+sha, variant `linux` or `linuxassert`; the org and pipeline come from its own
+environment, never the caller) and deduplicates on `<sha>/<variant>` so a
+commit is built once however many workers ask.
+
+The token belongs to a Buildkite **machine user** whose team access covers the
+build-request pipeline and nothing else — scope names are organization-wide, so
+team membership is the real boundary. It needs `write_builds` (to create the
+build) and `read_builds` (so a failed build is distinguishable from a slow one).
+
+Terraform creates the parameter with a placeholder and never manages its value;
+set it out of band so no token enters state:
+
+```sh
+printf '%s' 'bkua_...' > /tmp/bk-token
+aws ssm put-parameter --name /pkgeval/buildkite-token \
+  --type SecureString --value file:///tmp/bk-token --overwrite
+shred -u /tmp/bk-token
+```
+
+Set `buildkite_pipeline = ""` to remove the whole mechanism.
+
 ## Debug access
 
 `${prefix}-debug` is a narrowly scoped role for handing someone short-lived
