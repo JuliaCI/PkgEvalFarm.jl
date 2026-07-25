@@ -62,3 +62,8 @@ output "lambda_bucket" {
   description = "Private bucket holding the Lambda deployment bundles."
   value       = aws_s3_bucket.lambda.bucket
 }
+
+output "debug_role_arn" {
+  description = "Read-only debug role (empty when debug_role_principals is null)."
+  value       = length(aws_iam_role.debug) > 0 ? aws_iam_role.debug[0].arn : ""
+}

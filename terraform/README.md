@@ -168,6 +168,43 @@ Target 0 (znver4): Rejecting this target due to use of runtime-disabled features
 Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
 — it must be 0.
 
+## Debug access
+
+`debug_role_principals` creates `${prefix}-debug`, a narrowly scoped role for
+handing someone short-lived credentials to diagnose a problem:
+
+```sh
+tofu apply -var 'debug_role_principals=["arn:aws:iam::873569884612:root"]'
+
+aws sts assume-role \
+  --role-arn "$(tofu output -raw debug_role_arn)" \
+  --role-session-name debug --duration-seconds 3600 \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text
+```
+
+Export the three values as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` (or write them to `~/.aws/credentials`). They expire after
+`debug_role_max_session_seconds` (default 1 hour) and cannot be renewed by the
+holder.
+
+The role grants:
+
+- **SSM shell on farm workers only** — `ssm:SendCommand`/`StartSession`
+  conditioned on the instance tag `Name = ${prefix}-ec2-worker`, so no other
+  instance in the account is reachable;
+- **read-only** on the jobs queue and its DLQ, both DynamoDB tables, the
+  results bucket, the farm's Lambda log groups and function configuration;
+- **nothing mutating** — no scaling, no writes, no IAM, no terraform.
+
+Two caveats worth stating plainly. Shell on a worker is effectively root on
+that box: it can inspect and disturb running jobs, though the box itself holds
+only worker-scoped credentials behind a bearer-gated proxy with IMDS
+firewalled. And the `Describe*`/`List*` actions are unavoidably `Resource: "*"`
+because AWS supports no resource-level permissions for them.
+
+Set `debug_role_principals = null` (the default) to remove the role entirely
+when it is not in use.
+
 ## CI/CD
 
 `.github/workflows/ci.yml` runs the test suite on every push/PR, builds both

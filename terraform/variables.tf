@@ -192,14 +192,21 @@ variable "github_deploy_ref" {
 variable "github_deploy_workflow_ref" {
   description = "Workflow file allowed to deploy (OWNER/REPO/.github/workflows/FILE@REF), matched against `job_workflow_ref`. null omits."
   type        = string
-  # Bisect step 2: re-enabled *alone* to test whether AWS's GitHub-specific
-  # claim mapping authorizes on this provider. Value observed verbatim in a
-  # dumped token. If the canary denies, this key is not honored here.
+  # value observed verbatim in a dumped token; works alongside `sub`, which
+  # IAM requires for GitHub (see cicd.tf)
   default  = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
   nullable = true
 }
 
+variable "debug_role_principals" {
+  description = "ARNs allowed to assume the read-only debug role (e.g. [\"arn:aws:iam::123:root\"] for anyone in the account with sts:AssumeRole). null disables the role entirely."
+  type        = list(string)
+  default     = null
+  nullable    = true
+}
 
-
-
-
+variable "debug_role_max_session_seconds" {
+  description = "Maximum session length for the debug role. Keep it short; credentials handed to a third party live only this long."
+  type        = number
+  default     = 3600
+}
