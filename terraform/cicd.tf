@@ -100,9 +100,14 @@ resource "aws_iam_role_policy" "deploy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "UploadBundles"
-        Effect   = "Allow"
-        Action   = "s3:PutObject"
+        Sid    = "UploadBundles"
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          # UpdateFunctionCode fetches the bundle with the *caller's*
+          # credentials, so publishing needs read access as well as write
+          "s3:GetObject",
+        ]
         Resource = "${aws_s3_bucket.lambda.arn}/*"
       },
       {
