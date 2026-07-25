@@ -108,6 +108,7 @@ struct GhUser
     login::Union{Nothing,String}
 end
 struct GhComment
+    id::Union{Nothing,Int}
     body::Union{Nothing,String}
     user::Union{Nothing,GhUser}
 end
@@ -192,18 +193,21 @@ function json_make(::Type{GhUser}, x::LazyVal)
 end
 
 function json_make(::Type{GhComment}, x::LazyVal)
+    id = Ref{Union{Nothing,Int}}(nothing)
     body = Ref{Union{Nothing,String}}(nothing)
     user = Ref{Union{Nothing,GhUser}}(nothing)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
-        if k == "body"
+        if k == "id"
+            n, p = json_int(v); id[] = Int(n); return p
+        elseif k == "body"
             s, p = json_string(v); body[] = s; return p
         elseif k == "user"
             u, p = json_make(GhUser, v); user[] = u; return p
         end
         return nothing
     end
-    return GhComment(body[], user[]), pos::Int
+    return GhComment(id[], body[], user[]), pos::Int
 end
 
 function json_make(::Type{GhPrRef}, x::LazyVal)
@@ -331,6 +335,16 @@ function config_json(name::String, julia::String; assertions::Bool)
     "{\"name\":$(JSON.json(name)),\"julia\":$(JSON.json(julia)),\"buildflags\":$flags}"
 end
 
+"""
+    create_run(ctx; run_id, ...) -> created::Bool
+
+Create the run (single conditional `PutItem`) and enqueue its expand message.
+With a deterministic `run_id` (e.g. derived from the triggering comment id) the
+conditional put doubles as an idempotency gate: `false` means this run was
+already submitted by an earlier delivery of the same command. The expand message
+is (re-)sent either way — duplicates are harmless by design, and skipping it
+could strand a run whose first submission crashed between put and send.
+"""
 function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
                     packages::Vector{String}, context_json::String, submitter::String)
     item = Item(
@@ -346,9 +360,20 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
     payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
               "\"Item\":$(json_item(item))," *
               "\"ConditionExpression\":\"attribute_not_exists(run_id)\"}"
-    ddb(ctx, "PutItem", payload)
+    created = try
+        ddb(ctx, "PutItem", payload)
+        true
+    catch err
+        is_conditional_failure(err) || rethrow()
+        false
+    end
+    if !created
+        # only rescue runs whose first submission crashed before the send; a
+        # run already past expansion doesn't need (churn-y) extra messages
+        str(get_run(ctx, run_id), "status") == "expanding" || return false
+    end
     sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}")
-    return run_id
+    return created
 end
 
 
@@ -413,7 +438,8 @@ function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
     repo = replace(something(issue.repository_url), gh.api_base * "/repos/" => "")
     pr_url = issue.pull_request === nothing ? nothing : something(issue.pull_request).url
 
-    handle_command(ctx, gh, name, repo, number, something(comment_body), requester, pr_url)
+    handle_command(ctx, gh, name, repo, number, something(comment_body), requester, pr_url;
+                   comment_id=comment.id)
 end
 
 struct TeamMembership
@@ -468,7 +494,8 @@ submit the run, and acknowledge.
 """
 function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
                         number::Int, comment_body::String, requester::String,
-                        pr_url::Union{Nothing,String})
+                        pr_url::Union{Nothing,String};
+                        comment_id::Union{Nothing,Int}=nothing)
     occursin("@$name", comment_body) || return
     command = parse_command(comment_body)
     command === nothing && return
@@ -507,8 +534,16 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
                          config_json("against", against; assertions=true) * "]"
     context_json = "{\"repo\":$(JSON.json(repo)),\"issue\":$number," *
                    "\"requester\":$(JSON.json(requester))}"
-    run_id = create_run(ctx; configs_json, packages=command.packages, context_json,
-                        submitter="$requester via @$name")
+    # a comment-derived run id makes submission idempotent: webhook redelivery,
+    # the fallback poll rediscovering the same mention, and webhook+poll overlap
+    # all collapse into one run (kicking off a run is expensive)
+    run_id = comment_id === nothing ? new_run_id() : "gh-$(something(comment_id))"
+    created = create_run(ctx; run_id, configs_json, packages=command.packages,
+                         context_json, submitter="$requester via @$name")
+    if !created
+        @info "command already processed; skipping duplicate delivery" run_id repo number
+        return
+    end
     post_comment(gh, repo, number, """
         Your package evaluation job has been submitted as run `$run_id` \
         (primary: `$primary`, against: `$against`). I will reply here once it finishes.""")
@@ -989,7 +1024,7 @@ function handle_webhook(ctx::LiteCtx, gh::GitHubCtx, event::TopEvent)
     pr_url = issue.pull_request === nothing ? nothing : something(issue.pull_request).url
 
     handle_command(ctx, gh, bot_name(), something(repo), something(issue.number),
-                   something(comment.body), requester, pr_url)
+                   something(comment.body), requester, pr_url; comment_id=comment.id)
     return fnurl_response(200, "{\"ok\":true}")
 end
 

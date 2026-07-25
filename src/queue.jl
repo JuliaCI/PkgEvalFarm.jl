@@ -93,6 +93,8 @@ messages are harmless, a redelivered expand message after the flip just re-enque
 """
 function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{String})
     run = get_run(ctx, run_id)
+    # a stray expand message for a finished run must not re-enqueue its jobs
+    run["status"] == "done" && return run["total_jobs"]
     config_names = [String(c["name"]) for c in run["configs"]]
     jobs = [JobRef(run_id, cfg, pkg) for cfg in config_names for pkg in packages]
     isempty(jobs) && error("expansion of $run_id produced no jobs")

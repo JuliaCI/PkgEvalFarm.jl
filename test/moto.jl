@@ -274,6 +274,14 @@ try
             req -> TestHTTP.Response(205))
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/comments/1",
             req -> TestHTTP.Response(200, JSON.json(Dict(
+                "id" => 987654,
+                "body" => "@nanosoldier2 runtests([\"Example\"])",
+                "user" => Dict("login" => "keno")))))
+        # same command comment as the webhook test delivers (id 555111), for the
+        # webhook+poll overlap check
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/comments/2",
+            req -> TestHTTP.Response(200, JSON.json(Dict(
+                "id" => 555111,
                 "body" => "@nanosoldier2 runtests([\"Example\"])",
                 "user" => Dict("login" => "keno")))))
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/12345",
@@ -370,7 +378,8 @@ try
             secret = "hooksecret"
             payload = JSON.json(Dict(
                 "action" => "created",
-                "comment" => Dict("body" => "@nanosoldier2 runtests([\"Example\"])",
+                "comment" => Dict("id" => 555111,
+                                  "body" => "@nanosoldier2 runtests([\"Example\"])",
                                   "user" => Dict("login" => "keno")),
                 "issue" => Dict("number" => 12345,
                                 "pull_request" => Dict("url" => "$(gh_base[])/repos/JuliaLang/julia/pulls/12345")),
@@ -394,6 +403,26 @@ try
             @test length(posted) == 3
             @test occursin("has been submitted as run", posted[3])
             webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
+            @test webhook_run_id == "gh-555111"  # deterministic, comment-derived
+
+            # 5a. duplicate deliveries collapse into the one run: a webhook
+            # redelivery and the fallback poll rediscovering the same comment
+            # both submit nothing and post nothing
+            with_env(Dict("GITHUB_WEBHOOK_SECRET" => secret)) do
+                resp = JSON.parse(PEF.FarmBot.handle_event(
+                    webhook_event(payload, sign(payload)), lite, gh))
+                @test resp["statusCode"] == 200
+            end
+            notifications[] = JSON.json([Dict(
+                "id" => "43", "reason" => "mention",
+                "subject" => Dict("type" => "PullRequest",
+                    "url" => "$(gh_base[])/repos/JuliaLang/julia/issues/12345",
+                    "latest_comment_url" => "$(gh_base[])/repos/JuliaLang/julia/issues/comments/2"))])
+            PEF.FarmBot.handle_invocation(lite, gh)
+            notifications[] = "[]"
+            @test length(posted) == 3      # no extra ack comments
+            run = PEF.get_run(ctx, "gh-555111")
+            @test run["status"] == "expanding"  # still exactly one run, untouched
 
             # 5b. an unauthorized author gets a refusal and no run
             intruder = replace(payload, "\"login\":\"keno\"" => "\"login\":\"rando\"")
