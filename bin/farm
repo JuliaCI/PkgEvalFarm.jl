@@ -1,0 +1,6 @@
+#!/bin/sh
+# CLI for PkgEvalFarm; see `farm help`.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec julia --project="$SCRIPT_DIR" --startup-file=no -e '
+    using PkgEvalFarm
+    exit(PkgEvalFarm.main(collect(String, ARGS)))' -- "$@"

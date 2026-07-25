@@ -1,0 +1,43 @@
+# The broker Lambda: authenticates users via the GitHub device flow, checks
+# team membership, and vends temporary AWS credentials (worker or submitter).
+# The zip must be built before applying:
+#
+#   julia --project=broker broker/build/build.jl
+
+resource "aws_lambda_function" "broker" {
+  function_name = "${var.name_prefix}-broker"
+  role          = aws_iam_role.broker.arn
+
+  filename = "${path.module}/../broker/build/bootstrap.zip"
+  # try() so that `tofu validate` succeeds before the zip has been built; on a
+  # real plan/apply the zip must exist (see README) and the hash is computed.
+  source_code_hash = try(filebase64sha256("${path.module}/../broker/build/bootstrap.zip"), null)
+
+  runtime       = "provided.al2023"
+  architectures = ["x86_64"]
+  handler       = "bootstrap"
+  memory_size   = 512
+  timeout       = 30
+
+  environment {
+    variables = {
+      GITHUB_ORG         = var.github_org
+      WORKER_TEAM        = var.worker_team
+      SUBMITTER_TEAM     = var.submitter_team
+      GITHUB_CLIENT_ID   = var.github_client_id
+      WORKER_ROLE_ARN    = aws_iam_role.worker.arn
+      SUBMITTER_ROLE_ARN = aws_iam_role.submitter.arn
+      CRED_DURATION      = tostring(var.cred_duration_seconds)
+      PKGEVAL_QUEUE_URL  = aws_sqs_queue.jobs.url
+      PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
+      PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
+      PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket
+      FARM_REGION        = var.region
+    }
+  }
+}
+
+resource "aws_lambda_function_url" "broker" {
+  function_name      = aws_lambda_function.broker.function_name
+  authorization_type = "NONE"
+}

@@ -1,0 +1,14 @@
+name = "FarmBroker"
+uuid = "3e9d1c84-7a55-4f21-b0c9-8f4a6d2e5b17"
+authors = ["Keno Fischer <keno@juliahub.com>"]
+version = "0.1.0"
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+
+[compat]
+JSON = "1"
+julia = "1.12"
