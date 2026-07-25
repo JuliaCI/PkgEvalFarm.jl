@@ -2,6 +2,14 @@
 # cloud-init for a self-enrolling PkgEval test worker (Ubuntu 24.04).
 set -eux
 
+# FIRST, before any third-party code runs (installers, Pkg build scripts):
+# IMDS is reachable by root only. Everything below that runs as non-root —
+# including the eventual sandboxed package code — goes through the
+# bearer-gated credential proxy instead. Re-applied on reboots by the proxy
+# service's ExecStartPre.
+command -v iptables >/dev/null || { apt-get update -q; apt-get install -qy iptables; }
+iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j REJECT
+
 # rootless containers (crun) + rr need these; Ubuntu 24.04 restricts
 # unprivileged user namespaces via AppArmor by default
 cat >/etc/sysctl.d/99-pkgeval.conf <<SYSCTL
