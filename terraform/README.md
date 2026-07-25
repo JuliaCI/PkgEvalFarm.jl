@@ -167,3 +167,34 @@ Target 0 (znver4): Rejecting this target due to use of runtime-disabled features
 
 Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
 — it must be 0.
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs the test suite on every push/PR, builds both
+Lambda bundles (asserting they contain no AVX-512, see above), and — only for
+pushes to `master` — publishes them to AWS.
+
+Deployment uses **GitHub Actions OIDC**: no AWS keys are stored anywhere. The
+workflow mints a short-lived OIDC token, and `${prefix}-deploy` (created here)
+trusts it only for the `sub` claims in `github_deploy_subjects` — by default the
+`master` branch of the deploy repo, so forks and pull requests cannot assume it.
+The role may only write to the Lambda bucket and call `UpdateFunctionCode` on
+`${prefix}-*` functions.
+
+Configure these repository **variables** (Settings → Secrets and variables →
+Actions → Variables) from the terraform outputs:
+
+| Variable | Value |
+| -------- | ----- |
+| `AWS_DEPLOY_ROLE` | `deploy_role_arn` output |
+| `AWS_REGION` | `region` output |
+| `LAMBDA_BUCKET` | `lambda_bucket` output |
+| `NAME_PREFIX` | `name_prefix` (optional; defaults to `pkgeval`) |
+| `BROKER_URL` | `broker_function_url` output (optional; enables the post-deploy smoke test) |
+
+If the account already has a GitHub OIDC provider, pass its ARN as
+`github_oidc_provider_arn` — an account may only have one per issuer URL.
+
+Terraform bootstraps the initial bundles and then defers to CI: the zip objects
+and the functions' `source_code_hash` carry `ignore_changes`, so a later
+`tofu apply` from a stale checkout will not roll back a CI-published bundle.

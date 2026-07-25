@@ -48,6 +48,11 @@ resource "aws_s3_object" "bot_zip" {
   key         = "bot.zip"
   source      = "${path.module}/../bot/build/bootstrap.zip"
   source_hash = try(filemd5("${path.module}/../bot/build/bootstrap.zip"), null)
+
+  # CI publishes new bundles; don't let a stale local file revert them
+  lifecycle {
+    ignore_changes = [source, source_hash, etag]
+  }
 }
 
 resource "aws_lambda_function" "bot" {
@@ -69,6 +74,11 @@ resource "aws_lambda_function" "bot" {
   # concurrency needs are minimal (stream: one batch per shard, schedule:
   # hourly, webhooks: human-paced), so a small cap bounds URL-spam cost
   reserved_concurrent_executions = 5
+
+  # CI publishes code updates via lambda:UpdateFunctionCode
+  lifecycle {
+    ignore_changes = [source_code_hash, s3_key]
+  }
 
   environment {
     variables = {

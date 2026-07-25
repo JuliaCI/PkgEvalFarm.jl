@@ -150,3 +150,16 @@ variable "bot_submitter_team" {
   default     = null
   nullable    = true
 }
+
+variable "github_oidc_provider_arn" {
+  description = "Existing GitHub Actions OIDC provider ARN. null creates one (an account may only have a single provider per URL)."
+  type        = string
+  default     = null
+  nullable    = true
+}
+
+variable "github_deploy_subjects" {
+  description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles."
+  type        = list(string)
+  default     = ["repo:KenoAIStaging/PkgEvalFarm.jl:ref:refs/heads/master"]
+}

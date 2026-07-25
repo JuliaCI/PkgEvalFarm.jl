@@ -13,6 +13,11 @@ resource "aws_s3_object" "broker_zip" {
   # try() so that `tofu validate` succeeds before the zip has been built; on a
   # real plan/apply the zip must exist (see README) and the hash is computed.
   source_hash = try(filemd5("${path.module}/../broker/build/bootstrap.zip"), null)
+
+  # CI publishes new bundles; don't let a stale local file revert them
+  lifecycle {
+    ignore_changes = [source, source_hash, etag]
+  }
 }
 
 resource "aws_lambda_function" "broker" {
@@ -32,6 +37,11 @@ resource "aws_lambda_function" "broker" {
   # the function URL is publicly invokable (auth happens against GitHub inside);
   # a concurrency cap bounds the cost/abuse blast radius of URL spam
   reserved_concurrent_executions = 10
+
+  # CI publishes code updates via lambda:UpdateFunctionCode
+  lifecycle {
+    ignore_changes = [source_code_hash, s3_key]
+  }
 
   environment {
     variables = {

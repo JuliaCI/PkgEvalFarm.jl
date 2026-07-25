@@ -52,3 +52,13 @@ output "ec2_worker_asg" {
   description = "Name of the EC2 worker auto-scaling group (empty when disabled)."
   value       = length(aws_autoscaling_group.ec2_worker) > 0 ? aws_autoscaling_group.ec2_worker[0].name : ""
 }
+
+output "deploy_role_arn" {
+  description = "Role for GitHub Actions to assume via OIDC (set as the AWS_DEPLOY_ROLE repo variable)."
+  value       = aws_iam_role.deploy.arn
+}
+
+output "lambda_bucket" {
+  description = "Private bucket holding the Lambda deployment bundles."
+  value       = aws_s3_bucket.lambda.bucket
+}
