@@ -172,7 +172,21 @@ Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
 
 `${prefix}-debug` is a narrowly scoped role for handing someone short-lived
 credentials to diagnose a problem. It is created by default
-(`debug_role_enabled`) and grants nothing until assumed:
+(`debug_role_enabled`) and grants nothing until assumed.
+
+**AWS forbids the account root user from assuming any role.** If root is your
+only identity, `debug_user_enabled` (default true) also creates a
+`${prefix}-debug` IAM *user* whose sole permission is assuming that role.
+Create its access key out of band — deliberately not in terraform state — and
+keep it only as long as you need it:
+
+```sh
+aws iam create-access-key --user-name pkgeval-debug     # as root, once
+# ...later:
+aws iam delete-access-key --user-name pkgeval-debug --access-key-id AKIA...
+```
+
+Then, with that user's credentials (e.g. as an `AWS_PROFILE`):
 
 ```sh
 aws sts assume-role \

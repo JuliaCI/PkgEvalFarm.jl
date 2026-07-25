@@ -216,3 +216,9 @@ variable "debug_role_max_session_seconds" {
   type        = number
   default     = 3600
 }
+
+variable "debug_user_enabled" {
+  description = "Create an IAM user whose only permission is assuming the debug role. Needed when the account's only identity is root, which AWS forbids from assuming roles. Its access key is created out of band, never in terraform state."
+  type        = bool
+  default     = true
+}

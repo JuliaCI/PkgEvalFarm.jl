@@ -25,6 +25,10 @@ locals {
   # able to mint these credentials.
   debug_principals = coalesce(var.debug_role_principals,
   ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"])
+
+  # note: the account-root ARN above delegates to the account; it does not let
+  # the *root user* assume the role — AWS forbids that outright, hence the
+  # bootstrap user at the bottom of this file.
 }
 
 resource "aws_iam_role" "debug" {
@@ -150,6 +154,36 @@ resource "aws_iam_role_policy" "debug" {
         Action   = ["lambda:GetFunctionConfiguration", "lambda:ListFunctions"]
         Resource = "*"
       },
+    ]
+  })
+}
+
+# Root cannot assume roles (an AWS-wide restriction), so an account whose only
+# human identity is root needs a minimal principal to assume the debug role
+# with. This user can do exactly one thing: assume that role. Its access key is
+# deliberately NOT created here — generate it out of band so no long-lived
+# secret ever lands in terraform state:
+#
+#   aws iam create-access-key --user-name ${prefix}-debug
+#   aws iam delete-access-key --user-name ${prefix}-debug --access-key-id ...
+resource "aws_iam_user" "debug" {
+  count = var.debug_role_enabled && var.debug_user_enabled ? 1 : 0
+  name  = "${var.name_prefix}-debug"
+}
+
+resource "aws_iam_user_policy" "debug" {
+  count = var.debug_role_enabled && var.debug_user_enabled ? 1 : 0
+  name  = "assume-debug-role"
+  user  = aws_iam_user.debug[0].name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = aws_iam_role.debug[0].arn
+      }
     ]
   })
 }
