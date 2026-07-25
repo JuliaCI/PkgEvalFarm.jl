@@ -119,14 +119,11 @@ resource "aws_launch_template" "ec2_worker" {
   vpc_security_group_ids = [aws_security_group.ec2_worker[0].id]
 
   metadata_options {
-    http_tokens                 = "required" # IMDSv2 (AWS.jl supports it)
+    http_tokens                 = "required" # IMDSv2
     http_put_response_hop_limit = 1
-    # CAVEAT: PkgEval sandboxes currently share the host network namespace, so
-    # sandboxed package code CAN reach IMDS and obtain this instance's
-    # (deliberately low-privilege) worker credentials — the hop limit only
-    # becomes a real barrier once PkgEval gives sandboxes their own netns.
-    # Treat EC2 workers accordingly; the brokered path does not have this
-    # exposure (credentials live only in worker-process memory).
+    # PkgEval sandboxes share the host network namespace, so cloud-init
+    # additionally firewalls IMDS to root and hands the worker credentials
+    # through a bearer-gated localhost proxy — see ec2_worker_userdata.sh.tpl.
   }
 
   block_device_mappings {

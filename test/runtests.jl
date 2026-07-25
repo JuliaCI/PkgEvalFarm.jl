@@ -89,6 +89,35 @@ end
     @test String(PEF.FarmLite.base64decode_lite("eyJ4Ijoi8J+SqSJ9")) == "{\"x\":\"💩\"}"
 end
 
+@testset "IMDS proxy credentials" begin
+    import HTTP as TestHTTP
+    served = Ref(0)
+    router = TestHTTP.Router()
+    TestHTTP.register!(router, "GET", "/credentials", req -> begin
+        auth = TestHTTP.header(req, "Authorization", "")
+        auth == "Bearer sekrit" || return TestHTTP.Response(401)
+        served[] += 1
+        TestHTTP.Response(200, JSON.json(Dict(
+            "AccessKeyId" => "ASIATEST$(served[])", "SecretAccessKey" => "s",
+            "Token" => "tok", "Expiration" => "2099-01-01T00:00:00Z")))
+    end)
+    port = rand(40001:50000)
+    server = TestHTTP.serve!(router, "127.0.0.1", port)
+    try
+        url = "http://127.0.0.1:$port/credentials"
+        creds = PEF.proxy_credentials(url, "sekrit")
+        @test creds.access_key_id == "ASIATEST1"
+        @test creds.token == "tok"
+        @test creds.expiry == DateTime(2099, 1, 1)
+        # renew fetches fresh credentials
+        @test creds.renew().access_key_id == "ASIATEST2"
+        # without the bearer token (what sandboxed code could attempt): rejected
+        @test_throws TestHTTP.StatusError PEF.proxy_credentials(url, "wrong")
+    finally
+        close(server)
+    end
+end
+
 @testset "broker unit tests" begin
     include("broker.jl")
 end

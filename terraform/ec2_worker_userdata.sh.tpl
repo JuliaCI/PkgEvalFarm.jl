@@ -19,14 +19,95 @@ sudo -u worker bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y -
 sudo -u worker git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
 sudo -u worker bash -c 'cd ~/PkgEvalFarm.jl && ~/.juliaup/bin/julia --project=. -e "using Pkg; Pkg.instantiate()"'
 
-# No enrollment/broker needed on EC2: the instance profile carries the worker
-# policy, and the farm CLI's env-bypass mode picks it up via the ambient AWS
-# credential chain (IMDS).
+# --- IMDS protection ---------------------------------------------------------
+# PkgEval sandboxes share the host network namespace, so package code under
+# test could otherwise reach IMDS and steal the instance's role credentials.
+# Instead: IMDS is firewalled to root only, and a root-owned localhost proxy
+# re-serves the credentials gated on a bearer token. The token is handed to the
+# worker via systemd EnvironmentFile; the sandbox inherits neither the worker's
+# environment nor host files, so it can reach the proxy's port but never
+# authenticate to it.
+CREDS_TOKEN=$(head -c 32 /dev/urandom | sha256sum | cut -d' ' -f1)
+install -m 640 -o root -g worker /dev/null /etc/pkgeval-worker.env
+cat >/etc/pkgeval-worker.env <<ENVFILE
+PKGEVAL_CREDS_URL=http://127.0.0.1:9911/credentials
+PKGEVAL_CREDS_TOKEN=$CREDS_TOKEN
+ENVFILE
+
+cat >/usr/local/bin/pkgeval-imds-proxy <<'PROXY'
+#!/usr/bin/env python3
+"""Serve this instance's IMDSv2 role credentials on localhost, bearer-gated."""
+import json, os, time, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+IMDS = "http://169.254.169.254"
+TOKEN = os.environ["CREDS_TOKEN"]
+cache = {"expires": 0, "body": b""}
+
+def imds(path, token):
+    req = urllib.request.Request(IMDS + path, headers={"X-aws-ec2-metadata-token": token})
+    return urllib.request.urlopen(req, timeout=5).read()
+
+def fetch():
+    if time.time() < cache["expires"]:
+        return cache["body"]
+    req = urllib.request.Request(IMDS + "/latest/api/token", method="PUT",
+        headers={"X-aws-ec2-metadata-token-ttl-seconds": "300"})
+    token = urllib.request.urlopen(req, timeout=5).read().decode()
+    role = imds("/latest/meta-data/iam/security-credentials/", token).decode().strip()
+    body = imds("/latest/meta-data/iam/security-credentials/" + role, token)
+    cache["body"] = body
+    cache["expires"] = time.time() + 120  # IMDS rotates well ahead of expiry
+    return body
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer " + TOKEN:
+            self.send_response(401); self.end_headers(); return
+        if self.path != "/credentials":
+            self.send_response(404); self.end_headers(); return
+        try:
+            body = fetch()
+        except Exception as err:
+            self.send_response(502); self.end_headers()
+            self.wfile.write(json.dumps({"error": str(err)}).encode()); return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+HTTPServer(("127.0.0.1", 9911), Handler).serve_forever()
+PROXY
+chmod 755 /usr/local/bin/pkgeval-imds-proxy
+
+cat >/etc/systemd/system/pkgeval-imds-proxy.service <<UNIT
+[Unit]
+Description=Bearer-gated IMDS credential proxy for the PkgEval worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+Environment=CREDS_TOKEN=$CREDS_TOKEN
+# (re-)apply the firewall on every boot: IMDS reachable by root only
+ExecStartPre=-/usr/sbin/iptables -D OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j REJECT
+ExecStartPre=/usr/sbin/iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j REJECT
+ExecStart=/usr/local/bin/pkgeval-imds-proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat >/etc/systemd/system/pkgeval-worker.service <<UNIT
 [Unit]
 Description=PkgEval farm worker
-After=network-online.target
+After=network-online.target pkgeval-imds-proxy.service
 Wants=network-online.target
+Requires=pkgeval-imds-proxy.service
 
 [Service]
 User=worker
@@ -40,6 +121,10 @@ Environment=PKGEVAL_QUEUE_URL=${queue_url}
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}
 Environment=PKGEVAL_JOBS_TABLE=${jobs_table}
 Environment=PKGEVAL_BUCKET=${bucket}
+# PKGEVAL_CREDS_URL/_TOKEN: credentials come from the bearer-gated local proxy
+# (IMDS itself is firewalled to root); the token file is root:worker 640 and
+# systemd injects it, so it never exists in sandbox-visible files or env
+EnvironmentFile=/etc/pkgeval-worker.env
 ExecStart=/home/worker/PkgEvalFarm.jl/bin/farm worker
 Restart=always
 RestartSec=30
@@ -49,4 +134,5 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
+systemctl enable --now pkgeval-imds-proxy
 systemctl enable --now pkgeval-worker

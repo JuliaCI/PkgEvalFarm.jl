@@ -138,14 +138,36 @@ function aws_credentials(broker, role, token, payload=fetch_broker_creds(broker,
 end
 
 """
+Renewing credentials from a local metadata-style proxy (EC2 workers): sandboxed
+package code shares the host network, so IMDS itself is firewalled to root and a
+root-owned proxy re-serves the credentials gated on a bearer token that only the
+worker's environment holds (the PkgEval sandbox inherits neither environment nor
+host files, so the token is out of its reach).
+"""
+function proxy_credentials(url::AbstractString, token::AbstractString)
+    resp = HTTP.get(url, ["Authorization" => "Bearer $token"])
+    c = JSON.parse(String(resp.body))
+    # IMDS credential document shape
+    AWS.AWSCredentials(c["AccessKeyId"], c["SecretAccessKey"], c["Token"];
+                       expiry=parse_expiration(c["Expiration"]),
+                       renew=() -> proxy_credentials(url, token))
+end
+
+"""
     farm_ctx(; broker=broker_url(), role="worker") -> (ctx::FarmCtx, user)
 
 Build a `FarmCtx` with auto-refreshing broker-vended credentials.
 
-If `PKGEVAL_QUEUE_URL` (etc.) are set in the environment, the broker is bypassed and
-the ambient AWS credential chain is used instead — useful for admins and tests.
+The broker is bypassed when `PKGEVAL_CREDS_URL` is set (EC2 workers: bearer-gated
+local credential proxy, see `proxy_credentials`) or when `PKGEVAL_QUEUE_URL` alone is
+set (ambient AWS credential chain — admins and tests).
 """
 function farm_ctx(; broker::Union{AbstractString,Nothing}=nothing, role::AbstractString="worker")
+    if broker === nothing && haskey(ENV, "PKGEVAL_CREDS_URL")
+        cfg = farm_config_from_env()
+        creds = proxy_credentials(ENV["PKGEVAL_CREDS_URL"], ENV["PKGEVAL_CREDS_TOKEN"])
+        return FarmCtx(cfg, AWS.AWSConfig(; creds, region=cfg.region)), worker_identity()
+    end
     if broker === nothing && haskey(ENV, "PKGEVAL_QUEUE_URL")
         cfg = farm_config_from_env()
         return FarmCtx(cfg, AWS.global_aws_config(; region=cfg.region)), worker_identity()

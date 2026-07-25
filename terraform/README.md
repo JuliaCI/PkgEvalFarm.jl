@@ -88,14 +88,15 @@ juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 (worker logs via `journalctl -u pkgeval-worker`).
 
-**Credential-exposure caveat**: PkgEval sandboxes do not get their own network
-namespace, so on EC2 workers the *package code under test* can reach the
-instance metadata service and obtain the worker-role credentials. Those are
-deliberately low-privilege (write logs under `runs/`, flip job states, queue
-operations — the same power any enrolled worker holds), but it does mean the
-package-code/worker boundary is not credential-tight on EC2. Brokered workers
-keep their credentials in process memory, out of the sandbox's reach. The
-structural fix is network-namespace isolation in PkgEval itself.
+**IMDS protection**: PkgEval sandboxes share the host network namespace, so
+package code under test could otherwise reach the instance metadata service
+and steal the worker-role credentials. Cloud-init therefore firewalls IMDS to
+root only (`iptables` uid-owner rule) and runs a root-owned localhost proxy
+that re-serves the credentials gated on a bearer token. The token reaches the
+worker via a root:worker-readable systemd `EnvironmentFile`; the sandbox
+inherits neither the worker's environment nor host files, so it can reach the
+proxy's port but never authenticate. Network-namespace isolation in PkgEval
+itself would still be a welcome belt-and-braces improvement.
 
 ## Variables
 
