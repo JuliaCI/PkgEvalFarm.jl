@@ -48,6 +48,24 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
+  # Fast canary (~20s, no checkout/tests/build): answers "does the OIDC trust
+  # policy authorize this workflow?" without waiting on the pipeline. Lives in
+  # this file deliberately, so its job_workflow_ref matches the deploy job's.
+  oidc-check:
+    name: OIDC assume check
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: oidc-check-${{ github.run_id }}
+      - run: aws sts get-caller-identity
+
   build:
     name: Build Lambda bundles
     runs-on: ubuntu-latest
