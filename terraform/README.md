@@ -88,6 +88,14 @@ juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 (worker logs via `journalctl -u pkgeval-worker`).
 
+**Container prerequisites**: PkgEval drives rootless containers with `crun
+--systemd-cgroup`, which needs the worker user's own systemd manager and
+session D-Bus — a plain `User=` system service has neither, so cloud-init
+enables lingering for the worker. It also delegates `cpuset` to user managers
+(systemd's default omits it), which the per-slot CPU pinning requires;
+without it containers fail with "the requested cgroup controller `cpuset` is
+not available", which PkgEval reports only as `skip`/`uninstallable`.
+
 **IMDS protection**: PkgEval sandboxes share the host network namespace, so
 package code under test could otherwise reach the instance metadata service
 and steal the worker-role credentials. Cloud-init therefore firewalls IMDS to

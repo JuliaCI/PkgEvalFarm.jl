@@ -29,6 +29,18 @@ useradd --create-home --shell /bin/bash worker
 # starting with the shared Xvfb one -- dies instantly with the error discarded.
 # Lingering starts a persistent `systemd --user` for the worker at boot, which
 # creates /run/user/<uid> and its bus.
+#
+# systemd delegates only `memory pids cpu` to user managers by default. The
+# worker pins each slot to a CPU, so crun also needs `cpuset` — without it every
+# container fails with "the requested cgroup controller `cpuset` is not
+# available", which PkgEval surfaces as an unhelpful skip/uninstallable.
+mkdir -p /etc/systemd/system/user@.service.d
+cat >/etc/systemd/system/user@.service.d/delegate.conf <<DELEGATE
+[Service]
+Delegate=cpu cpuset io memory pids
+DELEGATE
+systemctl daemon-reload
+
 loginctl enable-linger worker
 WORKER_UID=$(id -u worker)
 
