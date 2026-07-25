@@ -47,3 +47,8 @@ output "bot_webhook_url" {
   description = "URL to register as a GitHub issue_comment webhook (empty when disabled)."
   value       = length(aws_lambda_function_url.bot) > 0 ? aws_lambda_function_url.bot[0].function_url : ""
 }
+
+output "test_worker_instance_ids" {
+  description = "Instance ids of the test workers (connect with `aws ssm start-session --target <id>`)."
+  value       = aws_instance.test_worker[*].id
+}

@@ -48,6 +48,23 @@ There is no per-machine registration and no long-lived secrets:
   all other configuration (queue URL, table names, bucket, region) is served
   by the broker itself.
 
+## Test workers
+
+For shakedown testing, the config can spin up self-enrolling EC2 workers:
+
+```sh
+tofu apply -var test_worker_count=2    # up
+tofu apply -var test_worker_count=0    # down (default)
+```
+
+Being inside AWS they skip GitHub enrollment entirely — an instance profile
+carries the same worker policy the broker would vend, and cloud-init installs
+juliaup + PkgEvalFarm.jl (`test_worker_farm_repo`/`_ref`) and starts a
+`pkgeval-worker` systemd unit with the cgroup/userns settings PkgEval needs.
+No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
+(ids in the `test_worker_instance_ids` output; worker logs via
+`journalctl -u pkgeval-worker`).
+
 ## Variables
 
 | Name | Required | Default | Description |
@@ -65,6 +82,11 @@ There is no per-machine registration and no long-lived secrets:
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
+| `test_worker_count` | no | `0` | Self-enrolling EC2 test workers to run (0 = none). |
+| `test_worker_instance_type` | no | `"c6i.2xlarge"` | Instance type for test workers. |
+| `test_worker_disk_gb` | no | `200` | Test worker root volume (GB). |
+| `test_worker_farm_repo` / `_ref` | no | staging repo, `master` | Where test workers clone PkgEvalFarm.jl from. |
+| `test_worker_julia_channel` | no | `"1.12"` | juliaup channel installed on test workers. |
 
 ## Deploying
 

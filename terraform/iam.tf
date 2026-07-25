@@ -65,11 +65,9 @@ resource "aws_iam_role" "worker" {
   })
 }
 
-resource "aws_iam_role_policy" "worker" {
-  name = "worker-access"
-  role = aws_iam_role.worker.id
-
-  policy = jsonencode({
+# shared between the brokered worker role and the test-instance profile
+locals {
+  worker_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
@@ -111,6 +109,12 @@ resource "aws_iam_role_policy" "worker" {
       },
     ]
   })
+}
+
+resource "aws_iam_role_policy" "worker" {
+  name   = "worker-access"
+  role   = aws_iam_role.worker.id
+  policy = local.worker_policy
 }
 
 # --- Submitter role ----------------------------------------------------------

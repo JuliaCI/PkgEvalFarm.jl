@@ -74,3 +74,39 @@ variable "github_webhook_secret" {
   default     = ""
   sensitive   = true
 }
+
+variable "test_worker_count" {
+  description = "Number of self-enrolling EC2 test workers (0 disables everything test-worker related)."
+  type        = number
+  default     = 0
+}
+
+variable "test_worker_instance_type" {
+  description = "Instance type for test workers."
+  type        = string
+  default     = "c6i.2xlarge"
+}
+
+variable "test_worker_disk_gb" {
+  description = "Root volume size for test workers (rootfs/compile caches are hungry)."
+  type        = number
+  default     = 200
+}
+
+variable "test_worker_farm_repo" {
+  description = "Git URL the test workers clone PkgEvalFarm.jl from."
+  type        = string
+  default     = "https://github.com/KenoAIStaging/PkgEvalFarm.jl"
+}
+
+variable "test_worker_farm_ref" {
+  description = "Branch/tag of PkgEvalFarm.jl to check out on test workers."
+  type        = string
+  default     = "master"
+}
+
+variable "test_worker_julia_channel" {
+  description = "juliaup channel installed on test workers."
+  type        = string
+  default     = "1.12"
+}
