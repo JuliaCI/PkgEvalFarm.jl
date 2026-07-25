@@ -13,6 +13,17 @@ concurrency:
 permissions:
   contents: read
 
+# Deployment coordinates. None of these are secrets (an account id, a role ARN,
+# a bucket name and a public function URL), so they live here rather than in
+# repository variables — the workflow is then self-contained and a redeployment
+# elsewhere is a one-file edit.
+env:
+  AWS_REGION: us-east-1
+  AWS_DEPLOY_ROLE: arn:aws:iam::873569884612:role/pkgeval-deploy
+  LAMBDA_BUCKET: nanosoldier2-lambda
+  NAME_PREFIX: pkgeval
+  BROKER_URL: https://xxwaguxec43lrpm2f74o4uftmy0wbxxd.lambda-url.us-east-1.on.aws
+
 jobs:
   test:
     name: Tests (Julia ${{ matrix.julia }})
@@ -90,13 +101,13 @@ jobs:
           name: lambda-bundles
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: pkgevalfarm-deploy-${{ github.run_id }}
       - name: Upload bundles
         run: |
-          aws s3 cp broker/build/bootstrap.zip "s3://${{ vars.LAMBDA_BUCKET }}/broker.zip"
-          aws s3 cp bot/build/bootstrap.zip "s3://${{ vars.LAMBDA_BUCKET }}/bot.zip"
+          aws s3 cp broker/build/bootstrap.zip "s3://${{ env.LAMBDA_BUCKET }}/broker.zip"
+          aws s3 cp bot/build/bootstrap.zip "s3://${{ env.LAMBDA_BUCKET }}/bot.zip"
       - name: Publish to Lambda
         run: |
           publish() {
@@ -106,17 +117,17 @@ jobs:
               return 0
             }
             aws lambda update-function-code --function-name "$name" \
-              --s3-bucket "${{ vars.LAMBDA_BUCKET }}" --s3-key "$key" --publish >/dev/null
+              --s3-bucket "${{ env.LAMBDA_BUCKET }}" --s3-key "$key" --publish >/dev/null
             aws lambda wait function-updated --function-name "$name"
             echo "::notice::published $name"
           }
-          publish "${{ vars.NAME_PREFIX || 'pkgeval' }}-broker" broker.zip
-          publish "${{ vars.NAME_PREFIX || 'pkgeval' }}-bot" bot.zip
+          publish "${{ env.NAME_PREFIX }}-broker" broker.zip
+          publish "${{ env.NAME_PREFIX }}-bot" bot.zip
       - name: Smoke-test the broker
         # /info needs no credentials and exercises init end to end, which is
         # exactly what the CPU-target class of bug breaks
-        if: vars.BROKER_URL != ''
+        if: env.BROKER_URL != ''
         run: |
-          body=$(curl -fsS --retry 5 --retry-delay 5 "${{ vars.BROKER_URL }}/info")
+          body=$(curl -fsS --retry 5 --retry-delay 5 "${{ env.BROKER_URL }}/info")
           echo "$body"
           echo "$body" | grep -q client_id

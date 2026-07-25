@@ -181,16 +181,18 @@ trusts it only for the `sub` claims in `github_deploy_subjects` — by default t
 The role may only write to the Lambda bucket and call `UpdateFunctionCode` on
 `${prefix}-*` functions.
 
-Configure these repository **variables** (Settings → Secrets and variables →
-Actions → Variables) from the terraform outputs:
+The deploy coordinates live in the workflow's own `env:` block — none of them
+are secrets (an account id, a role ARN, a bucket name and a public function
+URL), so there is nothing to configure in repository settings. After a
+redeployment, refresh them from the terraform outputs:
 
-| Variable | Value |
-| -------- | ----- |
-| `AWS_DEPLOY_ROLE` | `deploy_role_arn` output |
-| `AWS_REGION` | `region` output |
-| `LAMBDA_BUCKET` | `lambda_bucket` output |
-| `NAME_PREFIX` | `name_prefix` (optional; defaults to `pkgeval`) |
-| `BROKER_URL` | `broker_function_url` output (optional; enables the post-deploy smoke test) |
+| Workflow `env` | Output |
+| -------------- | ------ |
+| `AWS_DEPLOY_ROLE` | `deploy_role_arn` |
+| `AWS_REGION` | `region` |
+| `LAMBDA_BUCKET` | `lambda_bucket` |
+| `NAME_PREFIX` | `name_prefix` |
+| `BROKER_URL` | `broker_function_url` (empty disables the post-deploy smoke test) |
 
 Check whether the account already has a GitHub OIDC provider (only one per
 issuer URL is allowed; pass its ARN as `github_oidc_provider_arn` if so):
