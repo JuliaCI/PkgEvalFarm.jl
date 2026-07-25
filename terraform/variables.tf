@@ -192,8 +192,11 @@ variable "github_deploy_ref" {
 variable "github_deploy_workflow_ref" {
   description = "Workflow file allowed to deploy (OWNER/REPO/.github/workflows/FILE@REF), matched against `job_workflow_ref`. null omits."
   type        = string
-  default     = null
-  nullable    = true
+  # Bisect step 2: re-enabled *alone* to test whether AWS's GitHub-specific
+  # claim mapping authorizes on this provider. Value observed verbatim in a
+  # dumped token. If the canary denies, this key is not honored here.
+  default  = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
+  nullable = true
 }
 
 
