@@ -490,11 +490,22 @@ Run the Lambda custom-runtime loop forever: fetch each invocation, call
 function lambda_loop(handle::F) where {F}
     api = ENV["AWS_LAMBDA_RUNTIME_API"]
     next_url = "http://$api/2018-06-01/runtime/invocation/next"
+    # Lambda freezes the process while this GET waits for the next event and
+    # thaws it when one arrives, so libcurl wakes to minutes of wall clock with
+    # zero bytes transferred and Downloads' stalled-transfer default (1 byte/s
+    # over 20s) aborts the request — eating the very invocation that woke us.
+    # A dedicated downloader with the low-speed guard off; other requests are
+    # never frozen mid-flight and keep the default.
+    next_dl = Downloads.Downloader()
+    next_dl.easy_hook = (easy, _) -> begin
+        Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_LOW_SPEED_LIMIT, 0)
+        Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_LOW_SPEED_TIME, 0)
+    end
     while true
         request_id = ""
         try
             output = IOBuffer()
-            resp = Downloads.request(next_url; method="GET", output,
+            resp = Downloads.request(next_url; method="GET", output, downloader=next_dl,
                                      headers=["User-Agent" => "PkgEvalFarm"])
             resp isa Downloads.Response || error("unexpected runtime API response")
             request_id = resp_header(resp, "lambda-runtime-aws-request-id")

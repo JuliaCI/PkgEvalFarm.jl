@@ -30,7 +30,9 @@ export run_bot, handle_invocation
 
 ## command parsing (pure)
 
-const BOT_COMMAND = r"@([\w-]+)\s+runtests\((.*?)\)"s
+# the command may be wrapped in backticks — `runtests(...)` — which is how
+# classic Nanosoldier documents it and how people habitually write it
+const BOT_COMMAND = r"@([\w-]+)\s+`?runtests\((.*?)\)`?"s
 
 struct Command
     packages::Vector{String}
@@ -41,7 +43,8 @@ end
 """
     parse_command(body) -> Union{Nothing,Command}
 
-Parse a `@<bot> runtests(...)` comment. Supported forms:
+Parse a `@<bot> runtests(...)` comment (backticks around the command are
+allowed, matching classic Nanosoldier usage). Supported forms:
 
     runtests()                    all packages
     runtests(["Foo", "Bar"])      a subset

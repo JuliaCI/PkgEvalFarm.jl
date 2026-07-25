@@ -54,6 +54,10 @@ end
 @testset "bot command parsing" begin
     parse_command = PEF.FarmBot.parse_command
     @test parse_command("hello world") === nothing
+    let c = parse_command("@pkgeval `runtests([\"Example\"])`")
+        @test c.packages == ["Example"]
+        @test c.vs === nothing && c.error === nothing
+    end
     let c = parse_command("@pkgeval runtests()")
         @test c.packages == String[] && c.vs === nothing && c.error === nothing
     end
