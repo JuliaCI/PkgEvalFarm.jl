@@ -5,14 +5,21 @@
 # initial code bundles; CI owns code updates thereafter (see the ignore_changes
 # lifecycle blocks on the zip objects and functions).
 #
-# IMPORTANT: IAM maps only a fixed set of GitHub claims to condition keys —
-# actor, actor_id, job_workflow_ref, repository, repository_id,
-# repository_owner_id, workflow, ref, environment, enterprise_id, plus the
-# standard aud/sub/amr. A condition on any *other* claim (event_name,
-# runner_environment, repository_owner, workflow_ref, ...) can never match, so
-# the role silently becomes unassumable and STS answers with a flat
-# "Not authorized to perform sts:AssumeRoleWithWebIdentity".
-# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif
+# Two IAM rules govern what this trust policy may contain; violating either
+# yields the same unhelpful "Not authorized to perform
+# sts:AssumeRoleWithWebIdentity", with no indication of which condition failed:
+#
+#  1. GitHub Actions is a *shared* OIDC provider, so IAM requires the
+#     identity-provider control `token.actions.githubusercontent.com:sub` to be
+#     evaluated (and not as a bare wildcard). A policy that pins only the
+#     GitHub-specific claims and omits `sub` is unassumable.
+#     https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc_secure-by-default.html
+#  2. Only a fixed set of GitHub claims map to condition keys: actor, actor_id,
+#     job_workflow_ref, repository, repository_id, repository_owner_id,
+#     workflow, ref, environment, enterprise_id (plus aud/sub/amr). Conditions
+#     on anything else — event_name, runner_environment, repository_owner,
+#     workflow_ref — can never match.
+#     https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif
 
 resource "aws_iam_openid_connect_provider" "github" {
   count = var.github_oidc_provider_arn == null ? 1 : 0

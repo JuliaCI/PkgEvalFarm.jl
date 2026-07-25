@@ -169,9 +169,9 @@ variable "github_deploy_subjects" {
 }
 
 variable "github_repository_id" {
-  description = "Numeric repository id, pinned via the repository_id claim. null omits. Off by default: AWS's GitHub-specific claim mapping did not authorize on this account's provider (see README), so only standard claims are used."
+  description = "Numeric repository id, pinned via the repository_id claim (immutable across renames). null omits."
   type        = string
-  default     = null
+  default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
   nullable    = true
 }
 
@@ -183,9 +183,9 @@ variable "github_repository_owner_id" {
 }
 
 variable "github_deploy_ref" {
-  description = "Git ref allowed to deploy, matched against the `ref` claim. null omits (the branch is already pinned inside the immutable `sub`)."
+  description = "Git ref allowed to deploy, matched against the `ref` claim. null omits (the branch is also pinned inside `sub`)."
   type        = string
-  default     = null
+  default     = "refs/heads/master"
   nullable    = true
 }
 

@@ -205,39 +205,35 @@ aws iam list-open-id-connect-providers \
 
 ### What the trust policy is keyed on
 
-IAM maps a **fixed set** of GitHub claims to condition keys: `actor`,
-`actor_id`, `job_workflow_ref`, `repository`, `repository_id`,
-`repository_owner_id`, `workflow`, `ref`, `environment`, `enterprise_id`, plus
-the standard `aud`/`sub`/`amr`
-([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif)).
-A condition on any *other* claim — `event_name`, `runner_environment`,
-`repository_owner`, `workflow_ref` — can never match, so the role becomes
-unassumable and STS returns a bare `Not authorized to perform
-sts:AssumeRoleWithWebIdentity` with no indication of which condition failed.
-
 | Claim | Condition | Why |
 | ----- | --------- | --- |
+| `sub` | `∈ github_deploy_subjects` | **required** (see below); this org's immutable format pins owner id, repo id and branch |
 | `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
-| `repository_id` | `= github_repository_id` | immutable: survives renames, and the path can't be re-claimed after deletion |
-| `repository_owner_id` | `= github_repository_owner_id` | ditto for the owner |
+| `repository_id` | `= github_repository_id` | immutable: survives renames, path can't be re-claimed after deletion |
 | `ref` | `= github_deploy_ref` | only the deploy branch |
 | `job_workflow_ref` | `= github_deploy_workflow_ref` | only *this* workflow file; a new workflow on the branch doesn't inherit the grant |
 
-`sub` is deliberately unused (`github_deploy_subjects` is empty): its format is
-org-configurable — this org emits the immutable variant,
-`repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master` — and the claims
-above pin the same facts in a format GitHub can't reconfigure underneath us.
+Two IAM rules constrain what may go here. Violating either produces the same
+opaque `Not authorized to perform sts:AssumeRoleWithWebIdentity`, with no hint
+as to which condition failed:
 
-Forks and pull requests are excluded by `ref`: a PR run carries
-`ref=refs/pull/N/merge`. Belt and braces, GitHub caps fork-PR permissions at
-read-only, so such a job cannot mint a token at all, and the deploy job's `if:`
-refuses to run outside a push to the deploy branch. Guards IAM cannot express
-(only on `push`, only on a GitHub-hosted runner) live in that `if:` and should
-be backed by branch protection.
+1. **`sub` must be evaluated.** GitHub Actions is a *shared* OIDC provider
+   (many AWS customers trust the same issuer), so IAM demands an
+   [identity-provider control](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc_secure-by-default.html):
+   `token.actions.githubusercontent.com:sub`, not a bare wildcard. A policy that
+   pins only the GitHub-specific claims and drops `sub` is unassumable —
+   the docs say such an update should fail with `MalformedPolicyDocument`, but
+   in practice terraform applied it happily and only STS refused later.
+2. **Only mapped claims work.** `actor`, `actor_id`, `job_workflow_ref`,
+   `repository`, `repository_id`, `repository_owner_id`, `workflow`, `ref`,
+   `environment`, `enterprise_id`, plus `aud`/`sub`/`amr`
+   ([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif)).
+   Conditions on `event_name`, `runner_environment`, `repository_owner` or
+   `workflow_ref` can never match.
 
-Note `job_workflow_ref` pins the file path — renaming `ci.yml` or moving the
-deploy job into a reusable workflow breaks deploys until the variable is
-updated. To see the claims a run actually mints:
+Note the subject format is org-configurable: this org mints the *immutable*
+variant, `repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master`, not the
+documented `repo:OWNER/REPO:...`. Dump a real token before writing the policy:
 
 ```yaml
 - run: |
@@ -245,6 +241,16 @@ updated. To see the claims a run actually mints:
       "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
     echo "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
 ```
+
+Forks and pull requests are excluded by `ref` and by `sub`'s trailing
+`:ref:refs/heads/master` (a PR run carries `refs/pull/N/merge`). GitHub also
+caps fork-PR permissions at read-only, so such a job cannot mint a token at
+all. Guards IAM cannot express — only on `push`, only on a GitHub-hosted runner
+— live in the deploy job's `if:` and should be backed by branch protection.
+
+The `oidc-check` job in the workflow is a ~20s canary that assumes the role
+with no test/build dependency; use it to validate trust-policy changes without
+waiting for the full pipeline.
 
 Terraform bootstraps the initial bundles and then defers to CI: the zip objects
 and the functions' `source_code_hash` carry `ignore_changes`, so a later
