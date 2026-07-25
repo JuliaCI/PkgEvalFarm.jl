@@ -65,6 +65,11 @@ resource "aws_lambda_function" "bot" {
   memory_size   = 1024
   timeout       = 300 # report aggregation pages through every job of a run
 
+  # the function URL is publicly invokable (webhook auth is HMAC inside); real
+  # concurrency needs are minimal (stream: one batch per shard, schedule:
+  # hourly, webhooks: human-paced), so a small cap bounds URL-spam cost
+  reserved_concurrent_executions = 5
+
   environment {
     variables = {
       NANOSOLDIER2_GITHUB_TOKEN = var.github_bot_token
