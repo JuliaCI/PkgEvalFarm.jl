@@ -5,3 +5,6 @@ broker/build/bootstrap.zip
 terraform/.terraform/
 *.tfstate
 *.tfstate.backup
+bot/build/stage/
+bot/build/bootstrap.zip
+lite/Manifest.toml

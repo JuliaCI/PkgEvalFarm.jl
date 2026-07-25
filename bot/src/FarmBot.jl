@@ -19,7 +19,10 @@ include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
 using .FarmLite: Attr, Item, attr, str, int, opt_str, json_item, ddb, sqs_send_message,
                  s3_put, is_conditional_failure, GitHubCtx, github_request, urlencode,
-                 error_message, lambda_loop, ctx_from_env
+                 error_message, lambda_loop, ctx_from_env,
+                 LazyVal, parse_json, json_string, json_bool, json_int,
+                 json_string_vector, jsontype, isnullval, json_expected
+import .FarmLite: json_make
 
 export run_bot, handle_invocation
 
@@ -65,11 +68,16 @@ function parse_command(body::AbstractString)
                (arg::Expr).args[1] === :vs && (arg::Expr).args[2] isa String
                 vs = (arg::Expr).args[2]::String
             elseif Meta.isexpr(arg, :vect) && all(x -> x isa String, (arg::Expr).args)
-                packages = String[(arg::Expr).args...]
+                packages = String[x::String for x in (arg::Expr).args]
             elseif arg === :ALL
                 # explicit "all packages"
             else
-                return Command(packages, vs, "unsupported argument `$arg`")
+                # description via an isa-chain: `string(::Any)` on the expression
+                # would pull the (untimmable) Expr-show machinery into the binary
+                argdesc = arg isa Symbol ? String(arg) :
+                          arg isa String ? arg :
+                          arg isa Number ? "a number" : "an expression"
+                return Command(packages, vs, "unsupported argument `$argdesc`")
             end
         end
     end
@@ -120,7 +128,143 @@ struct GhPr
     base::Union{Nothing,GhCommit}
 end
 
-parse_json(body::String, ::Type{T}) where {T} = JSON.parse(body, T)::T
+# lazy materializers (see FarmLite.parse_json: typed `JSON.parse(body, T)` cannot
+# pass the `juliac --trim=safe` verifier, so shapes are built by walking JSON.jl's
+# lazy values with concrete closures)
+
+function json_make(::Type{NotificationSubject}, x::LazyVal)
+    type = Ref{Union{Nothing,String}}(nothing)
+    url = Ref{Union{Nothing,String}}(nothing)
+    latest_comment_url = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "type"
+            s, p = json_string(v); type[] = s; return p
+        elseif k == "url"
+            s, p = json_string(v); url[] = s; return p
+        elseif k == "latest_comment_url"
+            s, p = json_string(v); latest_comment_url[] = s; return p
+        end
+        return nothing
+    end
+    return NotificationSubject(type[], url[], latest_comment_url[]), pos::Int
+end
+
+function json_make(::Type{Notification}, x::LazyVal)
+    id = Ref{Union{Nothing,String}}(nothing)
+    reason = Ref{Union{Nothing,String}}(nothing)
+    subject = Ref{Union{Nothing,NotificationSubject}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "id"
+            s, p = json_string(v); id[] = s; return p
+        elseif k == "reason"
+            s, p = json_string(v); reason[] = s; return p
+        elseif k == "subject"
+            s, p = json_make(NotificationSubject, v); subject[] = s; return p
+        end
+        return nothing
+    end
+    return Notification(id[], reason[], subject[]), pos::Int
+end
+
+function json_make(::Type{Vector{Notification}}, x::LazyVal)
+    jsontype(x) == JSON.JSONTypes.ARRAY || json_expected("array")
+    out = Notification[]
+    pos = JSON.applyarray(x) do i, v
+        n, p = json_make(Notification, v)
+        push!(out, n)
+        return p
+    end
+    return out, pos::Int
+end
+
+function json_make(::Type{GhUser}, x::LazyVal)
+    login = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "login"
+            s, p = json_string(v); login[] = s; return p
+        end
+        return nothing
+    end
+    return GhUser(login[]), pos::Int
+end
+
+function json_make(::Type{GhComment}, x::LazyVal)
+    body = Ref{Union{Nothing,String}}(nothing)
+    user = Ref{Union{Nothing,GhUser}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "body"
+            s, p = json_string(v); body[] = s; return p
+        elseif k == "user"
+            u, p = json_make(GhUser, v); user[] = u; return p
+        end
+        return nothing
+    end
+    return GhComment(body[], user[]), pos::Int
+end
+
+function json_make(::Type{GhPrRef}, x::LazyVal)
+    url = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "url"
+            s, p = json_string(v); url[] = s; return p
+        end
+        return nothing
+    end
+    return GhPrRef(url[]), pos::Int
+end
+
+function json_make(::Type{GhIssue}, x::LazyVal)
+    number = Ref{Union{Nothing,Int}}(nothing)
+    repository_url = Ref{Union{Nothing,String}}(nothing)
+    pull_request = Ref{Union{Nothing,GhPrRef}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "number"
+            n, p = json_int(v); number[] = Int(n); return p
+        elseif k == "repository_url"
+            s, p = json_string(v); repository_url[] = s; return p
+        elseif k == "pull_request"
+            r, p = json_make(GhPrRef, v); pull_request[] = r; return p
+        end
+        return nothing
+    end
+    return GhIssue(number[], repository_url[], pull_request[]), pos::Int
+end
+
+function json_make(::Type{GhCommit}, x::LazyVal)
+    sha = Ref{Union{Nothing,String}}(nothing)
+    ref = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "sha"
+            s, p = json_string(v); sha[] = s; return p
+        elseif k == "ref"
+            s, p = json_string(v); ref[] = s; return p
+        end
+        return nothing
+    end
+    return GhCommit(sha[], ref[]), pos::Int
+end
+
+function json_make(::Type{GhPr}, x::LazyVal)
+    head = Ref{Union{Nothing,GhCommit}}(nothing)
+    base = Ref{Union{Nothing,GhCommit}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "head"
+            c, p = json_make(GhCommit, v); head[] = c; return p
+        elseif k == "base"
+            c, p = json_make(GhCommit, v); base[] = c; return p
+        end
+        return nothing
+    end
+    return GhPr(head[], base[]), pos::Int
+end
 
 
 ## DynamoDB response shapes
@@ -133,6 +277,42 @@ struct ItemResp                        # GetItem
     Item::Union{Nothing,Item}
 end
 
+function json_make(::Type{ItemsResp}, x::LazyVal)
+    items = Ref{Union{Nothing,Vector{Item}}}(nothing)
+    last_key = Ref{Union{Nothing,Item}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "Items"
+            jsontype(v) == JSON.JSONTypes.ARRAY || json_expected("array of items")
+            out = Item[]
+            p = JSON.applyarray(v) do i, val
+                # distinct name: reusing `item` would capture (and box) the outer one
+                it, q = json_make(Item, val)
+                push!(out, it)
+                return q
+            end
+            items[] = out
+            return p::Int
+        elseif k == "LastEvaluatedKey"
+            item, p = json_make(Item, v); last_key[] = item; return p
+        end
+        return nothing
+    end
+    return ItemsResp(items[], last_key[]), pos::Int
+end
+
+function json_make(::Type{ItemResp}, x::LazyVal)
+    item = Ref{Union{Nothing,Item}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "Item"
+            i, p = json_make(Item, v); item[] = i; return p
+        end
+        return nothing
+    end
+    return ItemResp(item[]), pos::Int
+end
+
 
 ## run submission (mirrors PkgEvalFarm.create_run: one PutItem + one expand message)
 
@@ -140,7 +320,9 @@ isodate() = Dates.format(Dates.now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 
 function new_run_id()
     suffix = join(rand("0123456789abcdef", 6))
-    Dates.format(Dates.now(UTC), "yyyymmdd-HHMMSS") * "-" * suffix
+    # a dateformat"" literal: `format` with a format *string* builds the DateFormat
+    # dynamically, which `juliac --trim` cannot resolve
+    Dates.format(Dates.now(UTC), dateformat"yyyymmdd-HHMMSS") * "-" * suffix
 end
 
 "Serialized `Configuration` the workers will reconstruct (modified settings only)."
@@ -276,6 +458,24 @@ struct RunContext
     requester::Union{Nothing,String}
 end
 
+function json_make(::Type{RunContext}, x::LazyVal)
+    repo = Ref{Union{Nothing,String}}(nothing)
+    issue = Ref{Union{Nothing,Int}}(nothing)
+    requester = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "repo"
+            s, p = json_string(v); repo[] = s; return p
+        elseif k == "issue"
+            n, p = json_int(v); issue[] = Int(n); return p
+        elseif k == "requester"
+            s, p = json_string(v); requester[] = s; return p
+        end
+        return nothing
+    end
+    return RunContext(repo[], issue[], requester[]), pos::Int
+end
+
 function check_finished_runs(ctx::LiteCtx, gh::GitHubCtx)
     start_key = ""
     while true
@@ -305,7 +505,9 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     try
         ddb(ctx, "UpdateItem", payload)
     catch err
-        is_conditional_failure(err) && return
+        # narrow before dispatching: a call on the Any-typed catch slot cannot be
+        # resolved by the trim verifier
+        err isa ErrorException && is_conditional_failure(err) && return
         rethrow()
     end
 
@@ -368,6 +570,35 @@ struct ConfigInfo
     name::Union{Nothing,String}
     julia::Union{Nothing,String}
     buildflags::Union{Nothing,Vector{String}}
+end
+
+function json_make(::Type{ConfigInfo}, x::LazyVal)
+    name = Ref{Union{Nothing,String}}(nothing)
+    julia = Ref{Union{Nothing,String}}(nothing)
+    buildflags = Ref{Union{Nothing,Vector{String}}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "name"
+            s, p = json_string(v); name[] = s; return p
+        elseif k == "julia"
+            s, p = json_string(v); julia[] = s; return p
+        elseif k == "buildflags"
+            f, p = json_string_vector(v); buildflags[] = f; return p
+        end
+        return nothing
+    end
+    return ConfigInfo(name[], julia[], buildflags[]), pos::Int
+end
+
+function json_make(::Type{Vector{ConfigInfo}}, x::LazyVal)
+    jsontype(x) == JSON.JSONTypes.ARRAY || json_expected("array")
+    out = ConfigInfo[]
+    pos = JSON.applyarray(x) do i, v
+        c, p = json_make(ConfigInfo, v)
+        push!(out, c)
+        return p
+    end
+    return out, pos::Int
 end
 
 function describe_job(ctx::LiteCtx, job::Item)

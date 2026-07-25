@@ -159,9 +159,13 @@ ddb(ctx::LiteCtx, op::String, payload::String) =
     aws_json(ctx, "dynamodb", "DynamoDB_20120810.$op", payload)
 
 "Whether an error thrown by `ddb` was a failed ConditionExpression."
-is_conditional_failure(err) = err isa ErrorException &&
-    (occursin("ConditionalCheckFailed", err.msg) ||
-     occursin("conditional request failed", lowercase(err.msg)))
+function is_conditional_failure(err)
+    err isa ErrorException || return false
+    msg = err.msg
+    msg isa String || return false  # narrow the AbstractString field for juliac --trim
+    return occursin("ConditionalCheckFailed", msg) ||
+           occursin("conditional request failed", lowercase(msg))
+end
 
 function sqs_send_message(ctx::LiteCtx, body::String)
     payload = JSON.json((; QueueUrl=ctx.queue_url, MessageBody=body))
@@ -188,6 +192,65 @@ function s3_put(ctx::LiteCtx, key::String, body::String; content_type::String="t
     resp = http_request("PUT", url; headers, body)
     resp.status == 200 || error("S3 PUT $key failed (HTTP $(resp.status)): $(resp.body)")
     return nothing
+end
+
+
+## typed JSON parsing: a small materialization layer over JSON.jl's lazy parser.
+## JSON.jl does all the actual parsing (lexing, string unescaping, number parsing);
+## we only walk the lazy values with fully-concrete closures so that every call is
+## statically resolvable under `juliac --trim=safe` (the generic `StructUtils.make`
+## machinery, and thus typed `JSON.parse(buf, T)`, is deliberately unspecialized on
+## the target type, which the trim verifier rejects). Consumers define
+## `json_make(::Type{T}, ::LazyVal)` methods for their own shapes.
+
+const LazyVal = JSON.LazyValue{String}
+
+@noinline json_expected(what::String) = error("malformed JSON: expected " * what)
+
+jsontype(v::LazyVal) = JSON.gettype(v)
+isnullval(v::LazyVal) = jsontype(v) == JSON.JSONTypes.NULL
+
+function json_string(v::LazyVal)
+    jsontype(v) == JSON.JSONTypes.STRING || json_expected("string")
+    s, pos = JSON.parsestring(v)
+    return convert(String, s)::String, pos
+end
+
+function json_bool(v::LazyVal)
+    t = jsontype(v)
+    t == JSON.JSONTypes.TRUE && return true, JSON.getpos(v) + 4
+    t == JSON.JSONTypes.FALSE && return false, JSON.getpos(v) + 5
+    json_expected("boolean")
+end
+
+function json_int(v::LazyVal)
+    jsontype(v) == JSON.JSONTypes.NUMBER || json_expected("integer")
+    num, pos = JSON.parsenumber(v)
+    n = JSON.isint(num) ? num.int :
+        JSON.isfloat(num) ? Int64(num.float) : json_expected("integer")
+    return n::Int64, pos
+end
+
+function json_string_vector(v::LazyVal)
+    jsontype(v) == JSON.JSONTypes.ARRAY || json_expected("array of strings")
+    out = String[]
+    pos = JSON.applyarray(v) do i, val
+        s, p = json_string(val)
+        push!(out, s)
+        return p
+    end
+    return out, pos::Int
+end
+
+"`json_make(::Type{T}, ::LazyVal) -> (value::T, pos::Int)`; see `parse_json`."
+function json_make end
+
+"Parse `buf` into `T` via `json_make`, checking that the whole input is consumed."
+function parse_json(buf::String, ::Type{T}) where {T}
+    x = JSON.lazy(buf)
+    v, pos = json_make(T, x)
+    JSON.checkendpos(x, T, pos)
+    return v
 end
 
 
@@ -218,6 +281,57 @@ str(item::Item, key::String, default::String) =
     haskey(item, key) && item[key].S !== nothing ? something(item[key].S) : default
 int(item::Item, key::String) = parse(Int, something(item[key].N)::String)
 opt_str(item::Item, key::String) = haskey(item, key) ? item[key].S : nothing
+
+# lazy materializers for attribute values ("Attr" is recursive through L and M);
+# the explicit return types break the recursive inference cycle, which would
+# otherwise widen to Any and fail the trim verifier
+function json_make(::Type{Attr}, x::LazyVal)::Tuple{Attr,Int}
+    S = Ref{Union{Nothing,String}}(nothing)
+    N = Ref{Union{Nothing,String}}(nothing)
+    BOOL = Ref{Union{Nothing,Bool}}(nothing)
+    NULL = Ref{Union{Nothing,Bool}}(nothing)
+    L = Ref{Union{Nothing,Vector{Attr}}}(nothing)
+    M = Ref{Union{Nothing,Dict{String,Attr}}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "S"
+            s, p = json_string(v); S[] = s; return p
+        elseif k == "N"
+            s, p = json_string(v); N[] = s; return p
+        elseif k == "BOOL"
+            b, p = json_bool(v); BOOL[] = b; return p
+        elseif k == "NULL"
+            b, p = json_bool(v); NULL[] = b; return p
+        elseif k == "L"
+            l, p = json_make(Vector{Attr}, v); L[] = l; return p
+        elseif k == "M"
+            m, p = json_make(Item, v); M[] = m; return p
+        end
+        return nothing
+    end
+    return Attr(S[], N[], BOOL[], NULL[], L[], M[]), pos::Int
+end
+
+function json_make(::Type{Vector{Attr}}, x::LazyVal)::Tuple{Vector{Attr},Int}
+    jsontype(x) == JSON.JSONTypes.ARRAY || json_expected("attribute list")
+    out = Attr[]
+    pos = JSON.applyarray(x) do i, v
+        a, p = json_make(Attr, v)
+        push!(out, a)
+        return p
+    end
+    return out, pos::Int
+end
+
+function json_make(::Type{Item}, x::LazyVal)::Tuple{Item,Int}
+    item = Item()
+    pos = JSON.applyobject(x) do k, v
+        a, p = json_make(Attr, v)
+        item[convert(String, k)::String] = a
+        return p
+    end
+    return item, pos::Int
+end
 
 function json_attr(io::IO, a::Attr)
     if a.S !== nothing
@@ -250,20 +364,33 @@ end
 
 ## Lambda custom runtime loop
 
-"Trim-friendly error rendering (`sprint(showerror, ::Any)` cannot be trimmed)."
-function error_message(err)
-    if err isa ErrorException
-        return err.msg
-    elseif err isa ArgumentError
-        return err.msg
-    elseif err isa KeyError
-        return "missing key: $(string(err.key)::String)"
-    elseif err isa Downloads.RequestError
-        return "request to $(err.url) failed: $(err.message) (code $(err.code))"
-    else
-        return "unexpected error of type $(String(nameof(typeof(err))))"
-    end
+"""
+    @trim_errmsg err
+
+Trim-friendly error rendering (`sprint(showerror, ::Any)` cannot be trimmed, and
+neither can a function call dispatched on the `Any`-typed catch slot — hence a
+macro that expands to an inlined isa-chain).
+"""
+macro trim_errmsg(err)
+    esc(quote
+        local e = $err
+        if e isa ErrorException
+            e.msg
+        elseif e isa ArgumentError
+            e.msg
+        elseif e isa KeyError
+            local k = e.key
+            k isa String ? "missing key: " * k : "missing key"
+        elseif e isa Downloads.RequestError
+            "request to " * e.url * " failed: " * e.message * " (code " * string(e.code) * ")"
+        else
+            "unexpected error of type " * String(nameof(typeof(e)))
+        end
+    end)
 end
+
+"Function form of `@trim_errmsg` for callers with a narrowed exception type."
+error_message(err) = @trim_errmsg err
 
 """
     lambda_loop(handle)
@@ -287,8 +414,8 @@ function lambda_loop(handle::F) where {F}
                 "http://$api/2018-06-01/runtime/invocation/$request_id/response";
                 body=response)
         catch err
-            msg = error_message(err)
-            @error "invocation failed" msg
+            msg = (@trim_errmsg err)::String
+            println(Core.stderr, "invocation failed: ", msg)
             isempty(request_id) && continue
             try
                 http_request("POST",
