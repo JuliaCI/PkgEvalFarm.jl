@@ -72,11 +72,14 @@ function json_make(::Type{FnUrlEvent}, x::LazyVal)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         if k == "requestContext"
+            # NB: distinct local names per nesting level. Reusing `s`/`p` from
+            # the enclosing closure makes Julia box the shared capture to Any,
+            # which juliac --trim cannot verify.
             return JSON.applyobject(v) do rk, rv
                 rk == "http" || return nothing
                 JSON.applyobject(rv) do hk, hv
                     if hk == "method"
-                        s, p = json_string(hv); method[] = s; return p
+                        mstr, mpos = json_string(hv); method[] = mstr; return mpos
                     end
                     return nothing
                 end
@@ -155,7 +158,9 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
 
     repo = something(ask.repo, ALLOWED_REPO)
     repo == ALLOWED_REPO ||
-        return json_response(403, "{\"error\":\"only $ALLOWED_REPO builds may be requested\"}")
+        # literal rather than interpolated: interpolating even a const global
+        # emits a `string(::Any...)` call the trim verifier cannot resolve
+        return json_response(403, "{\"error\":\"only JuliaLang/julia builds may be requested\"}")
     sha = ask.sha
     (sha !== nothing && is_sha(something(sha))) ||
         return json_response(400, "{\"error\":\"sha must be a 40-character commit hash\"}")
@@ -163,15 +168,16 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
     variant in ("linux", "linuxassert") ||
         return json_response(400, "{\"error\":\"variant must be linux or linuxassert\"}")
 
-    table = ENV["PKGEVAL_BUILDS_TABLE"]
-    key = "$(something(sha))/$variant"
+    table = ENV["PKGEVAL_BUILDS_TABLE"]::String
+    commit = something(sha)::String
+    key = string(commit, "/", variant)
     if !claim_build(ctx, table, key, "lambda")
         return json_response(200, "{\"status\":\"already-requested\"}")
     end
 
-    trigger_build(ssm_parameter(ctx, ENV["BUILDKITE_TOKEN_PARAM"]),
-                  ENV["BUILDKITE_ORG"], ENV["BUILDKITE_PIPELINE"],
-                  something(sha), variant)
+    trigger_build(ssm_parameter(ctx, ENV["BUILDKITE_TOKEN_PARAM"]::String),
+                  ENV["BUILDKITE_ORG"]::String, ENV["BUILDKITE_PIPELINE"]::String,
+                  commit, variant)
     return json_response(202, "{\"status\":\"requested\"}")
 end
 
