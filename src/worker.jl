@@ -18,6 +18,12 @@ and tests).
 """
 function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                     ninstances::Int=Sys.CPU_THREADS, once::Bool=false)
+    # HTTP.jl pools connections *globally per socket type* (default
+    # max(16, nthreads*4)), so long-lived requests can starve every other AWS
+    # call in the process. We keep exactly one long poll in flight (below), but
+    # give the pool headroom for the concurrent uploads slots make anyway.
+    HTTP.set_default_connection_limit!(max(64, 4 * ninstances))
+
     ctx, user = farm_ctx(; broker, role="worker")
     @info "worker started" user ninstances host=gethostname()
 
@@ -25,12 +31,56 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     run_cache = Dict{String,Dict{String,Any}}()    # run_id -> parsed run item
     run_cache_lock = ReentrantLock()
 
+    # One receiver owns the only SQS long poll; slots take claimed work from the
+    # channel. A message is claimed *only* once a slot is free (the semaphore),
+    # so nothing sits claimed-but-unheartbeated waiting for capacity.
+    work = Channel{Any}(ninstances)
+    free_slots = Base.Semaphore(ninstances)
+
     slots = map(1:ninstances) do i
-        errormonitor(@async worker_slot(ctx, i - 1, draining, run_cache, run_cache_lock;
-                                        once))
+        errormonitor(@async begin
+            for claimed in work
+                try
+                    if claimed isa ClaimedExpand
+                        process_expand(ctx, claimed)
+                    else
+                        process_job(ctx, claimed, i - 1, run_cache, run_cache_lock)
+                    end
+                finally
+                    Base.release(free_slots)
+                end
+            end
+        end)
     end
 
+    receiver = errormonitor(@async begin
+        idle_polls = 0
+        try
+            while !draining[]
+                Base.acquire(free_slots)
+                claimed = try
+                    draining[] ? nothing : claim_job(ctx)
+                catch err
+                    @error "failed to poll the queue; backing off" exception=(err, catch_backtrace())
+                    sleep(30)
+                    nothing
+                end
+                if claimed === nothing
+                    Base.release(free_slots)
+                    idle_polls += 1
+                    once && idle_polls >= 3 && break
+                    continue
+                end
+                idle_polls = 0
+                put!(work, claimed)   # released by the slot that runs it
+            end
+        finally
+            close(work)
+        end
+    end)
+
     try
+        wait(receiver)
         wait.(slots)
         @info "queue drained; exiting"
     catch err
@@ -38,34 +88,10 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                                           err.task.exception isa InterruptException)
             @info "interrupted; draining running jobs (Ctrl-C again to abort)"
             draining[] = true
+            wait(receiver)
             wait.(slots)
         else
             rethrow()
-        end
-    end
-end
-
-function worker_slot(ctx::FarmCtx, cpu::Int, draining::Ref{Bool},
-                     run_cache, run_cache_lock; once::Bool=false)
-    idle_polls = 0
-    while !draining[]
-        claimed = try
-            claim_job(ctx)
-        catch err
-            @error "failed to poll the queue; backing off" slot=cpu exception=(err, catch_backtrace())
-            sleep(30)
-            continue
-        end
-        if claimed === nothing
-            idle_polls += 1
-            once && idle_polls >= 3 && return
-            continue
-        end
-        idle_polls = 0
-        if claimed isa ClaimedExpand
-            process_expand(ctx, claimed)
-        else
-            process_job(ctx, claimed, cpu, run_cache, run_cache_lock)
         end
     end
 end
@@ -110,7 +136,7 @@ end
 # job is redelivered. Returns a function that stops the heartbeat task.
 function start_heartbeat(ctx::FarmCtx, claimed, what)
     stopped = Ref(false)
-    task = @async while !stopped[]
+    task = @async for n in 1:MAX_HEARTBEATS
         sleep(HEARTBEAT_INTERVAL)
         stopped[] && break
         try
@@ -118,10 +144,16 @@ function start_heartbeat(ctx::FarmCtx, claimed, what)
         catch err
             @warn "heartbeat failed" what err
         end
+        # Bounded on purpose: a *hung* worker (as opposed to a dead one) would
+        # otherwise extend visibility forever and the job could never be
+        # redelivered. Give up well past any legitimate job duration.
+        n == MAX_HEARTBEATS &&
+            @error "job exceeded the heartbeat limit; releasing it to the queue" what
     end
+    # cooperative stop: the task checks `stopped` after each sleep, so it exits
+    # within one interval without needing to be interrupted mid-request
     return function ()
         stopped[] = true
-        istaskdone(task) || schedule(task, InterruptException(); error=true)
         nothing
     end
 end

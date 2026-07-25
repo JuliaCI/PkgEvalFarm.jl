@@ -7,6 +7,9 @@
 # how long a claimed message stays invisible; workers heartbeat well within this
 const VISIBILITY_TIMEOUT = 30 * 60
 const HEARTBEAT_INTERVAL = 5 * 60
+# ~3 hours: beyond any legitimate job (PkgEval's own limit is 45 min, doubled for
+# slow packages), so a hung worker eventually lets its job return to the queue
+const MAX_HEARTBEATS = 36
 
 isodate(t=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 

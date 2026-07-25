@@ -58,9 +58,14 @@ On any Linux x86_64/aarch64 machine that meets PkgEval's requirements (cgroup v2
 unprivileged user namespaces):
 
 ```sh
-bin/farm login          # GitHub device flow; requires membership in the workers team
-bin/farm worker         # pulls jobs until stopped; --ninstances to bound parallelism
+julia -e 'using Pkg; Pkg.Apps.add(url="https://github.com/KenoAIStaging/PkgEvalFarm.jl")'
+farm login              # GitHub device flow; requires membership in the workers team
+farm worker             # pulls jobs until stopped; --ninstances to bound parallelism
 ```
+
+`farm` is a Julia 1.12 [app](https://pkgdocs.julialang.org/dev/apps/): the shim
+lands in `~/.julia/bin`. From a checkout, `bin/farm <cmd>` (or
+`julia --project -m PkgEvalFarm <cmd>`) is equivalent.
 
 The only configuration a worker needs is the broker URL (`--broker` or
 `PKGEVAL_FARM_BROKER`); everything else (queue URL, table names, bucket, region) is

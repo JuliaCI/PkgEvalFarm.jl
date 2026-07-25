@@ -19,7 +19,7 @@ const CLI_HELP = """
     names ("nightly", "v1.12.0") or repo specs ("JuliaLang/julia#0123abc").
     """
 
-function main(args::Vector{String}=ARGS)
+function cli_main(args::Vector{String}=ARGS)
     isempty(args) && (println(CLI_HELP); return 0)
     command, rest... = args
     rest = collect(String, rest)
