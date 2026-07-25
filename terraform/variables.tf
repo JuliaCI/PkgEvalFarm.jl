@@ -75,16 +75,35 @@ variable "github_webhook_secret" {
   sensitive   = true
 }
 
-variable "ec2_worker_count" {
-  description = "Desired number of EC2 workers (testing/burst capacity; 0 disables)."
+variable "ec2_worker_max" {
+  description = "Capacity ceiling for EC2 workers (0 disables everything EC2-worker related). Scaling within [min, max] is queue-driven."
+  type        = number
+  default     = 0
+
+  # deliberate guardrail while the farm is young: raise this limit here when
+  # you actually mean to run a bigger fleet
+  validation {
+    condition     = var.ec2_worker_max <= 4
+    error_message = "ec2_worker_max is capped at 4 for now (worst case ≈ $2.5/h spot); raise the cap in variables.tf deliberately if you need more."
+  }
+}
+
+variable "ec2_worker_min" {
+  description = "Capacity floor for EC2 workers. Set equal to ec2_worker_max to pin fixed capacity."
   type        = number
   default     = 0
 }
 
-variable "ec2_worker_max" {
-  description = "Upper bound on EC2 workers."
+variable "ec2_worker_backlog_target" {
+  description = "Target visible queue backlog per in-service worker; lower = more aggressive scale-out. 400 clears a full backlog share in roughly half an hour on a 32-vCPU worker."
   type        = number
-  default     = 16
+  default     = 400
+}
+
+variable "ec2_worker_idle_minutes" {
+  description = "How long the queue must be fully idle (nothing visible or in flight) before scaling down to the floor."
+  type        = number
+  default     = 15
 }
 
 variable "ec2_worker_instance_types" {

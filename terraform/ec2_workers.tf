@@ -1,8 +1,21 @@
 # Optional EC2 worker capacity (testing and burst), as a spot-first auto-scaling
-# group. Off by default; scale with:
+# group that scales itself off the job queue. Enable by setting the capacity
+# ceiling (`-var ec2_worker_max=16`); scaling within [ec2_worker_min, max] is
+# then automatic:
 #
-#   tofu apply -var ec2_worker_count=4
-#   tofu apply -var ec2_worker_count=0
+#   - scale-out is proportional to the queue backlog per in-service instance
+#     (target tracking, scale-out ONLY — draining backlog never churns busy
+#     workers) and cannot exceed ec2_worker_max. A long instance-warmup stops
+#     the ASG from over-ordering while instances are still booting.
+#   - a "kickstart" policy brings up the first instance when the queue becomes
+#     non-empty (from zero instances the backlog ratio cannot breach the
+#     target). That first worker also expands the run, so large fan-outs only
+#     attract capacity once the real job count is on the queue.
+#   - capacity drops to ec2_worker_min only once visible + in-flight messages
+#     have been zero for ec2_worker_idle_minutes (in-flight counts running
+#     jobs, so the long tail is never cut short).
+#
+# Set ec2_worker_min = ec2_worker_max to pin fixed capacity instead.
 #
 # Interrupted spot instances are replaced by the ASG automatically; that is safe
 # by construction, since a killed worker's jobs stop being heartbeated and are
@@ -14,7 +27,7 @@
 # access is via SSM Session Manager (no ingress at all).
 
 locals {
-  ec2_workers = var.ec2_worker_count > 0 ? 1 : 0
+  ec2_workers = var.ec2_worker_max > 0 ? 1 : 0
 }
 
 resource "aws_iam_role" "ec2_worker" {
@@ -141,10 +154,17 @@ resource "aws_launch_template" "ec2_worker" {
 resource "aws_autoscaling_group" "ec2_worker" {
   count               = local.ec2_workers
   name                = "${var.name_prefix}-ec2-worker"
-  min_size            = 0
+  min_size            = var.ec2_worker_min
   max_size            = var.ec2_worker_max
-  desired_capacity    = var.ec2_worker_count
+  desired_capacity    = var.ec2_worker_min
   vpc_zone_identifier = data.aws_subnets.default[0].ids
+
+  # instances need to install Julia and warm caches before they consume at full
+  # rate; a long warmup prevents the scaler from over-ordering in the meantime
+  default_instance_warmup = 900
+
+  # the scale-out policy divides queue backlog by this metric
+  enabled_metrics = ["GroupInServiceInstances"]
 
   mixed_instances_policy {
     instances_distribution {
@@ -164,5 +184,176 @@ resource "aws_autoscaling_group" "ec2_worker" {
         }
       }
     }
+  }
+
+  lifecycle {
+    # desired_capacity is owned by the scaling policies after creation
+    ignore_changes = [desired_capacity]
+  }
+}
+
+
+## scaling policies
+
+# 1. proportional scale-out: keep (visible backlog / in-service instances) at the
+#    target; never scales in (that's policy 3's job, and only when fully idle)
+resource "aws_autoscaling_policy" "ec2_worker_backlog" {
+  count                  = local.ec2_workers
+  name                   = "backlog-per-instance"
+  autoscaling_group_name = aws_autoscaling_group.ec2_worker[0].name
+  policy_type            = "TargetTrackingScaling"
+
+  target_tracking_configuration {
+    target_value     = var.ec2_worker_backlog_target
+    disable_scale_in = true
+
+    customized_metric_specification {
+      metrics {
+        id          = "backlog"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesVisible"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs.name
+            }
+          }
+        }
+      }
+      metrics {
+        id          = "instances"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/AutoScaling"
+            metric_name = "GroupInServiceInstances"
+            dimensions {
+              name  = "AutoScalingGroupName"
+              value = aws_autoscaling_group.ec2_worker[0].name
+            }
+          }
+        }
+      }
+      metrics {
+        id          = "per_instance"
+        expression  = "backlog / MAX([instances, 1])"
+        label       = "queue backlog per in-service worker"
+        return_data = true
+      }
+    }
+  }
+}
+
+# 2. kickstart: from zero instances the ratio above cannot breach the target, so
+#    bring up exactly one worker as soon as the queue is non-empty
+resource "aws_cloudwatch_metric_alarm" "ec2_worker_kickstart" {
+  count               = local.ec2_workers
+  alarm_name          = "${var.name_prefix}-ec2-worker-kickstart"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "Job queue is non-empty but no EC2 workers are running"
+  alarm_actions       = [aws_autoscaling_policy.ec2_worker_kickstart[0].arn]
+
+  metric_query {
+    id          = "backlog"
+    return_data = false
+    metric {
+      namespace   = "AWS/SQS"
+      metric_name = "ApproximateNumberOfMessagesVisible"
+      period      = 60
+      stat        = "Average"
+      dimensions  = { QueueName = aws_sqs_queue.jobs.name }
+    }
+  }
+  metric_query {
+    id          = "instances"
+    return_data = false
+    metric {
+      namespace   = "AWS/AutoScaling"
+      metric_name = "GroupInServiceInstances"
+      period      = 60
+      stat        = "Average"
+      dimensions  = { AutoScalingGroupName = aws_autoscaling_group.ec2_worker[0].name }
+    }
+  }
+  metric_query {
+    id          = "needs_kickstart"
+    expression  = "IF(AND(backlog > 0, instances < 1), 1, 0)"
+    label       = "queue waiting with no workers"
+    return_data = true
+  }
+}
+
+resource "aws_autoscaling_policy" "ec2_worker_kickstart" {
+  count                  = local.ec2_workers
+  name                   = "kickstart"
+  autoscaling_group_name = aws_autoscaling_group.ec2_worker[0].name
+  policy_type            = "StepScaling"
+  adjustment_type        = "ExactCapacity"
+
+  step_adjustment {
+    metric_interval_lower_bound = 0
+    scaling_adjustment          = 1
+  }
+}
+
+# 3. scale to min once the queue has been fully idle (nothing visible, nothing
+#    in flight) for a while
+resource "aws_cloudwatch_metric_alarm" "ec2_worker_idle" {
+  count               = local.ec2_workers
+  alarm_name          = "${var.name_prefix}-ec2-worker-idle"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  threshold           = 0
+  evaluation_periods  = max(1, ceil(var.ec2_worker_idle_minutes / 5))
+  treat_missing_data  = "breaching"
+  alarm_description   = "Job queue idle (no visible or in-flight messages)"
+  alarm_actions       = [aws_autoscaling_policy.ec2_worker_idle[0].arn]
+
+  metric_query {
+    id          = "visible"
+    return_data = false
+    metric {
+      namespace   = "AWS/SQS"
+      metric_name = "ApproximateNumberOfMessagesVisible"
+      period      = 300
+      stat        = "Maximum"
+      dimensions  = { QueueName = aws_sqs_queue.jobs.name }
+    }
+  }
+  metric_query {
+    id          = "inflight"
+    return_data = false
+    metric {
+      namespace   = "AWS/SQS"
+      metric_name = "ApproximateNumberOfMessagesNotVisible"
+      period      = 300
+      stat        = "Maximum"
+      dimensions  = { QueueName = aws_sqs_queue.jobs.name }
+    }
+  }
+  metric_query {
+    id          = "total"
+    expression  = "visible + inflight"
+    label       = "total queued + running jobs"
+    return_data = true
+  }
+}
+
+resource "aws_autoscaling_policy" "ec2_worker_idle" {
+  count                  = local.ec2_workers
+  name                   = "scale-to-min-when-idle"
+  autoscaling_group_name = aws_autoscaling_group.ec2_worker[0].name
+  policy_type            = "StepScaling"
+  adjustment_type        = "ExactCapacity"
+
+  step_adjustment {
+    metric_interval_upper_bound = 0
+    scaling_adjustment          = var.ec2_worker_min
   }
 }

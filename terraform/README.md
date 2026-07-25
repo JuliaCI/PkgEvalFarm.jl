@@ -51,12 +51,28 @@ There is no per-machine registration and no long-lived secrets:
 ## EC2 workers (testing and burst capacity)
 
 The config can run self-enrolling EC2 workers as a spot-first auto-scaling
-group:
+group **that scales itself off the job queue**:
 
 ```sh
-tofu apply -var ec2_worker_count=4    # scale up
-tofu apply -var ec2_worker_count=0    # scale to zero (default)
+tofu apply -var ec2_worker_max=4    # enable, with a hard capacity ceiling
+tofu apply -var ec2_worker_max=0    # tear down (default)
 ```
+
+Scaling within `[ec2_worker_min, ec2_worker_max]` is automatic and designed
+not to overshoot:
+
+- **out**: proportional to the visible backlog per in-service worker
+  (`ec2_worker_backlog_target`, default 400 jobs), scale-out *only*, so a
+  draining queue never churns busy workers; a 15-minute instance warmup stops
+  the scaler from over-ordering while machines boot. From zero, a kickstart
+  policy starts exactly one worker when the queue turns non-empty — that
+  worker also expands the run, so capacity follows the real job count.
+- **in**: only to the floor, and only after the queue has been completely
+  idle — nothing visible *or in flight* — for `ec2_worker_idle_minutes`
+  (default 15), so the long tail of slow jobs is never cut short.
+- `ec2_worker_max` is validated to ≤ 4 for now as a cost guardrail; raise the
+  cap in `variables.tf` deliberately when a bigger fleet is intended. Set
+  `ec2_worker_min = ec2_worker_max` to pin fixed capacity.
 
 All-spot by default (`ec2_worker_on_demand_percent = 0`): spot interruption is
 harmless — the killed worker's jobs stop being heartbeated and SQS redelivers
@@ -89,8 +105,10 @@ No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
-| `ec2_worker_count` | no | `0` | Desired EC2 workers (testing/burst; 0 = none). |
-| `ec2_worker_max` | no | `16` | ASG upper bound. |
+| `ec2_worker_max` | no | `0` | EC2 worker ceiling (0 = disabled; validated ≤ 4 for now). |
+| `ec2_worker_min` | no | `0` | EC2 worker floor (= max to pin capacity). |
+| `ec2_worker_backlog_target` | no | `400` | Visible jobs per worker the scaler aims for. |
+| `ec2_worker_idle_minutes` | no | `15` | Full queue idle time before scaling to the floor. |
 | `ec2_worker_instance_types` | no | m6a/m6i/m5a/m7a `8xlarge` | Spot pool candidates, in preference order. |
 | `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
 | `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
