@@ -12,7 +12,7 @@ const CLI_HELP = """
       submit   --primary SPEC [--against SPEC] [--assertions] [PKG...]
                                                   submit a run (all packages if none given)
       status   RUN_ID                             show run progress
-      report   RUN_ID [--no-upload]               aggregate and print the report
+      report   RUN_ID                             aggregate, upload and print the report
       bot      [--interval SECS] [--name NAME]    run the @nanosoldier2 bot
 
     The broker URL can also be set via PKGEVAL_FARM_BROKER. Julia SPECs are release
@@ -27,7 +27,7 @@ function main(args::Vector{String}=ARGS)
     # split --flag [value] options from positional arguments
     options = Dict{String,String}()
     positional = String[]
-    flags = Set(["--once", "--assertions", "--no-upload"])
+    flags = Set(["--once", "--assertions"])
     i = 1
     while i <= length(rest)
         arg = rest[i]
@@ -68,12 +68,13 @@ function main(args::Vector{String}=ARGS)
                 "(submitted by $(status.submitter) at $(status.created_at))")
     elseif command == "report"
         length(positional) == 1 || error("report requires exactly one RUN_ID")
-        ctx, _ = farm_ctx(; broker, role="submitter")
-        report = generate_report(ctx, only(positional); upload=!haskey(options, "--no-upload"))
+        provider = lite_ctx_provider(; broker)
+        report = FarmBot.generate_report(provider(), only(positional))
         println(report.markdown)
     elseif command == "bot"
-        run_bot(; broker, interval=parse(Int, get(options, "--interval", "60")),
-                bot_name=get(options, "--name", "nanosoldier2"))
+        haskey(options, "--name") && (ENV["BOT_NAME"] = options["--name"])
+        FarmBot.run_bot(lite_ctx_provider(; broker);
+                        interval=parse(Int, get(options, "--interval", "60")))
     elseif command in ("help", "--help", "-h")
         println(CLI_HELP)
     else

@@ -88,12 +88,52 @@ bin/farm report <run-id>    # aggregate results into a Nanosoldier-style report
 4. When the counter reaches the total, whoever wants the report runs the aggregation
    (the bot does this automatically and posts back to GitHub).
 
+## Worker requirements
+
+Same as PkgEval.jl: Linux (x86_64/aarch64), cgroup v2 with delegated controllers,
+unprivileged user namespaces, and enough disk for the rootfs/compile caches. Run **one
+worker process per machine** (PkgEval's shared caches are guarded by in-process locks);
+scale within the machine via `--ninstances`.
+
 ## Deploying
 
+1. Create a **GitHub OAuth app** (Settings → Developer settings → OAuth Apps) for the
+   farm. Enable *Device Flow*; no callback URL or client secret is needed — the broker
+   never holds GitHub secrets. Note the client id.
+2. Create the two GitHub teams (default `pkgeval-workers` and `pkgeval-submitters`) in
+   your org. Membership in these teams is what authorizes people; enrolling a new
+   worker operator is just a team invite.
+3. Build the broker and apply the terraform:
+
 ```sh
+julia +1.13 --project=broker broker/build/build.jl   # produces broker/build/bootstrap.zip
 cd terraform
-tofu init && tofu apply    # or terraform
-cd ../broker && julia --project build/build.jl && cd ../terraform && tofu apply
+tofu init && tofu apply                              # or terraform
 ```
 
-See `terraform/README.md` for the variables (GitHub org/teams, OAuth client id, ...).
+The `broker_function_url` output is the only thing workers and the bot need
+(`PKGEVAL_FARM_BROKER`). See `terraform/README.md` for all variables.
+
+## Running the bot
+
+The `@nanosoldier2` bot is a second juliac-compiled Lambda, invoked by an EventBridge
+schedule (default: every minute); each invocation polls the bot account's GitHub
+notifications for commands and posts reports for finished runs. It is created by the
+same terraform when `github_bot_token` is set, and its execution role carries the
+submitter policy directly — no broker hop, no long-running server, no inbound network.
+
+Mention it on a PR: `@nanosoldier2 runtests()`, `runtests(["Foo"])`, or
+`runtests(vs = ":master")`.
+
+The identical bot code also runs interactively anywhere (state lives in the runs
+table and GitHub, so Lambda and interactive bots can even coexist):
+
+```sh
+export NANOSOLDIER2_GITHUB_TOKEN=...   # token of the bot account
+bin/farm login                          # operator must be in the submitters team
+bin/farm bot
+```
+
+Package-list expansion never happens in the bot: submission stores the request and
+the first worker to pick it up fans out the jobs (computing the "all compatible
+packages" set needs the Julia build under test, which only workers have).

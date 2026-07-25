@@ -16,13 +16,16 @@ using AWS: @service
 
 import PkgEval
 
+# the bot/report logic is shared with the compiled bot Lambda, so it lives in a
+# stdlib-only module tree (which also brings in FarmLite, the lite AWS client)
+include(joinpath(@__DIR__, "..", "bot", "src", "FarmBot.jl"))
+using .FarmBot: FarmBot, FarmLite
+
 include("schema.jl")
 include("auth.jl")
 include("queue.jl")
 include("worker.jl")
 include("submit.jl")
-include("report.jl")
-include("bot.jl")
 include("cli.jl")
 
 end # module

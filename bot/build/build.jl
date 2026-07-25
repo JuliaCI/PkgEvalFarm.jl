@@ -1,20 +1,20 @@
-# Build the broker Lambda bundle: a juliac-compiled `bootstrap` executable plus the
+# Build the bot Lambda bundle: a juliac-compiled `bootstrap` executable plus the
 # Julia runtime libraries it needs, zipped up for the `provided.al2023` runtime.
 #
-#   julia --project=broker broker/build/build.jl [--trim=safe]
+#   julia --project=bot bot/build/build.jl [--trim=safe]
 #
-# produces broker/build/bootstrap.zip, which terraform deploys.
+# produces bot/build/bootstrap.zip, which terraform deploys.
 
 using Pkg
 
-const BROKER_DIR = dirname(@__DIR__)
+const APP_DIR = dirname(@__DIR__)
 const BUILD_DIR = @__DIR__
 const STAGE_DIR = joinpath(BUILD_DIR, "stage")
 
 trim = something(findfirst(a -> startswith(a, "--trim"), ARGS), "--trim=safe")
 trim isa Int && (trim = ARGS[trim])
 
-Pkg.activate(BROKER_DIR)
+Pkg.activate(APP_DIR)
 Pkg.instantiate()
 
 juliac = normpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl")
@@ -24,20 +24,19 @@ rm(STAGE_DIR; force=true, recursive=true)
 mkpath(STAGE_DIR)
 exe = joinpath(STAGE_DIR, "bootstrap")
 
-@info "compiling broker with juliac" trim
+@info "compiling bot with juliac" trim
 env = copy(ENV)
-env["JULIA_PROJECT"] = BROKER_DIR
+env["JULIA_PROJECT"] = APP_DIR
 run(setenv(`$(Base.julia_cmd()[1]) $juliac --output-exe $exe --experimental $trim
-            --relative-rpath $(joinpath(BROKER_DIR, "src", "main.jl"))`,
-           env; dir=BROKER_DIR))
+            --relative-rpath $(joinpath(APP_DIR, "src", "main.jl"))`,
+           env; dir=APP_DIR))
 
-# bundle the Julia runtime libraries next to the executable, mirroring the julia
-# lib/ layout: the executable's RPATH points at "julia/" for libjulia.so, and
-# libjulia in turn expects its private libraries in a "julia/" subdir next to it
+# bundle the Julia runtime libraries next to the executable ("julia/" is where
+# --relative-rpath points the RPATH)
 libdir = normpath(Sys.BINDIR, "..", "lib")
 stage_libdir = joinpath(STAGE_DIR, "julia")
 mkpath(stage_libdir)
-cp(joinpath(libdir, "julia"), joinpath(stage_libdir, "julia"); force=true)
+cp(joinpath(libdir, "julia"), stage_libdir; force=true)
 for lib in filter(f -> occursin(r"^libjulia\.so", f), readdir(libdir))
     cp(joinpath(libdir, lib), joinpath(stage_libdir, lib); force=true)
 end

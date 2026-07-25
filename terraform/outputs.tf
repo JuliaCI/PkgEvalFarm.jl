@@ -37,3 +37,8 @@ output "region" {
   description = "AWS region the farm is deployed in."
   value       = var.region
 }
+
+output "bot_function_name" {
+  description = "Name of the bot Lambda (empty when the bot is disabled)."
+  value       = length(aws_lambda_function.bot) > 0 ? aws_lambda_function.bot[0].function_name : ""
+}

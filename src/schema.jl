@@ -169,3 +169,8 @@ end
 
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
 issuccess(status::AbstractString) = status in ("test", "load")
+
+reason_message(reason::Nothing) = ""
+reason_message(reason::AbstractString) =
+    reason == "worker_exception" ? "the worker failed to evaluate the package" :
+    PkgEval.reason_message(Symbol(reason))

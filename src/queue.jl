@@ -12,34 +12,53 @@ isodate(t=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 
 aws_retry(f; n=5) = retry(f; delays=ExponentialBackOff(; n, first_delay=1, max_delay=30))()
 
+# real AWS uses the ConditionalCheckFailedException code; some emulators only carry
+# the human-readable message with a generic 400 code
+is_conditional_failure(err) = err isa AWS.AWSException &&
+    (occursin("ConditionalCheckFailed", err.code) ||
+     occursin("conditional request failed", lowercase(err.message)))
+
 
 ## submission
 
 """
     create_run(ctx, spec::RunSpec; submitter, run_id=new_run_id()) -> run_id
 
-Create the run and job items in DynamoDB, then enqueue one SQS message per job.
+Create the run in DynamoDB (one `PutItem`) and enqueue a single *expand* message.
+Job fan-out always happens on a worker via [`expand_run`](@ref): for an explicit
+package list (stored on the run item) that is a mere formality, and for an empty one
+("all packages") the worker computes the selection — which may require the Julia
+build under test, so it cannot happen on submitters. Keeping submission this small
+also lets the bot Lambda submit runs without an AWS SDK.
 """
 function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
                     run_id::AbstractString=new_run_id())
     config_names = [cfg.name for cfg in spec.configs]
     allunique(config_names) || error("configuration names must be unique: $config_names")
-    jobs = [JobRef(run_id, cfg, pkg) for cfg in config_names for pkg in spec.packages]
 
     Dynamodb.put_item(ddb_item(Dict(
             "run_id" => run_id,
             "created_at" => isodate(),
             "submitter" => String(submitter),
-            "status" => "active",
+            "status" => "expanding",
             "configs" => JSON.json(config_to_dict.(spec.configs)),
+            "packages" => JSON.json(spec.packages),  # empty = all compatible packages
             "context" => JSON.json(spec.context),
-            "total_jobs" => length(jobs),
+            "total_jobs" => 0,
             "completed_jobs" => 0,
         )), ctx.cfg.runs_table,
         Dict("ConditionExpression" => "attribute_not_exists(run_id)");
         aws_config=ctx.aws)
 
-    # job items, 25 per BatchWriteItem
+    aws_retry() do
+        SQS.send_message(JSON.json(Dict("run_id" => run_id, "expand" => true)),
+                         ctx.cfg.queue_url; aws_config=ctx.aws)
+    end
+    return run_id
+end
+
+"Create the DynamoDB job items (25 per BatchWriteItem), idempotently."
+function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef})
     for batch in Iterators.partition(jobs, 25)
         requests = [Dict("PutRequest" => Dict("Item" => ddb_item(Dict(
                         "run_id" => job.run_id,
@@ -56,9 +75,46 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
             isempty(unprocessed) || error("unprocessed DynamoDB writes; retrying")
         end
     end
+end
 
+"""
+    expand_run(ctx, run_id, packages) -> njobs
+
+Worker-side completion of an `expanding` run: write the job items, flip the run to
+`active` with the real job count, and enqueue the job messages.
+
+Safe under at-least-once delivery: job items are written before the conditional
+status flip, so a crashed expansion is simply redone, and because duplicate job
+messages are harmless, a redelivered expand message after the flip just re-enqueues.
+"""
+function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{String})
+    run = get_run(ctx, run_id)
+    config_names = [String(c["name"]) for c in run["configs"]]
+    jobs = [JobRef(run_id, cfg, pkg) for cfg in config_names for pkg in packages]
+    isempty(jobs) && error("expansion of $run_id produced no jobs")
+
+    # don't rewrite (= reset) job items once the run went active — after that point a
+    # redelivered expand message only needs to make sure the messages went out
+    run["status"] == "expanding" && write_jobs(ctx, jobs)
+    try
+        Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+            Dict("ConditionExpression" => "#s = :expanding",
+                 "UpdateExpression" => "SET #s = :active, total_jobs = :total",
+                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":expanding" => "expanding", ":active" => "active",
+                     ":total" => length(jobs))));
+            aws_config=ctx.aws)
+    catch err
+        if is_conditional_failure(err)
+            # already expanded by an earlier (interrupted) attempt; messages may or
+            # may not have been sent, so fall through and (re-)enqueue everything
+        else
+            rethrow()
+        end
+    end
     enqueue_jobs(ctx, jobs)
-    return run_id
+    return length(jobs)
 end
 
 "Enqueue SQS messages for jobs (also used to re-drive stalled jobs)."
@@ -83,6 +139,12 @@ struct ClaimedJob
     attempts::Int
 end
 
+"A received *expand* message: the worker should compute and fan out the run's jobs."
+struct ClaimedExpand
+    run_id::String
+    receipt_handle::String
+end
+
 """
     claim_job(ctx; wait=20) -> Union{ClaimedJob,Nothing}
 
@@ -100,7 +162,9 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
     (messages === nothing || isempty(messages)) && return nothing
     message = only(messages)
     receipt = message["ReceiptHandle"]
-    job = JobRef(JSON.parse(message["Body"]))
+    body = JSON.parse(message["Body"])
+    get(body, "expand", false) == true && return ClaimedExpand(body["run_id"], receipt)
+    job = JobRef(body)
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
 
     # flip pending/running -> running; fails if the job is already done
@@ -116,8 +180,7 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
                      ":worker" => worker_identity(), ":now" => isodate(), ":one" => 1)));
             aws_config=ctx.aws)
     catch err
-        # (error codes may carry a service prefix, e.g. "com.amazon...#Conditional...")
-        if err isa AWS.AWSException && occursin("ConditionalCheckFailed", err.code)
+        if is_conditional_failure(err)
             # already finished (duplicate delivery), or the run item was deleted
             SQS.delete_message(ctx.cfg.queue_url, receipt; aws_config=ctx.aws)
             return nothing
@@ -130,12 +193,13 @@ end
 worker_identity() = string(get(ENV, "USER", "unknown"), "@", gethostname())
 
 "Extend the message visibility while the job is still being evaluated."
-heartbeat(ctx::FarmCtx, claimed::ClaimedJob; extend::Int=VISIBILITY_TIMEOUT) =
+heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
+          extend::Int=VISIBILITY_TIMEOUT) =
     SQS.change_message_visibility(ctx.cfg.queue_url, claimed.receipt_handle, extend;
                                   aws_config=ctx.aws)
 
 "Give up on a claimed job without recording a result; it will be redelivered."
-function release_job(ctx::FarmCtx, claimed::ClaimedJob; delay::Int=60)
+function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
     try
         SQS.change_message_visibility(ctx.cfg.queue_url, claimed.receipt_handle, delay;
                                       aws_config=ctx.aws)
@@ -169,12 +233,18 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
             ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
             ctx.cfg.jobs_table,
             Dict("ConditionExpression" => "#s = :running",
-                 "UpdateExpression" => "SET #s = :status, reason = :reason, version = :version, " *
+                 "UpdateExpression" => "SET #s = :status, reason = :reason, " *
+                                       "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, finished_at = :now, log_key = :log_key",
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
-                     ":reason" => result.reason, ":version" => result.version,
+                     ":reason" => result.reason,
+                     # store the human-readable description so report generation
+                     # doesn't need PkgEval's reason table (the bot Lambda lacks it)
+                     ":reason_message" => result.reason === nothing ? nothing :
+                                          reason_message(result.reason),
+                     ":version" => result.version,
                      ":duration" => result.duration, ":now" => isodate(),
                      ":log_key" => result.log === nothing ? nothing : key)));
             aws_config=ctx.aws)
@@ -215,6 +285,7 @@ function get_run(ctx::FarmCtx, run_id::AbstractString)
     run = ddb_parse(resp["Item"])
     run["configs"] = JSON.parse(run["configs"])
     run["context"] = JSON.parse(run["context"])
+    run["packages"] = JSON.parse(get(run, "packages", "[]"))
     return run
 end
 

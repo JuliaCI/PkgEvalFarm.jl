@@ -48,3 +48,22 @@ variable "public_reports" {
   type        = bool
   default     = true
 }
+
+variable "github_bot_token" {
+  description = "GitHub token of the @nanosoldier2 bot account. Empty disables the bot Lambda."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "bot_name" {
+  description = "GitHub handle the bot answers to (without @)."
+  type        = string
+  default     = "nanosoldier2"
+}
+
+variable "bot_schedule" {
+  description = "EventBridge schedule expression for bot polls."
+  type        = string
+  default     = "rate(1 minute)"
+}

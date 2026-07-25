@@ -52,9 +52,11 @@ const PEF = PkgEvalFarm
 end
 
 @testset "bot command parsing" begin
-    parse_command = PEF.parse_command
+    parse_command = PEF.FarmBot.parse_command
     @test parse_command("hello world") === nothing
-    @test parse_command("@nanosoldier2 runtests()") == (; packages=String[], vs=nothing, error=nothing)
+    let c = parse_command("@nanosoldier2 runtests()")
+        @test c.packages == String[] && c.vs === nothing && c.error === nothing
+    end
     let c = parse_command("@nanosoldier2 runtests([\"Foo\", \"Bar\"])")
         @test c.packages == ["Foo", "Bar"] && c.vs === nothing
     end
@@ -67,9 +69,10 @@ end
     @test parse_command("@nanosoldier2 runtests(rm(\"/\"))").error !== nothing
     @test parse_command("@nanosoldier2 runtests(") === nothing
 
-    @test PEF.resolve_vs(":master", "JuliaLang/julia") == "JuliaLang/julia#master"
-    @test PEF.resolve_vs("@0123abc", "JuliaLang/julia") == "JuliaLang/julia#0123abc"
-    @test PEF.resolve_vs("v1.12.0", "JuliaLang/julia") == "v1.12.0"
+    resolve_vs = PEF.FarmBot.resolve_vs
+    @test resolve_vs(":master", "JuliaLang/julia") == "JuliaLang/julia#master"
+    @test resolve_vs("@0123abc", "JuliaLang/julia") == "JuliaLang/julia#0123abc"
+    @test resolve_vs("v1.12.0", "JuliaLang/julia") == "v1.12.0"
 end
 
 @testset "broker unit tests" begin

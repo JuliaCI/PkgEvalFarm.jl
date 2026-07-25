@@ -81,15 +81,28 @@ try
                                 submitter="tester")
         global RUN_ID = run_id
         run = PEF.get_run(ctx, run_id)
-        @test run["status"] == "active"
-        @test run["total_jobs"] == 6
+        @test run["status"] == "expanding"  # all runs start expanding; a worker fans out
+        @test run["total_jobs"] == 0
         @test run["completed_jobs"] == 0
         @test length(run["configs"]) == 2
+        @test run["packages"] == packages
+        @test isempty(PEF.run_jobs(ctx, run_id))
+        @test_throws Exception PEF.create_run(ctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
+                                              submitter="tester", run_id)  # ids are unique
+
+        # worker-side fan-out of the stored package list
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedExpand
+        @test claimed.run_id == run_id
+        @test PEF.expand_run(ctx, run_id, String.(run["packages"])) == 6
+        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "active"
+        @test run["total_jobs"] == 6
         jobs = PEF.run_jobs(ctx, run_id)
         @test length(jobs) == 6
         @test all(j -> j["status"] == "pending", jobs)
-        @test_throws Exception PEF.create_run(ctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
-                                              submitter="tester", run_id)  # ids are unique
     end
 
     @testset "claim/heartbeat/complete lifecycle" begin
@@ -141,12 +154,16 @@ try
         job = only(filter(j -> j["job_key"] == "primary#JSON", jobs))
         @test PEF.job_log(ctx, job) == "log of JSON on primary"
 
-        report = PEF.generate_report(ctx, RUN_ID)
+        # report generation runs through FarmBot (the stdlib-only bot Lambda code)
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        report = PEF.FarmBot.generate_report(lite, RUN_ID)
         @test occursin("JSON", report.markdown)
         @test occursin("failed on primary but not on against", report.markdown)
         @test occursin("Packages that failed on both", report.markdown)  # Crayons
-        @test !occursin("Example", split(report.markdown, "failed on both")[1]) ||
-              occursin("now pass", report.markdown)
+        @test occursin("package has test failures", report.markdown)  # stored reason_message
         @test occursin("possible new issues: 1 package", report.summary)
 
         # uploaded artifacts
@@ -161,6 +178,10 @@ try
         # a job whose evaluation throws gets released, then errored out at attempt >= 3
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Broken"], Dict{String,Any}());
                                 submitter="tester")
+        expand_claim = PEF.claim_job(ctx; wait=1)
+        @test expand_claim isa PEF.ClaimedExpand
+        PEF.expand_run(ctx, run_id, ["Broken"])
+        SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
         for attempt in 1:3
             claimed = PEF.claim_job(ctx; wait=1)
             @test claimed !== nothing
@@ -180,15 +201,157 @@ try
         @test job["attempts"] == 3
     end
 
+    @testset "expand jobs" begin
+        # empty package list => run starts in `expanding` with a single expand message
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, String[], Dict{String,Any}());
+                                submitter="tester")
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "expanding"
+        @test run["total_jobs"] == 0
+        @test isempty(PEF.run_jobs(ctx, run_id))
+
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedExpand
+        @test claimed.run_id == run_id
+        PEF.heartbeat(ctx, claimed)  # expansion can be slow (may build Julia)
+
+        # what a worker does after computing the package set
+        njobs = PEF.expand_run(ctx, run_id, ["Example", "JSON"])
+        @test njobs == 4
+        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "active"
+        @test run["total_jobs"] == 4
+        @test length(PEF.run_jobs(ctx, run_id)) == 4
+
+        # a duplicate expand message after the flip only re-enqueues, never resets
+        first_claim = PEF.claim_job(ctx; wait=1)
+        @test first_claim isa PEF.ClaimedJob
+        njobs = PEF.expand_run(ctx, run_id, ["Example", "JSON"])  # redelivery scenario
+        @test njobs == 4
+        job_item = only(filter(j -> j["job_key"] == PEF.job_key(first_claim.job),
+                               PEF.run_jobs(ctx, run_id)))
+        @test job_item["status"] == "running"  # not reset back to pending
+
+        # drain: claim everything (incl. duplicates) and finish the run
+        PEF.record_result(ctx, first_claim, PEF.JobResult(; status="test", duration=1.0))
+        for _ in 1:20  # claim_job also returns nothing for swallowed duplicates
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"
+        @test run["completed_jobs"] == 4
+    end
+
+    @testset "bot end-to-end (stub GitHub)" begin
+        import HTTP as TestHTTP
+
+        posted = String[]  # comment bodies the bot posts
+        gh_base = Ref("")
+        notifications = Ref("[]")
+
+        router = TestHTTP.Router()
+        TestHTTP.register!(router, "GET", "/notifications",
+            req -> TestHTTP.Response(200, notifications[]))
+        TestHTTP.register!(router, "PATCH", "/notifications/threads/*",
+            req -> TestHTTP.Response(205))
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/comments/1",
+            req -> TestHTTP.Response(200, JSON.json(Dict(
+                "body" => "@nanosoldier2 runtests([\"Example\"])",
+                "user" => Dict("login" => "keno")))))
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/12345",
+            req -> TestHTTP.Response(200, JSON.json(Dict(
+                "number" => 12345,
+                "repository_url" => "$(gh_base[])/repos/JuliaLang/julia",
+                "pull_request" => Dict("url" => "$(gh_base[])/repos/JuliaLang/julia/pulls/12345")))))
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/pulls/12345",
+            req -> TestHTTP.Response(200, JSON.json(Dict(
+                "head" => Dict("sha" => "abcdef123456"),
+                "base" => Dict("ref" => "master")))))
+        TestHTTP.register!(router, "POST", "/repos/JuliaLang/julia/issues/12345/comments",
+            req -> begin
+                push!(posted, JSON.parse(String(req.body))["body"])
+                TestHTTP.Response(201, "{}")
+            end)
+        gh_port = rand(30001:40000)
+        server = TestHTTP.serve!(router, "127.0.0.1", gh_port)
+        gh_base[] = "http://127.0.0.1:$gh_port"
+        SQS.purge_queue(queue_url; aws_config=aws)  # drop strays from earlier testsets
+        gh = PEF.FarmLite.GitHubCtx("bot-token", gh_base[])
+
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+
+        try
+            # 1. a mention arrives -> bot submits a run and acks
+            notifications[] = JSON.json([Dict(
+                "id" => "42", "reason" => "mention",
+                "subject" => Dict("type" => "PullRequest",
+                    "url" => "$(gh_base[])/repos/JuliaLang/julia/issues/12345",
+                    "latest_comment_url" => "$(gh_base[])/repos/JuliaLang/julia/issues/comments/1"))])
+            PEF.FarmBot.handle_invocation(lite, gh)
+            @test length(posted) == 1
+            @test occursin("has been submitted as run", posted[1])
+            @test occursin("JuliaLang/julia#abcdef123456", posted[1])
+            run_id = match(r"run `([^`]+)`", posted[1]).captures[1]
+
+            run = PEF.get_run(ctx, run_id)
+            @test run["status"] == "expanding"
+            @test run["packages"] == ["Example"]
+            @test run["context"]["repo"] == "JuliaLang/julia"
+            @test run["submitter"] == "keno via @nanosoldier2"
+            @test run["configs"][1]["name"] == "primary"
+            @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
+            @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
+            # the config json round-trips into a PkgEval Configuration
+            config = PEF.config_from_dict(run["configs"][1])
+            @test config.buildflags == ["LLVM_ASSERTIONS=1", "FORCE_ASSERTIONS=1"]
+
+            # 2. a worker picks it up, expands and completes it
+            notifications[] = "[]"
+            expand_claim = PEF.claim_job(ctx; wait=1)
+            @test expand_claim isa PEF.ClaimedExpand
+            PEF.expand_run(ctx, run_id, ["Example"])
+            SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
+            for _ in 1:20  # claim_job also returns nothing for swallowed duplicates
+                PEF.get_run(ctx, run_id)["status"] == "done" && break
+                c = PEF.claim_job(ctx; wait=1)
+                c isa PEF.ClaimedJob || continue
+                PEF.record_result(ctx, c, PEF.JobResult(; status="test", version="1.0.0",
+                                                        duration=1.0, log="ok"))
+            end
+            @test PEF.get_run(ctx, run_id)["status"] == "done"
+
+            # 3. next poll posts the report
+            PEF.FarmBot.handle_invocation(lite, gh)
+            @test length(posted) == 2
+            @test occursin("@keno: run `$run_id` finished", posted[2])
+            @test occursin("no new package failures", posted[2])
+            @test occursin("report.md", posted[2])
+
+            # 4. and does not double-post
+            PEF.FarmBot.handle_invocation(lite, gh)
+            @test length(posted) == 2
+        finally
+            close(server)
+        end
+    end
+
     @testset "broker STS against moto" begin
         with_env(Dict("AWS_ACCESS_KEY_ID" => "testing", "AWS_SECRET_ACCESS_KEY" => "testing",
                       "FARM_REGION" => "us-east-1", "STS_ENDPOINT" => endpoint)) do
             creds = FarmBroker.assume_role("arn:aws:iam::123456789012:role/pkgeval-worker",
                                            "keno"; duration=3600)
-            @test !isempty(creds["access_key_id"])
-            @test !isempty(creds["session_token"])
+            @test !isempty(creds.access_key_id)
+            @test !isempty(creds.session_token)
             # expiration parses and is in the future
-            exp = PEF.parse_expiration(creds["expiration"])
+            exp = PEF.parse_expiration(creds.expiration)
             @test exp > Dates.now(UTC)
         end
     end

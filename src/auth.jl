@@ -158,3 +158,35 @@ function farm_ctx(; broker::Union{AbstractString,Nothing}=nothing, role::Abstrac
     ctx = FarmCtx(cfg, AWS.AWSConfig(; creds, region=cfg.region))
     return ctx, payload["user"]
 end
+
+"""
+    lite_ctx_provider(; broker=nothing, role="submitter") -> () -> FarmLite.LiteCtx
+
+A `FarmLite.LiteCtx` factory for the FarmBot code paths (`farm bot`, `farm report`),
+re-fetching broker credentials shortly before they expire. Bypasses the broker when
+`PKGEVAL_QUEUE_URL` is set (ambient env credentials, like `farm_ctx`).
+"""
+function lite_ctx_provider(; broker::Union{AbstractString,Nothing}=nothing,
+                           role::AbstractString="submitter")
+    if broker === nothing && haskey(ENV, "PKGEVAL_QUEUE_URL")
+        return FarmLite.ctx_from_env
+    end
+    broker = something(broker, broker_url())
+    token = github_token()
+    cached_ctx = Ref{Union{Nothing,FarmLite.LiteCtx}}(nothing)
+    expires = Ref(DateTime(0))
+    return function ()
+        if cached_ctx[] === nothing || expires[] <= Dates.now(UTC) + Dates.Minute(5)
+            payload = fetch_broker_creds(broker, role, token)
+            c, cfg = payload["credentials"], payload["config"]
+            cached_ctx[] = FarmLite.LiteCtx(;
+                region=cfg["region"],
+                creds=FarmLite.AwsCreds(c["access_key_id"], c["secret_access_key"],
+                                        c["session_token"]),
+                queue_url=cfg["queue_url"], runs_table=cfg["runs_table"],
+                jobs_table=cfg["jobs_table"], bucket=cfg["bucket"])
+            expires[] = parse_expiration(c["expiration"])
+        end
+        return something(cached_ctx[])
+    end
+end

@@ -62,7 +62,36 @@ function worker_slot(ctx::FarmCtx, cpu::Int, draining::Ref{Bool},
             continue
         end
         idle_polls = 0
-        process_job(ctx, claimed, cpu, run_cache, run_cache_lock)
+        if claimed isa ClaimedExpand
+            process_expand(ctx, claimed)
+        else
+            process_job(ctx, claimed, cpu, run_cache, run_cache_lock)
+        end
+    end
+end
+
+"Compute the package set for an `expanding` run and fan out its jobs."
+function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
+    @info "expanding run" claimed.run_id
+    stop_heartbeat = start_heartbeat(ctx, claimed, "expand $(claimed.run_id)")
+    try
+        run = get_run(ctx, claimed.run_id)
+        packages = String.(run["packages"])
+        if isempty(packages)  # "all packages": compute the selection here
+            configs = config_from_dict.(run["configs"])
+            # may download/build the Julia versions under test to determine compatibility
+            pkgs = intersect([PkgEval.get_packages(cfg) for cfg in configs]...)
+            # JLL wrappers are not worth testing (PkgEval.evaluate drops them too)
+            packages = [pkg.name for pkg in pkgs if !endswith(pkg.name, "_jll")]
+        end
+        njobs = expand_run(ctx, claimed.run_id, packages)
+        SQS.delete_message(ctx.cfg.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+        @info "expanded run" claimed.run_id njobs
+    catch err
+        @error "failed to expand run; releasing for retry" claimed.run_id exception=(err, catch_backtrace())
+        release_job(ctx, claimed)
+    finally
+        stop_heartbeat()
     end
 end
 
@@ -77,23 +106,32 @@ function job_config(ctx::FarmCtx, job::JobRef, run_cache, run_cache_lock)
     return config_from_dict(config_dict)
 end
 
+# Keep the message invisible while we work; a dead worker stops heartbeating and the
+# job is redelivered. Returns a function that stops the heartbeat task.
+function start_heartbeat(ctx::FarmCtx, claimed, what)
+    stopped = Ref(false)
+    task = @async while !stopped[]
+        sleep(HEARTBEAT_INTERVAL)
+        stopped[] && break
+        try
+            heartbeat(ctx, claimed)
+        catch err
+            @warn "heartbeat failed" what err
+        end
+    end
+    return function ()
+        stopped[] = true
+        istaskdone(task) || schedule(task, InterruptException(); error=true)
+        nothing
+    end
+end
+
 function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                      run_cache, run_cache_lock)
     job = claimed.job
     @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu
 
-    # keep the message invisible while we work; a dead worker stops heartbeating and
-    # the job is redelivered
-    heartbeat_task = @async begin
-        while true
-            sleep(HEARTBEAT_INTERVAL)
-            try
-                heartbeat(ctx, claimed)
-            catch err
-                @warn "heartbeat failed" job.package err
-            end
-        end
-    end
+    stop_heartbeat = start_heartbeat(ctx, claimed, job.package)
 
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
@@ -115,12 +153,11 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                       log=sprint(showerror, err, catch_backtrace()))
         else
             @error "job errored; releasing for retry" job.package exception=(err, catch_backtrace())
-            schedule(heartbeat_task, InterruptException(); error=true)
             release_job(ctx, claimed)
             return
         end
     finally
-        istaskdone(heartbeat_task) || schedule(heartbeat_task, InterruptException(); error=true)
+        stop_heartbeat()
     end
 
     try

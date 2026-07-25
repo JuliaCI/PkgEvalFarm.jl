@@ -80,6 +80,8 @@ resource "aws_iam_role_policy" "worker" {
           "sqs:DeleteMessage",
           "sqs:ChangeMessageVisibility",
           "sqs:GetQueueAttributes",
+          # workers fan out job messages when expanding a run's package list
+          "sqs:SendMessage",
         ]
         Resource = aws_sqs_queue.jobs.arn
       },
@@ -94,6 +96,12 @@ resource "aws_iam_role_policy" "worker" {
           aws_dynamodb_table.jobs.arn,
           aws_dynamodb_table.runs.arn,
         ]
+      },
+      {
+        Sid      = "ExpandRunJobs"
+        Effect   = "Allow"
+        Action   = "dynamodb:BatchWriteItem"
+        Resource = aws_dynamodb_table.jobs.arn
       },
       {
         Sid      = "UploadResults"
@@ -122,19 +130,19 @@ resource "aws_iam_role" "submitter" {
   })
 }
 
-resource "aws_iam_role_policy" "submitter" {
-  name = "submitter-access"
-  role = aws_iam_role.submitter.id
-
-  policy = jsonencode({
+# shared between the submitter role (brokered humans/CLIs) and the bot Lambda's
+# execution role
+locals {
+  submitter_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Sid    = "ManageRunsAndJobs"
         Effect = "Allow"
+        # job-item fan-out (BatchWriteItem) is the workers' job, even for explicit
+        # package lists, so submitters get by with single-item operations
         Action = [
           "dynamodb:PutItem",
-          "dynamodb:BatchWriteItem",
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
           "dynamodb:Query",
@@ -168,4 +176,10 @@ resource "aws_iam_role_policy" "submitter" {
       },
     ]
   })
+}
+
+resource "aws_iam_role_policy" "submitter" {
+  name   = "submitter-access"
+  role   = aws_iam_role.submitter.id
+  policy = local.submitter_policy
 }
