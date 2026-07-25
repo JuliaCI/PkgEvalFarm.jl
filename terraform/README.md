@@ -205,46 +205,44 @@ aws iam list-open-id-connect-providers \
 
 ### What the trust policy is keyed on
 
+**IAM only exposes `aud`, `sub` and `amr` as OIDC condition keys.** A condition
+on any other claim (`ref`, `event_name`, `repository_id`, `job_workflow_ref`,
+`runner_environment`, ...) can never match, which makes the role unassumable and
+produces a bare `Not authorized to perform sts:AssumeRoleWithWebIdentity` with
+no hint as to why. All authorization therefore lives in `sub` — which is exactly
+why GitHub offers customizable and immutable subject formats.
+
 | Claim | Condition | Why |
 | ----- | --------- | --- |
 | `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
-| `repository_id` | `= github_repository_id` | numeric and immutable: survives renames, and a deleted repo's name being re-registered by someone else does not inherit the grant |
-| `ref` | `= github_deploy_ref` | only the deploy branch |
-| `job_workflow_ref` | `= github_deploy_workflow_ref` | only *this* workflow file at this ref; a newly added workflow on master does not inherit the grant |
-| `event_name` | `= github_deploy_event_name` (`push`) | `workflow_dispatch`/`schedule`/PR runs of the same file cannot deploy |
-| `runner_environment` | `= github-hosted` | refuses tokens minted on self-hosted runners |
+| `sub` | `∈ github_deploy_subjects` | pins repository **and** branch |
 
-To see the claims an actual run produces (useful when tightening this further),
-add a step to the workflow:
+This org emits the *immutable* subject format, which embeds numeric ids:
+
+```
+repo:KenoAIStaging@216627359/PkgEvalFarm.jl@1311559445:ref:refs/heads/master
+```
+
+That is strictly better than the documented `repo:OWNER/REPO:ref:...` form: the
+ids survive renames and cannot be re-claimed by registering the same path after
+a deletion. Forks and pull requests end in `:pull_request` instead of
+`:ref:refs/heads/master`, so they cannot match — and GitHub caps fork-PR
+permissions at read-only, so such a job cannot mint a token at all.
+
+Do not assume the format: dump what your org actually mints by adding a step to
+the workflow, then set `github_deploy_subjects` to match exactly.
 
 ```yaml
 - run: |
     tok=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
       "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-    echo "$tok" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+    echo "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
 ```
 
-`sub` is deliberately **not** used: its format is org-configurable, and with
-GitHub's immutable variant enabled it reads
-`repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master` — a policy written
-against the documented `repo:OWNER/REPO:...` form then fails with an opaque
-`Not authorized to perform sts:AssumeRoleWithWebIdentity`. The `ref`,
-`repository_id` and `job_workflow_ref` claims say the same thing in a stable
-format. (`github_deploy_subjects` still exists if you want to pin `sub` too.)
-
-Forks are excluded by `event_name` and `ref`: a pull request — including one
-from a fork, which runs in *this* repo's context but with the fork's workflow
-file — carries `event_name=pull_request` and `ref=refs/pull/N/merge`. Belt and
-braces:
-GitHub caps fork-PR permissions at read-only, so such a job cannot obtain
-`id-token: write` to mint a token at all, and the workflow's own `if:` refuses
-to run the deploy job outside a master push.
-
-Caveat worth remembering: adding `environment: NAME` to the deploy job changes
-the subject to `repo:OWNER/REPO:environment:NAME`. That form is fine (and lets
-you require manual approval), but `github_deploy_subjects` must then match it,
-and the branch restriction moves into the environment's deployment branch
-policy.
+Guards that cannot be expressed in IAM — only this workflow file may deploy,
+only on `push`, only on a GitHub-hosted runner — are enforced job-side by the
+`if:` condition in `.github/workflows/ci.yml`, and should be backed by branch
+protection on the deploy branch.
 
 Terraform bootstraps the initial bundles and then defers to CI: the zip objects
 and the functions' `source_code_hash` carry `ignore_changes`, so a later
