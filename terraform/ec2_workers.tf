@@ -240,8 +240,11 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         }
       }
       metrics {
-        id          = "per_instance"
-        expression  = "backlog / MAX([instances, 1])"
+        id = "per_instance"
+        # CloudWatch metric math has no element-wise MAX against a constant, and
+        # dividing by a zero instance count yields no data — guard with IF.
+        # (Scaling up from zero is the kickstart policy's job, below.)
+        expression  = "IF(instances > 0, backlog / instances, backlog)"
         label       = "queue backlog per in-service worker"
         return_data = true
       }
@@ -284,8 +287,10 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_kickstart" {
     }
   }
   metric_query {
-    id          = "needs_kickstart"
-    expression  = "IF(AND(backlog > 0, instances < 1), 1, 0)"
+    id = "needs_kickstart"
+    # metric math has no AND: comparisons yield 0/1 series, so multiply them.
+    # FILL covers the gap before the ASG has published any instance metric.
+    expression  = "(backlog > 0) * (FILL(instances, 0) < 1)"
     label       = "queue waiting with no workers"
     return_data = true
   }
