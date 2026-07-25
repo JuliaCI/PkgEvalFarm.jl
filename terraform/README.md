@@ -170,12 +170,11 @@ Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
 
 ## Debug access
 
-`debug_role_principals` creates `${prefix}-debug`, a narrowly scoped role for
-handing someone short-lived credentials to diagnose a problem:
+`${prefix}-debug` is a narrowly scoped role for handing someone short-lived
+credentials to diagnose a problem. It is created by default
+(`debug_role_enabled`) and grants nothing until assumed:
 
 ```sh
-tofu apply -var 'debug_role_principals=["arn:aws:iam::873569884612:root"]'
-
 aws sts assume-role \
   --role-arn "$(tofu output -raw debug_role_arn)" \
   --role-session-name debug --duration-seconds 3600 \
@@ -202,8 +201,12 @@ only worker-scoped credentials behind a bearer-gated proxy with IMDS
 firewalled. And the `Describe*`/`List*` actions are unavoidably `Resource: "*"`
 because AWS supports no resource-level permissions for them.
 
-Set `debug_role_principals = null` (the default) to remove the role entirely
-when it is not in use.
+`debug_role_principals` is the trust policy's principal list — who is allowed
+to assume the role. It defaults to the **account-root ARN**, which in IAM means
+"delegate to this account": not the root user, but any principal in the account
+that *also* holds `sts:AssumeRole` permission for this role. Set it to specific
+user or role ARNs to narrow who can mint these credentials, or set
+`debug_role_enabled = false` to remove the role entirely.
 
 ## CI/CD
 

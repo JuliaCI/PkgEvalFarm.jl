@@ -17,8 +17,18 @@
 # bearer-gated proxy with IMDS firewalled — but treat this as "can inspect and
 # disturb running jobs", not as read-only.
 
+locals {
+  # Who may assume the debug role. The account-root ARN is IAM's idiom for
+  # "delegate to this account": it does *not* mean the root user — it means any
+  # principal in the account that separately holds sts:AssumeRole permission for
+  # this role. Narrow it to specific user/role ARNs if you want fewer people
+  # able to mint these credentials.
+  debug_principals = coalesce(var.debug_role_principals,
+  ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"])
+}
+
 resource "aws_iam_role" "debug" {
-  count = var.debug_role_principals == null ? 0 : 1
+  count = var.debug_role_enabled ? 1 : 0
   name  = "${var.name_prefix}-debug"
 
   assume_role_policy = jsonencode({
@@ -26,7 +36,7 @@ resource "aws_iam_role" "debug" {
     Statement = [
       {
         Effect    = "Allow"
-        Principal = { AWS = var.debug_role_principals }
+        Principal = { AWS = local.debug_principals }
         Action    = "sts:AssumeRole"
       }
     ]
@@ -36,7 +46,7 @@ resource "aws_iam_role" "debug" {
 }
 
 resource "aws_iam_role_policy" "debug" {
-  count = var.debug_role_principals == null ? 0 : 1
+  count = var.debug_role_enabled ? 1 : 0
   name  = "inspect-farm"
   role  = aws_iam_role.debug[0].id
 

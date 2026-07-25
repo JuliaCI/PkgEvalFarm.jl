@@ -198,8 +198,14 @@ variable "github_deploy_workflow_ref" {
   nullable = true
 }
 
+variable "debug_role_enabled" {
+  description = "Create the scoped debug role. It grants nothing until somebody assumes it, and assuming it requires sts:AssumeRole permission of your own."
+  type        = bool
+  default     = true
+}
+
 variable "debug_role_principals" {
-  description = "ARNs allowed to assume the read-only debug role (e.g. [\"arn:aws:iam::123:root\"] for anyone in the account with sts:AssumeRole). null disables the role entirely."
+  description = "ARNs allowed to assume the debug role. null means the account-root ARN, i.e. any principal in this account that separately holds sts:AssumeRole for it — not the root user. Narrow to specific user/role ARNs to restrict who can mint these credentials."
   type        = list(string)
   default     = null
   nullable    = true
