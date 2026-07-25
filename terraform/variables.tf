@@ -179,9 +179,9 @@ variable "github_repository_id" {
 }
 
 variable "github_repository_owner_id" {
-  description = "Numeric owner id, pinned via the repository_owner_id claim. null omits."
+  description = "Numeric owner id, pinned via the repository_owner_id claim. null omits. Off by default: repository_id already identifies the repo uniquely, and every condition should be a value observed in an actual token dump."
   type        = string
-  default     = "216627359" # KenoAIStaging
+  default     = null
   nullable    = true
 }
 
