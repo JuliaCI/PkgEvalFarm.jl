@@ -5,13 +5,14 @@
 # initial code bundles; CI owns code updates thereafter (see the ignore_changes
 # lifecycle blocks on the zip objects and functions).
 #
-# IMPORTANT: for OIDC federation, IAM only exposes `aud`, `sub` and `amr` as
-# condition keys. Conditions written against other claims (`ref`, `event_name`,
-# `repository_id`, `job_workflow_ref`, `runner_environment`, ...) do not merely
-# get ignored — they can never match, so the role becomes unassumable and STS
-# answers with a flat "Not authorized to perform sts:AssumeRoleWithWebIdentity".
-# All authorization therefore has to live in `sub`, which is exactly why GitHub
-# provides customizable and immutable subject formats.
+# IMPORTANT: IAM maps only a fixed set of GitHub claims to condition keys —
+# actor, actor_id, job_workflow_ref, repository, repository_id,
+# repository_owner_id, workflow, ref, environment, enterprise_id, plus the
+# standard aud/sub/amr. A condition on any *other* claim (event_name,
+# runner_environment, repository_owner, workflow_ref, ...) can never match, so
+# the role silently becomes unassumable and STS answers with a flat
+# "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+# https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif
 
 resource "aws_iam_openid_connect_provider" "github" {
   count = var.github_oidc_provider_arn == null ? 1 : 0
@@ -40,25 +41,45 @@ resource "aws_iam_role" "deploy" {
         Effect    = "Allow"
         Principal = { Federated = local.github_oidc_arn }
         Action    = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          StringEquals = {
+        Condition = merge({
+          StringEquals = merge(
             # a token minted for another audience cannot be replayed here
-            "${local.oidc}:aud" = "sts.amazonaws.com"
-          }
-          StringLike = {
-            # This org emits the *immutable* subject format, which embeds the
-            # numeric owner and repository ids:
-            #   repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master
-            # so a single condition pins the repository (immune to renames and
-            # to the path being re-registered by someone else) *and* the branch.
-            # Pull requests — including from forks, which run in this repo's
-            # context but with the fork's workflow file — end in `:pull_request`
-            # rather than `:ref:refs/heads/master`, so they cannot match.
-            # Verify the exact string your org mints before changing this; see
-            # the claim-dump snippet in README.md.
-            "${local.oidc}:sub" = var.github_deploy_subjects
-          }
-        }
+            { "${local.oidc}:aud" = "sts.amazonaws.com" },
+            # the repository and its owner, by immutable numeric id: these
+            # survive renames and cannot be re-claimed by registering the same
+            # path after a deletion
+            var.github_repository_id == null ? {} :
+            { "${local.oidc}:repository_id" = var.github_repository_id },
+            var.github_repository_owner_id == null ? {} :
+            { "${local.oidc}:repository_owner_id" = var.github_repository_owner_id },
+            # the branch. Also excludes pull requests, whose ref is
+            # refs/pull/N/merge — including PRs from forks, which run in this
+            # repo's context but with the fork's workflow file. (GitHub also
+            # caps fork-PR permissions at read-only, so such a job cannot mint
+            # a token at all.)
+            var.github_deploy_ref == null ? {} :
+            { "${local.oidc}:ref" = var.github_deploy_ref },
+            # the exact workflow file: a *new* workflow added to the branch
+            # does not inherit this grant
+            var.github_deploy_workflow_ref == null ? {} :
+            { "${local.oidc}:job_workflow_ref" = var.github_deploy_workflow_ref },
+          )
+          },
+          length(var.github_deploy_subjects) == 0 ? {} : {
+            StringLike = {
+              # This org emits the *immutable* subject format, which embeds the
+              # numeric owner and repository ids:
+              #   repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master
+              # so a single condition pins the repository (immune to renames and
+              # to the path being re-registered by someone else) *and* the branch.
+              # Pull requests — including from forks, which run in this repo's
+              # context but with the fork's workflow file — end in `:pull_request`
+              # rather than `:ref:refs/heads/master`, so they cannot match.
+              # Verify the exact string your org mints before changing this; see
+              # the claim-dump snippet in README.md.
+              "${local.oidc}:sub" = var.github_deploy_subjects
+            }
+        })
       }
     ]
   })

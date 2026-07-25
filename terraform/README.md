@@ -205,32 +205,39 @@ aws iam list-open-id-connect-providers \
 
 ### What the trust policy is keyed on
 
-**IAM only exposes `aud`, `sub` and `amr` as OIDC condition keys.** A condition
-on any other claim (`ref`, `event_name`, `repository_id`, `job_workflow_ref`,
-`runner_environment`, ...) can never match, which makes the role unassumable and
-produces a bare `Not authorized to perform sts:AssumeRoleWithWebIdentity` with
-no hint as to why. All authorization therefore lives in `sub` — which is exactly
-why GitHub offers customizable and immutable subject formats.
+IAM maps a **fixed set** of GitHub claims to condition keys: `actor`,
+`actor_id`, `job_workflow_ref`, `repository`, `repository_id`,
+`repository_owner_id`, `workflow`, `ref`, `environment`, `enterprise_id`, plus
+the standard `aud`/`sub`/`amr`
+([docs](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#condition-keys-wif)).
+A condition on any *other* claim — `event_name`, `runner_environment`,
+`repository_owner`, `workflow_ref` — can never match, so the role becomes
+unassumable and STS returns a bare `Not authorized to perform
+sts:AssumeRoleWithWebIdentity` with no indication of which condition failed.
 
 | Claim | Condition | Why |
 | ----- | --------- | --- |
 | `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
-| `sub` | `∈ github_deploy_subjects` | pins repository **and** branch |
+| `repository_id` | `= github_repository_id` | immutable: survives renames, and the path can't be re-claimed after deletion |
+| `repository_owner_id` | `= github_repository_owner_id` | ditto for the owner |
+| `ref` | `= github_deploy_ref` | only the deploy branch |
+| `job_workflow_ref` | `= github_deploy_workflow_ref` | only *this* workflow file; a new workflow on the branch doesn't inherit the grant |
 
-This org emits the *immutable* subject format, which embeds numeric ids:
+`sub` is deliberately unused (`github_deploy_subjects` is empty): its format is
+org-configurable — this org emits the immutable variant,
+`repo:OWNER@<owner_id>/REPO@<repo_id>:ref:refs/heads/master` — and the claims
+above pin the same facts in a format GitHub can't reconfigure underneath us.
 
-```
-repo:KenoAIStaging@216627359/PkgEvalFarm.jl@1311559445:ref:refs/heads/master
-```
+Forks and pull requests are excluded by `ref`: a PR run carries
+`ref=refs/pull/N/merge`. Belt and braces, GitHub caps fork-PR permissions at
+read-only, so such a job cannot mint a token at all, and the deploy job's `if:`
+refuses to run outside a push to the deploy branch. Guards IAM cannot express
+(only on `push`, only on a GitHub-hosted runner) live in that `if:` and should
+be backed by branch protection.
 
-That is strictly better than the documented `repo:OWNER/REPO:ref:...` form: the
-ids survive renames and cannot be re-claimed by registering the same path after
-a deletion. Forks and pull requests end in `:pull_request` instead of
-`:ref:refs/heads/master`, so they cannot match — and GitHub caps fork-PR
-permissions at read-only, so such a job cannot mint a token at all.
-
-Do not assume the format: dump what your org actually mints by adding a step to
-the workflow, then set `github_deploy_subjects` to match exactly.
+Note `job_workflow_ref` pins the file path — renaming `ci.yml` or moving the
+deploy job into a reusable workflow breaks deploys until the variable is
+updated. To see the claims a run actually mints:
 
 ```yaml
 - run: |
@@ -238,11 +245,6 @@ the workflow, then set `github_deploy_subjects` to match exactly.
       "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
     echo "$tok" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
 ```
-
-Guards that cannot be expressed in IAM — only this workflow file may deploy,
-only on `push`, only on a GitHub-hosted runner — are enforced job-side by the
-`if:` condition in `.github/workflows/ci.yml`, and should be backed by branch
-protection on the deploy branch.
 
 Terraform bootstraps the initial bundles and then defers to CI: the zip objects
 and the functions' `source_code_hash` carry `ignore_changes`, so a later

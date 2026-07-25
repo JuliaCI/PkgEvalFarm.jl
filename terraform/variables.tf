@@ -165,7 +165,38 @@ variable "github_deploy_subjects" {
   # here. This org mints the immutable subject format, which embeds numeric
   # owner/repo ids — confirm the exact value for your org (README shows how)
   # before changing it, since a mismatch denies with no explanation.
-  default = ["repo:KenoAIStaging@216627359/PkgEvalFarm.jl@1311559445:ref:refs/heads/master"]
+  # Empty: the specific claims below pin the same things in a format GitHub
+  # cannot reconfigure (this org mints the immutable subject variant,
+  # repo:OWNER@<id>/REPO@<id>:ref:..., not the documented form).
+  default = []
+}
+
+variable "github_repository_id" {
+  description = "Numeric repository id, pinned via the repository_id claim (immutable across renames). null omits."
+  type        = string
+  default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
+  nullable    = true
+}
+
+variable "github_repository_owner_id" {
+  description = "Numeric owner id, pinned via the repository_owner_id claim. null omits."
+  type        = string
+  default     = "216627359" # KenoAIStaging
+  nullable    = true
+}
+
+variable "github_deploy_ref" {
+  description = "Git ref allowed to deploy, matched against the `ref` claim. null omits."
+  type        = string
+  default     = "refs/heads/master"
+  nullable    = true
+}
+
+variable "github_deploy_workflow_ref" {
+  description = "Workflow file allowed to deploy (OWNER/REPO/.github/workflows/FILE@REF), matched against `job_workflow_ref`. null omits."
+  type        = string
+  default     = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
+  nullable    = true
 }
 
 
