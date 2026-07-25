@@ -13,6 +13,7 @@ variable "region" {
 variable "bucket_name" {
   description = "Name of the S3 bucket that stores PkgEval results (reports, logs, artifacts)."
   type        = string
+  default     = "nanosoldier2"
 }
 
 variable "github_org" {
@@ -33,8 +34,9 @@ variable "submitter_team" {
 }
 
 variable "github_client_id" {
-  description = "Client ID of the (public) GitHub OAuth app used for the device flow."
+  description = "Client ID of the (public) GitHub OAuth app used for the device flow. Not a secret."
   type        = string
+  default     = "Ov23lizNGZDa3XiWu3jh"
 }
 
 variable "cred_duration_seconds" {
