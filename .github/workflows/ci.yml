@@ -83,12 +83,14 @@ jobs:
         run: julia --project=broker broker/build/build.jl
       - name: Build bot
         run: julia --project=bot bot/build/build.jl
+      - name: Build build-request broker
+        run: julia --project=buildreq buildreq/build/build.jl
       - name: Assert bundles are CPU-portable
         # juliac targets the build host unless JULIA_CPU_TARGET is set; an
         # AVX-512 build dies during Lambda init ("Rejecting this target due to
         # use of runtime-disabled features"), so fail loudly here instead
         run: |
-          for app in broker bot; do
+          for app in broker bot buildreq; do
             count=$(objdump -d "$app/build/stage/bootstrap" | grep -c '%zmm' || true)
             echo "$app: $count AVX-512 instructions"
             [ "$count" -eq 0 ] || { echo "::error::$app bundle is not portable"; exit 1; }
@@ -99,12 +101,57 @@ jobs:
           path: |
             broker/build/bootstrap.zip
             bot/build/bootstrap.zip
+            buildreq/build/bootstrap.zip
+          retention-days: 7
+
+  # Sysimage the workers download at boot instead of spending ~80s precompiling
+  # AWS.jl, PkgEval and friends on every launch (spot replacement, scale-out,
+  # scale-to-zero). Built on the same Julia *minor* the workers install and from
+  # the committed Manifest, so the baked code is not stale on arrival.
+  sysimage:
+    name: Build worker sysimage
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          # must match ec2_worker_julia_channel in terraform/variables.tf
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Build sysimage
+        run: |
+          julia --project=sysimage -e 'using Pkg; Pkg.instantiate()'
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
+          julia --project=. sysimage/build.jl
+      - name: Assert the sysimage is CPU-portable
+        # workers are whatever the spot pool hands us (m5a/m6a/m7a...), so the
+        # image must not contain instructions the oldest of them lacks. It is
+        # multiversioned, unlike the juliac bundles, but the failure mode of
+        # getting this wrong is the same: dead on arrival.
+        run: |
+          count=$(objdump -d sysimage/build/*.so | grep -c '%zmm' || true)
+          echo "$count AVX-512 instructions"
+          [ "$count" -eq 0 ] || { echo "::error::sysimage is not portable"; exit 1; }
+      - name: Check it loads
+        run: |
+          julia --project=. -J sysimage/build/*.so -e '
+            using PkgEvalFarm
+            # the point of the exercise: nothing may be recompiled on load
+            for m in (PkgEvalFarm, PkgEvalFarm.AWS, PkgEvalFarm.PkgEval)
+                Base.in_sysimage(Base.PkgId(m)) ||
+                    error("$m is not in the sysimage; workers would precompile it anyway")
+            end'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-sysimage
+          path: sysimage/build/*.so
           retention-days: 7
 
   deploy:
     name: Publish Lambda bundles
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, sysimage]
     # only from the deploy branch of this repo — never from forks or PRs, which
     # is also what the role's OIDC `sub` condition enforces on the AWS side
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
@@ -119,6 +166,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: lambda-bundles
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-sysimage
+          path: sysimage
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
@@ -128,6 +179,7 @@ jobs:
         run: |
           aws s3 cp broker/build/bootstrap.zip "s3://${{ env.LAMBDA_BUCKET }}/broker.zip"
           aws s3 cp bot/build/bootstrap.zip "s3://${{ env.LAMBDA_BUCKET }}/bot.zip"
+          aws s3 cp buildreq/build/bootstrap.zip "s3://${{ env.LAMBDA_BUCKET }}/build-request.zip"
       - name: Publish to Lambda
         run: |
           publish() {
@@ -143,6 +195,26 @@ jobs:
           }
           publish "${{ env.NAME_PREFIX }}-broker" broker.zip
           publish "${{ env.NAME_PREFIX }}-bot" bot.zip
+          publish "${{ env.NAME_PREFIX }}-build-request" build-request.zip
+      - name: Publish the worker sysimage
+        # Keyed by commit: a worker fetches the image built from the exact
+        # revision it checked out, so code and image can never disagree (and a
+        # miss just means the worker precompiles, see the cloud-init fallback).
+        # The bucket policy makes these create-only -- a published image is
+        # executed by every EC2 worker that boots afterwards.
+        run: |
+          for so in sysimage/*.so; do
+            key="sysimage/${{ github.sha }}/$(basename "$so")"
+            if aws s3api head-object --bucket "${{ env.LAMBDA_BUCKET }}" --key "$key" >/dev/null 2>&1; then
+              echo "::notice::$key already published (re-run of the same commit)"
+              continue
+            fi
+            # If-None-Match: * -- the bucket policy rejects any put without it
+            aws s3api put-object --bucket "${{ env.LAMBDA_BUCKET }}" --key "$key" \
+              --body "$so" --if-none-match '*' >/dev/null
+            echo "::notice::published $key"
+          done
+
       - name: Smoke-test the broker
         # /info needs no credentials and exercises init end to end, which is
         # exactly what the CPU-target class of bug breaks

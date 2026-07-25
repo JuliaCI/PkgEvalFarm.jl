@@ -11,3 +11,4 @@ lite/Manifest.toml
 buildreq/build/stage/
 buildreq/build/bootstrap.zip
 buildreq/Manifest.toml
+sysimage/build/

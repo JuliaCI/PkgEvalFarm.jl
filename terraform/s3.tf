@@ -71,6 +71,55 @@ resource "aws_s3_bucket" "lambda" {
   bucket = "${var.bucket_name}-lambda"
 }
 
+# Worker sysimages live here too, under sysimage/<commit>/. They are code the
+# EC2 workers *execute*, so the same reasoning applies as for the Lambda zips:
+# a bucket no farm principal can write to. EC2 workers get read access to this
+# one prefix (see ec2_workers.tf) using their instance-profile credentials;
+# manually enrolled workers are long-lived, so they just precompile once and
+# never need it.
+resource "aws_s3_bucket_policy" "lambda" {
+  bucket = aws_s3_bucket.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # Unlike the Lambda zips, which CI republishes in place, a sysimage is
+      # named after the commit it was built from and never legitimately changes.
+      # Refusing overwrites means a leaked deploy credential cannot swap the
+      # code under workers that are already booting from it.
+      {
+        Sid       = "SysimagesAreCreateOnly"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.lambda.arn}/sysimage/*"
+        Condition = {
+          StringNotEquals = { "s3:if-none-match" = "*" }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "lambda" {
+  bucket = aws_s3_bucket.lambda.id
+
+  rule {
+    id     = "expire-sysimages"
+    status = "Enabled"
+
+    filter {
+      prefix = "sysimage/"
+    }
+
+    # one per commit that ever deployed, at ~250MB each; workers only ever want
+    # the image for the ref they check out, which is the current master
+    expiration {
+      days = 30
+    }
+  }
+}
+
 resource "aws_s3_bucket_public_access_block" "lambda" {
   bucket = aws_s3_bucket.lambda.id
 

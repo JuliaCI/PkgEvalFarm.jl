@@ -19,7 +19,9 @@ SYSCTL
 sysctl --system
 
 apt-get update -q
-DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl
+# awscli: cloud-init downloads the worker sysimage from a private bucket with
+# the instance profile's credentials, before any Julia AWS tooling exists
+DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl awscli
 
 useradd --create-home --shell /bin/bash worker
 
@@ -46,7 +48,66 @@ WORKER_UID=$(id -u worker)
 
 sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
 sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
-sudo -u worker -H bash -c 'cd ~/PkgEvalFarm.jl && ~/.juliaup/bin/julia --project=. -e "using Pkg; Pkg.instantiate()"'
+
+# --- worker sysimage ---------------------------------------------------------
+# CI publishes a sysimage per (commit, Julia version) holding the worker and its
+# dependencies; loading it turns ~80s of precompilation on every launch into a
+# download from S3 within the region. That cost is paid on every spot
+# replacement and every scale-out, which is what makes it worth the machinery.
+#
+# All of this is best effort: no image for this commit, a Julia patch release
+# CI has not built for yet, a failed download or an image that refuses to load
+# all end with SYSIMAGE empty and the worker precompiling exactly as before --
+# slower, never broken.
+JULIA=/home/worker/.juliaup/bin/julia
+SYSIMAGE=
+
+# packages and artifacts, but no precompilation -- see below
+fetch_deps() {
+  sudo -u worker -H bash -c \
+    "cd ~/PkgEvalFarm.jl && JULIA_PKG_PRECOMPILE_AUTO=0 \
+       $JULIA --project=. -e 'using Pkg; Pkg.instantiate()'"
+}
+
+# the slow path this whole section exists to avoid
+precompile_deps() {
+  sudo -u worker -H bash -c \
+    "cd ~/PkgEvalFarm.jl && $JULIA --project=. -e 'using Pkg; Pkg.instantiate()'"
+}
+
+loads_from_sysimage() {
+  sudo -u worker -H bash -c \
+    "cd ~/PkgEvalFarm.jl && $JULIA -J$SYSIMAGE --project=. -e 'using PkgEvalFarm'"
+}
+
+if [ -n "${sysimage_bucket}" ]; then
+  sha=$(sudo -u worker -H git -C /home/worker/PkgEvalFarm.jl rev-parse HEAD)
+  ver=$(sudo -u worker -H $JULIA --startup-file=no -e 'print(VERSION)')
+  key="sysimage/$sha/pkgevalfarm-julia-$ver-$(uname -m).so"
+  # /opt, not the worker's home: the worker loads this image but must not be
+  # able to rewrite it
+  mkdir -p /opt/pkgeval
+  if aws s3 cp --only-show-errors --region ${region} \
+       "s3://${sysimage_bucket}/$key" /opt/pkgeval/sysimage.so; then
+    SYSIMAGE=/opt/pkgeval/sysimage.so
+  else
+    echo "no sysimage published for $key; will precompile instead" >&2
+  fi
+fi
+
+# Order matters: the packages and *artifacts* must be on disk before anything
+# starts julia with the sysimage. Baked-in JLL `__init__`s resolve their
+# artifact paths in the depot at startup, so on a fresh machine `julia -J`
+# aborts during init -- before it could run the instantiate that would have
+# installed them. Fetching with precompilation disabled puts both in place
+# without paying the cost the sysimage exists to avoid.
+if [ -n "$SYSIMAGE" ] && fetch_deps && loads_from_sysimage; then
+  echo "using sysimage $SYSIMAGE"
+else
+  SYSIMAGE=
+  rm -f /opt/pkgeval/sysimage.so
+  precompile_deps
+fi
 
 # --- IMDS protection ---------------------------------------------------------
 # PkgEval sandboxes share the host network namespace, so package code under
@@ -61,6 +122,7 @@ install -m 640 -o root -g worker /dev/null /etc/pkgeval-worker.env
 cat >/etc/pkgeval-worker.env <<ENVFILE
 PKGEVAL_CREDS_URL=http://127.0.0.1:9911/credentials
 PKGEVAL_CREDS_TOKEN=$CREDS_TOKEN
+$${SYSIMAGE:+PKGEVAL_SYSIMAGE=$SYSIMAGE}
 ENVFILE
 
 cat >/usr/local/bin/pkgeval-imds-proxy <<'PROXY'
@@ -149,6 +211,8 @@ Environment=HOME=/home/worker
 Environment=XDG_RUNTIME_DIR=/run/user/$WORKER_UID
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$WORKER_UID/bus
 Environment=JULIA=/home/worker/.juliaup/bin/julia
+# PKGEVAL_SYSIMAGE (if cloud-init got one) comes from the EnvironmentFile below;
+# bin/farm passes it to julia as -J
 Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}

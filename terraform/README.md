@@ -88,6 +88,20 @@ juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 (worker logs via `journalctl -u pkgeval-worker`).
 
+**Sysimage bootstrap**: bringing the depot up from cold costs 137s, of which
+~75s is precompiling AWS.jl, PkgEval and their dependency trees, and EC2
+workers launch constantly (spot replacement, queue-driven scale-out,
+scale-to-zero). CI therefore publishes a
+sysimage per (commit, Julia version) to `s3://<bucket>-lambda/sysimage/<sha>/`,
+which cloud-init downloads with the instance profile (read-only, that prefix
+only) and passes to julia as `-J` — 62s to fetch packages and artifacts, plus
+the image download, and the worker loads in under a second. Keyed by commit, so the image always matches
+the checked-out code, and create-only, since workers execute it. Every failure
+path — no image for that commit, a Julia patch bump CI has not built for, a bad
+download — falls back to plain `Pkg.instantiate`, so a missing sysimage costs
+time, never a dead worker. Manually enrolled workers do not get this grant:
+they are long-lived, so they precompile once and never care.
+
 **Container prerequisites**: PkgEval drives rootless containers with `crun
 --systemd-cgroup`, which needs the worker user's own systemd manager and
 session D-Bus — a plain `User=` system service has neither, so cloud-init

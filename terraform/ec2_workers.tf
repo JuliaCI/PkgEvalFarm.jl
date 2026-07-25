@@ -58,6 +58,28 @@ resource "aws_iam_role_policy_attachment" "ec2_worker_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Read-only, and only the sysimage prefix: an EC2 worker downloads the image
+# built from the revision it checks out (cloud-init falls back to precompiling
+# if it is missing). Deliberately not granted to the brokered worker role —
+# those machines are long-lived, so paying precompilation once is nothing, and
+# the Lambda bucket stays entirely unreachable from off-farm credentials.
+resource "aws_iam_role_policy" "ec2_worker_sysimage" {
+  count = local.ec2_workers
+  name  = "read-sysimage"
+  role  = aws_iam_role.ec2_worker[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${aws_s3_bucket.lambda.arn}/sysimage/*"
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "ec2_worker" {
   count = local.ec2_workers
   name  = "${var.name_prefix}-ec2-worker"
@@ -168,6 +190,9 @@ resource "aws_launch_template" "ec2_worker" {
     farm_repo     = var.ec2_worker_farm_repo
     farm_ref      = var.ec2_worker_farm_ref
     julia_channel = var.ec2_worker_julia_channel
+    # private; workers read it with their instance profile (see the
+    # read-sysimage policy above)
+    sysimage_bucket = aws_s3_bucket.lambda.bucket
   }))
 
   tag_specifications {
