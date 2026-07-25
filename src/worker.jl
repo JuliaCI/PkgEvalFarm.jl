@@ -105,10 +105,15 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
         packages = String.(run["packages"])
         if isempty(packages)  # "all packages": compute the selection here
             configs = config_from_dict.(run["configs"])
-            # may download/build the Julia versions under test to determine compatibility
-            pkgs = intersect([PkgEval.get_packages(cfg) for cfg in configs]...)
+            # `get_packages` returns a Dict keyed by name (registry packages) or
+            # uuid (stdlibs), so intersect the *names* of its values: comparing
+            # Package structs would rely on their fields being egal.
+            # This may download the Julia versions under test, since determining
+            # compatibility needs their version numbers.
+            names = intersect([Set(pkg.name for pkg in values(PkgEval.get_packages(cfg)))
+                               for cfg in configs]...)
             # JLL wrappers are not worth testing (PkgEval.evaluate drops them too)
-            packages = [pkg.name for pkg in pkgs if !endswith(pkg.name, "_jll")]
+            packages = sort!([n for n in names if !endswith(n, "_jll")])
         end
         njobs = expand_run(ctx, claimed.run_id, packages)
         SQS.delete_message(ctx.cfg.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
