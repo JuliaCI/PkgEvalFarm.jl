@@ -77,6 +77,32 @@ data "aws_subnets" "default" {
   }
 }
 
+data "aws_subnet" "default" {
+  for_each = local.ec2_workers == 0 ? toset([]) : toset(data.aws_subnets.default[0].ids)
+  id       = each.value
+}
+
+# Legacy zones (us-east-1e, for one) do not offer modern instance types, and the
+# default VPC has a subnet in every zone. Handing those subnets to the ASG makes
+# it burn launch attempts on InvalidFleetConfiguration before retrying elsewhere,
+# which delays scale-out exactly when capacity is wanted.
+data "aws_ec2_instance_type_offerings" "worker" {
+  count         = local.ec2_workers
+  location_type = "availability-zone"
+
+  filter {
+    name   = "instance-type"
+    values = var.ec2_worker_instance_types
+  }
+}
+
+locals {
+  worker_subnets = local.ec2_workers == 0 ? [] : [
+    for s in data.aws_subnet.default : s.id
+    if contains(data.aws_ec2_instance_type_offerings.worker[0].locations, s.availability_zone)
+  ]
+}
+
 resource "aws_security_group" "ec2_worker" {
   count       = local.ec2_workers
   name        = "${var.name_prefix}-ec2-worker"
@@ -158,7 +184,7 @@ resource "aws_autoscaling_group" "ec2_worker" {
   min_size            = var.ec2_worker_min
   max_size            = var.ec2_worker_max
   desired_capacity    = var.ec2_worker_min
-  vpc_zone_identifier = data.aws_subnets.default[0].ids
+  vpc_zone_identifier = local.worker_subnets
 
   # instances need to install Julia and warm caches before they consume at full
   # rate; a long warmup prevents the scaler from over-ordering in the meantime
