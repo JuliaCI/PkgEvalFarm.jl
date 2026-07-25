@@ -135,7 +135,11 @@ same secret). Its execution role carries the submitter policy directly — no br
 hop, no long-running server.
 
 Mention it on a PR: `@nanosoldier2 runtests()`, `runtests(["Foo"])`, or
-`runtests(vs = ":master")`.
+`runtests(vs = ":master")`. Commands are only executed for authorized authors —
+by default active members of the submitter team, or (with
+`bot_submitter_team = ""`) any org member. Classic Nanosoldier's collaborator
+check was disabled in 2021, leaving it open to any commenter; this bot
+deliberately does not replicate that.
 
 The identical bot code also runs interactively anywhere (state lives in the runs
 table and GitHub, so Lambda and interactive bots can even coexist):

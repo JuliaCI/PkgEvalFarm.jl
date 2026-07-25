@@ -44,8 +44,8 @@ resource "aws_iam_role_policy" "bot" {
 
 resource "aws_s3_object" "bot_zip" {
   count       = local.bot_enabled
-  bucket      = aws_s3_bucket.results.id
-  key         = "lambda/bot.zip"
+  bucket      = aws_s3_bucket.lambda.id
+  key         = "bot.zip"
   source      = "${path.module}/../bot/build/bootstrap.zip"
   source_hash = try(filemd5("${path.module}/../bot/build/bootstrap.zip"), null)
 }
@@ -70,11 +70,15 @@ resource "aws_lambda_function" "bot" {
       NANOSOLDIER2_GITHUB_TOKEN = var.github_bot_token
       GITHUB_WEBHOOK_SECRET     = var.github_webhook_secret
       BOT_NAME                  = var.bot_name
-      PKGEVAL_QUEUE_URL         = aws_sqs_queue.jobs.url
-      PKGEVAL_RUNS_TABLE        = aws_dynamodb_table.runs.name
-      PKGEVAL_JOBS_TABLE        = aws_dynamodb_table.jobs.name
-      PKGEVAL_BUCKET            = aws_s3_bucket.results.bucket
-      FARM_REGION               = var.region
+      # commands are only executed for authorized authors (the bot's token
+      # needs read:org to check); empty team = any org member
+      GITHUB_ORG         = var.github_org
+      SUBMITTER_TEAM     = var.bot_submitter_team == null ? var.submitter_team : var.bot_submitter_team
+      PKGEVAL_QUEUE_URL  = aws_sqs_queue.jobs.url
+      PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
+      PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
+      PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket
+      FARM_REGION        = var.region
     }
   }
 }

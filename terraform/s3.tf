@@ -15,14 +15,13 @@ resource "aws_s3_bucket_public_access_block" "results" {
   restrict_public_buckets = !var.public_reports
 }
 
-resource "aws_s3_bucket_policy" "public_reports" {
-  count = var.public_reports ? 1 : 0
+locals {
+  # role ARNs that hold worker credentials (brokered + EC2 instance profile)
+  worker_role_arns = concat([aws_iam_role.worker.arn],
+  aws_iam_role.ec2_worker[*].arn)
 
-  bucket = aws_s3_bucket.results.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
+  results_policy_statements = concat(
+    var.public_reports ? [
       {
         Sid       = "PublicReadReportsAndLogs"
         Effect    = "Allow"
@@ -33,10 +32,52 @@ resource "aws_s3_bucket_policy" "public_reports" {
           "${aws_s3_bucket.results.arn}/runs/*/logs/*",
         ]
       }
+    ] : [],
+    [
+      # workers may only *create* objects, never overwrite: uploads must carry
+      # If-None-Match: * (which S3 rejects with 412 if the key exists), so a
+      # rogue job with worker credentials cannot falsify already-recorded logs
+      {
+        Sid       = "WorkersCreateOnly"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:PutObject"
+        Resource  = "${aws_s3_bucket.results.arn}/runs/*"
+        Condition = {
+          StringNotEquals = { "s3:if-none-match" = "*" }
+          ArnLike         = { "aws:PrincipalArn" = local.worker_role_arns }
+        }
+      }
     ]
+  )
+}
+
+resource "aws_s3_bucket_policy" "results" {
+  bucket = aws_s3_bucket.results.id
+
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = local.results_policy_statements
   })
 
   depends_on = [aws_s3_bucket_public_access_block.results]
+}
+
+# The Lambda deployment zips live in their own private bucket that no farm
+# principal (worker/submitter/bot) has any grant on, so even a policy
+# regression on the results bucket cannot become privilege escalation via
+# code overwrite.
+resource "aws_s3_bucket" "lambda" {
+  bucket = "${var.bucket_name}-lambda"
+}
+
+resource "aws_s3_bucket_public_access_block" "lambda" {
+  bucket = aws_s3_bucket.lambda.id
+
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "results" {

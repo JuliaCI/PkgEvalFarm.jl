@@ -5,10 +5,10 @@
 #   julia --project=broker broker/build/build.jl
 
 # the juliac bundles exceed Lambda's 50 MB direct-upload limit, so the zips are
-# staged through the results bucket (under lambda/, which is never public)
+# staged through the dedicated (strictly private) lambda bucket
 resource "aws_s3_object" "broker_zip" {
-  bucket = aws_s3_bucket.results.id
-  key    = "lambda/broker.zip"
+  bucket = aws_s3_bucket.lambda.id
+  key    = "broker.zip"
   source = "${path.module}/../broker/build/bootstrap.zip"
   # try() so that `tofu validate` succeeds before the zip has been built; on a
   # real plan/apply the zip must exist (see README) and the hash is computed.

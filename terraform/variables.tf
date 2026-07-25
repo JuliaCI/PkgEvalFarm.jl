@@ -143,3 +143,10 @@ variable "ec2_worker_julia_channel" {
   type        = string
   default     = "1.12"
 }
+
+variable "bot_submitter_team" {
+  description = "Team gating @bot commands. null = same as submitter_team; empty string = any github_org member (classic Nanosoldier's documented policy)."
+  type        = string
+  default     = null
+  nullable    = true
+}

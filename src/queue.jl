@@ -18,6 +18,10 @@ is_conditional_failure(err) = err isa AWS.AWSException &&
     (occursin("ConditionalCheckFailed", err.code) ||
      occursin("conditional request failed", lowercase(err.message)))
 
+# S3's answer to an If-None-Match: * PUT when the key already exists
+is_precondition_failed(err) = err isa AWS.AWSException &&
+    (err.code == "PreconditionFailed" || err.code == "412")
+
 
 ## submission
 
@@ -221,10 +225,19 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     key = log_key(job.run_id, job.config, job.package)
     if result.log !== nothing
         aws_retry() do
-            S3.put_object(ctx.cfg.bucket, key,
-                Dict("body" => result.log,
-                     "headers" => Dict("Content-Type" => "text/plain; charset=utf-8"));
-                aws_config=ctx.aws)
+            try
+                # If-None-Match makes the upload create-only (and the bucket
+                # policy *requires* workers to send it): first write wins, so an
+                # already-recorded log can never be overwritten later
+                S3.put_object(ctx.cfg.bucket, key,
+                    Dict("body" => result.log,
+                         "headers" => Dict("Content-Type" => "text/plain; charset=utf-8",
+                                           "If-None-Match" => "*"));
+                    aws_config=ctx.aws)
+            catch err
+                # a crashed earlier attempt already uploaded this job's log
+                is_precondition_failed(err) || rethrow()
+            end
         end
     end
 

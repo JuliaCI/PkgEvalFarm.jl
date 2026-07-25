@@ -416,9 +416,55 @@ function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
     handle_command(ctx, gh, name, repo, number, something(comment_body), requester, pr_url)
 end
 
+struct TeamMembership
+    state::Union{Nothing,String}
+end
+
+function json_make(::Type{TeamMembership}, x::LazyVal)
+    state = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "state"
+            s, p = json_string(v); state[] = s; return p
+        end
+        return nothing
+    end
+    return TeamMembership(state[]), pos::Int
+end
+
+"""
+Whether `login` may submit evaluation jobs. With `SUBMITTER_TEAM` set, that means
+active membership in that team (the same gate the broker applies to human
+submitters); with it empty, any `GITHUB_ORG` member qualifies (the policy classic
+Nanosoldier documents — its actual author check was disabled in 2021, which this
+bot deliberately does not replicate). The author's identity is attested by GitHub
+(HMAC-verified webhook delivery, or comments fetched from the API), so this check
+is what stops arbitrary passers-by from running their code on workers.
+"""
+function authorized_submitter(gh::GitHubCtx, login::String)
+    org = get(ENV, "GITHUB_ORG", "")
+    team = get(ENV, "SUBMITTER_TEAM", "")
+    isempty(org) && error("bot misconfigured: GITHUB_ORG not set")
+    if isempty(team)
+        # org-membership mode; the bot's account must itself be an org member
+        resp = github_request(gh, "GET", "/orgs/$org/members/$login")
+        return resp.status == 204
+    end
+    resp = github_request(gh, "GET", "/orgs/$org/teams/$team/memberships/$login")
+    resp.status == 200 || return false
+    return parse_json(resp.body, TeamMembership).state == "active"
+end
+
+authz_description() = begin
+    org = get(ENV, "GITHUB_ORG", "")
+    team = get(ENV, "SUBMITTER_TEAM", "")
+    isempty(team) ? "members of the $org organization" : "members of the $org/$team team"
+end
+
 """
 Execute a `runtests` command found in a comment (from either the webhook or the
-notifications path): validate it, resolve the PR, submit the run, and acknowledge.
+notifications path): authorize the author, validate the command, resolve the PR,
+submit the run, and acknowledge.
 """
 function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
                         number::Int, comment_body::String, requester::String,
@@ -426,6 +472,13 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     occursin("@$name", comment_body) || return
     command = parse_command(comment_body)
     command === nothing && return
+
+    if !authorized_submitter(gh, requester)
+        post_comment(gh, repo, number,
+                     "Sorry @$requester, only $(authz_description()) may submit " *
+                     "evaluation jobs.")
+        return
+    end
 
     if command.error !== nothing
         post_comment(gh, repo, number,

@@ -112,6 +112,7 @@ itself would still be a welcome belt-and-braces improvement.
 | `cred_duration_seconds` | no | `3600` | Lifetime of the temporary credentials the broker vends. |
 | `public_reports` | no | `true` | Make `runs/*/report/*` and `runs/*/logs/*` publicly readable. |
 | `github_bot_token` | no | `""` | Token of the bot's GitHub account; empty disables the bot Lambda. |
+| `bot_submitter_team` | no | `null` | Team gating bot commands (null = `submitter_team`; `""` = any org member). |
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |

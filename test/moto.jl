@@ -154,6 +154,19 @@ try
         job = only(filter(j -> j["job_key"] == "primary#JSON", jobs))
         @test PEF.job_log(ctx, job) == "log of JSON on primary"
 
+        # create-only uploads: conditional re-put of an existing log is rejected
+        # and the original content survives (first write wins)
+        overwrite_err = try
+            S3.put_object(cfg.bucket, PEF.log_key(RUN_ID, "primary", "JSON"),
+                Dict("body" => "forged",
+                     "headers" => Dict("If-None-Match" => "*")); aws_config=aws)
+            nothing
+        catch err
+            err
+        end
+        @test PEF.is_precondition_failed(overwrite_err)
+        @test PEF.job_log(ctx, job) == "log of JSON on primary"
+
         # report generation runs through FarmBot (the stdlib-only bot Lambda code)
         lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
             creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
@@ -272,6 +285,19 @@ try
             req -> TestHTTP.Response(200, JSON.json(Dict(
                 "head" => Dict("sha" => "abcdef123456"),
                 "base" => Dict("ref" => "master")))))
+        # author authorization: keno is an active submitter, rando is nobody
+        TestHTTP.register!(router, "GET",
+            "/orgs/KenoAIStaging/teams/pkgeval-submitters/memberships/keno",
+            req -> TestHTTP.Response(200, JSON.json(Dict("state" => "active"))))
+        TestHTTP.register!(router, "GET",
+            "/orgs/KenoAIStaging/teams/pkgeval-submitters/memberships/rando",
+            req -> TestHTTP.Response(404, "{}"))
+        TestHTTP.register!(router, "GET", "/orgs/KenoAIStaging/members/keno",
+            req -> TestHTTP.Response(204))
+        TestHTTP.register!(router, "GET", "/orgs/KenoAIStaging/members/rando",
+            req -> TestHTTP.Response(404, "{}"))
+        ENV["GITHUB_ORG"] = "KenoAIStaging"
+        ENV["SUBMITTER_TEAM"] = "pkgeval-submitters"
         TestHTTP.register!(router, "POST", "/repos/JuliaLang/julia/issues/12345/comments",
             req -> begin
                 push!(posted, JSON.parse(String(req.body))["body"])
@@ -368,6 +394,25 @@ try
             @test length(posted) == 3
             @test occursin("has been submitted as run", posted[3])
             webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
+
+            # 5b. an unauthorized author gets a refusal and no run
+            intruder = replace(payload, "\"login\":\"keno\"" => "\"login\":\"rando\"")
+            with_env(Dict("GITHUB_WEBHOOK_SECRET" => secret)) do
+                resp = JSON.parse(PEF.FarmBot.handle_event(
+                    webhook_event(intruder, sign(intruder)), lite, gh))
+                @test resp["statusCode"] == 200
+            end
+            @test length(posted) == 4
+            @test occursin("only members of the KenoAIStaging/pkgeval-submitters team", posted[4])
+            posted_refusal = pop!(posted)  # keep later indices stable
+
+            # both authorization modes, checked directly
+            @test PEF.FarmBot.authorized_submitter(gh, "keno")
+            @test !PEF.FarmBot.authorized_submitter(gh, "rando")
+            with_env(Dict("SUBMITTER_TEAM" => "")) do  # org-membership mode
+                @test PEF.FarmBot.authorized_submitter(gh, "keno")
+                @test !PEF.FarmBot.authorized_submitter(gh, "rando")
+            end
             run = PEF.get_run(ctx, webhook_run_id)
             @test run["packages"] == ["Example"]
             @test run["submitter"] == "keno via @nanosoldier2"

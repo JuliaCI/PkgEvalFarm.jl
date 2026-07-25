@@ -165,8 +165,8 @@ resource "aws_iam_role" "submitter" {
 #   runs put/get/update/scan   create_run, status, reported-claim, finished-run scan
 #   jobs query                 report aggregation (fan-out itself is the workers' job)
 #   sqs send                   the expand message
-#   s3 under runs/ only        report upload, log fetch — the lambda/ deployment
-#                              prefix is deliberately out of reach
+#   s3 under runs/ only        report upload, log fetch (deployment zips live in
+#                              a separate bucket no farm principal can touch)
 locals {
   submitter_policy = jsonencode({
     Version = "2012-10-17"
