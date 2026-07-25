@@ -170,3 +170,23 @@ variable "github_repository_id" {
   default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
   nullable    = true
 }
+
+variable "github_deploy_workflow_ref" {
+  description = "Exact workflow file allowed to deploy, as OWNER/REPO/.github/workflows/FILE@REF. null omits the condition."
+  type        = string
+  default     = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
+  nullable    = true
+}
+
+variable "github_deploy_event_name" {
+  description = "GitHub event that may deploy (e.g. push). null omits the condition."
+  type        = string
+  default     = "push"
+  nullable    = true
+}
+
+variable "github_require_hosted_runner" {
+  description = "Require the OIDC token to come from a GitHub-hosted runner."
+  type        = bool
+  default     = true
+}

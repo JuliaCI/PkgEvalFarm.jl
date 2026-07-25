@@ -38,7 +38,20 @@ resource "aws_iam_role" "deploy" {
           StringEquals = merge(
             { "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com" },
             var.github_repository_id == null ? {} :
-            { "token.actions.githubusercontent.com:repository_id" = var.github_repository_id }
+            { "token.actions.githubusercontent.com:repository_id" = var.github_repository_id },
+            # the exact workflow file that may deploy: a *new* workflow added to
+            # master (or a reusable workflow called from elsewhere) does not
+            # inherit this grant
+            var.github_deploy_workflow_ref == null ? {} :
+            { "token.actions.githubusercontent.com:job_workflow_ref" = var.github_deploy_workflow_ref },
+            # the trigger: only a push, so workflow_dispatch/schedule/PR runs of
+            # the same file cannot deploy (mirrors the job's own `if:`)
+            var.github_deploy_event_name == null ? {} :
+            { "token.actions.githubusercontent.com:event_name" = var.github_deploy_event_name },
+            # refuse tokens minted on self-hosted runners, whose environment is
+            # not controlled by GitHub
+            var.github_require_hosted_runner ?
+            { "token.actions.githubusercontent.com:runner_environment" = "github-hosted" } : {}
           )
           # `sub` encodes repo + trigger context. A push to master is
           #   repo:OWNER/REPO:ref:refs/heads/master

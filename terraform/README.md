@@ -208,6 +208,19 @@ aws iam list-open-id-connect-providers \
 | `aud` | `= sts.amazonaws.com` | a token minted for another audience can't be replayed here |
 | `repository_id` | `= github_repository_id` | numeric and immutable: survives renames, and a deleted repo's name being re-registered by someone else does not inherit the grant |
 | `sub` | `∈ github_deploy_subjects` | pins repo **and trigger context** |
+| `job_workflow_ref` | `= github_deploy_workflow_ref` | only *this* workflow file at this ref; a newly added workflow on master does not inherit the grant |
+| `event_name` | `= github_deploy_event_name` (`push`) | `workflow_dispatch`/`schedule`/PR runs of the same file cannot deploy |
+| `runner_environment` | `= github-hosted` | refuses tokens minted on self-hosted runners |
+
+To see the claims an actual run produces (useful when tightening this further),
+add a step to the workflow:
+
+```yaml
+- run: |
+    tok=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+    echo "$tok" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+```
 
 The `sub` claim is what keeps forks out. A push to master is
 `repo:OWNER/REPO:ref:refs/heads/master`; a pull request — including one from a
