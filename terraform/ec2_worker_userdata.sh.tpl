@@ -23,9 +23,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl
 
 useradd --create-home --shell /bin/bash worker
 
-sudo -u worker bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
-sudo -u worker git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
-sudo -u worker bash -c 'cd ~/PkgEvalFarm.jl && ~/.juliaup/bin/julia --project=. -e "using Pkg; Pkg.instantiate()"'
+sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
+sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
+sudo -u worker -H bash -c 'cd ~/PkgEvalFarm.jl && ~/.juliaup/bin/julia --project=. -e "using Pkg; Pkg.instantiate()"'
 
 # --- IMDS protection ---------------------------------------------------------
 # PkgEval sandboxes share the host network namespace, so package code under
@@ -123,6 +123,7 @@ User=worker
 Delegate=yes
 TasksMax=infinity
 LimitNOFILE=1048576
+Environment=HOME=/home/worker
 Environment=JULIA=/home/worker/.juliaup/bin/julia
 Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
