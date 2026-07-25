@@ -56,8 +56,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          # juliac lives in the Julia install; the trim-compatible build needs 1.13
+          # juliac lives in the Julia install; the trim-compatible build needs
+          # 1.13, which is still a prerelease — hence include-all-prereleases
           version: '1.13'
+          include-all-prereleases: true
       - uses: julia-actions/cache@v2
       - name: Build broker
         run: julia --project=broker broker/build/build.jl
