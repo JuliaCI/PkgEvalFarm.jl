@@ -48,22 +48,29 @@ There is no per-machine registration and no long-lived secrets:
   all other configuration (queue URL, table names, bucket, region) is served
   by the broker itself.
 
-## Test workers
+## EC2 workers (testing and burst capacity)
 
-For shakedown testing, the config can spin up self-enrolling EC2 workers:
+The config can run self-enrolling EC2 workers as a spot-first auto-scaling
+group:
 
 ```sh
-tofu apply -var test_worker_count=2    # up
-tofu apply -var test_worker_count=0    # down (default)
+tofu apply -var ec2_worker_count=4    # scale up
+tofu apply -var ec2_worker_count=0    # scale to zero (default)
 ```
+
+All-spot by default (`ec2_worker_on_demand_percent = 0`): spot interruption is
+harmless — the killed worker's jobs stop being heartbeated and SQS redelivers
+them — and the ASG replaces interrupted instances automatically
+(`price-capacity-optimized` across `ec2_worker_instance_types`, default
+m6a/m6i/m5a/m7a 8xlarge: 32 vCPU with 4 GB/vCPU headroom for heavy package
+tests; larger instances amortize the per-machine Julia build and caches).
 
 Being inside AWS they skip GitHub enrollment entirely — an instance profile
 carries the same worker policy the broker would vend, and cloud-init installs
-juliaup + PkgEvalFarm.jl (`test_worker_farm_repo`/`_ref`) and starts a
+juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 `pkgeval-worker` systemd unit with the cgroup/userns settings PkgEval needs.
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
-(ids in the `test_worker_instance_ids` output; worker logs via
-`journalctl -u pkgeval-worker`).
+(worker logs via `journalctl -u pkgeval-worker`).
 
 ## Variables
 
@@ -82,11 +89,13 @@ No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
-| `test_worker_count` | no | `0` | Self-enrolling EC2 test workers to run (0 = none). |
-| `test_worker_instance_type` | no | `"c6i.2xlarge"` | Instance type for test workers. |
-| `test_worker_disk_gb` | no | `200` | Test worker root volume (GB). |
-| `test_worker_farm_repo` / `_ref` | no | staging repo, `master` | Where test workers clone PkgEvalFarm.jl from. |
-| `test_worker_julia_channel` | no | `"1.12"` | juliaup channel installed on test workers. |
+| `ec2_worker_count` | no | `0` | Desired EC2 workers (testing/burst; 0 = none). |
+| `ec2_worker_max` | no | `16` | ASG upper bound. |
+| `ec2_worker_instance_types` | no | m6a/m6i/m5a/m7a `8xlarge` | Spot pool candidates, in preference order. |
+| `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
+| `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
+| `ec2_worker_farm_repo` / `_ref` | no | staging repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |
+| `ec2_worker_julia_channel` | no | `"1.12"` | juliaup channel installed on EC2 workers. |
 
 ## Deploying
 

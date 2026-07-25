@@ -75,38 +75,50 @@ variable "github_webhook_secret" {
   sensitive   = true
 }
 
-variable "test_worker_count" {
-  description = "Number of self-enrolling EC2 test workers (0 disables everything test-worker related)."
+variable "ec2_worker_count" {
+  description = "Desired number of EC2 workers (testing/burst capacity; 0 disables)."
   type        = number
   default     = 0
 }
 
-variable "test_worker_instance_type" {
-  description = "Instance type for test workers."
-  type        = string
-  default     = "c6i.2xlarge"
+variable "ec2_worker_max" {
+  description = "Upper bound on EC2 workers."
+  type        = number
+  default     = 16
 }
 
-variable "test_worker_disk_gb" {
-  description = "Root volume size for test workers (rootfs/compile caches are hungry)."
+variable "ec2_worker_instance_types" {
+  description = "Instance types the spot fleet may use, in order of preference. 4 GB/vCPU recommended (heavy package tests); one machine amortizes Julia builds and caches across all its job slots, so prefer fewer, larger instances."
+  type        = list(string)
+  default     = ["m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge"]
+}
+
+variable "ec2_worker_on_demand_percent" {
+  description = "Percentage of capacity to run on-demand instead of spot (0 = all spot; interruptions are safe, jobs are simply redelivered)."
+  type        = number
+  default     = 0
+}
+
+variable "ec2_worker_disk_gb" {
+  description = "Root volume size for EC2 workers (rootfs/compile caches are hungry)."
   type        = number
   default     = 200
 }
 
-variable "test_worker_farm_repo" {
-  description = "Git URL the test workers clone PkgEvalFarm.jl from."
+variable "ec2_worker_farm_repo" {
+  description = "Git URL the EC2 workers clone PkgEvalFarm.jl from."
   type        = string
   default     = "https://github.com/KenoAIStaging/PkgEvalFarm.jl"
 }
 
-variable "test_worker_farm_ref" {
-  description = "Branch/tag of PkgEvalFarm.jl to check out on test workers."
+variable "ec2_worker_farm_ref" {
+  description = "Branch/tag of PkgEvalFarm.jl to check out on EC2 workers."
   type        = string
   default     = "master"
 }
 
-variable "test_worker_julia_channel" {
-  description = "juliaup channel installed on test workers."
+variable "ec2_worker_julia_channel" {
+  description = "juliaup channel installed on EC2 workers."
   type        = string
   default     = "1.12"
 }

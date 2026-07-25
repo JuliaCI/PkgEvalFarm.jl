@@ -48,7 +48,7 @@ output "bot_webhook_url" {
   value       = length(aws_lambda_function_url.bot) > 0 ? aws_lambda_function_url.bot[0].function_url : ""
 }
 
-output "test_worker_instance_ids" {
-  description = "Instance ids of the test workers (connect with `aws ssm start-session --target <id>`)."
-  value       = aws_instance.test_worker[*].id
+output "ec2_worker_asg" {
+  description = "Name of the EC2 worker auto-scaling group (empty when disabled)."
+  value       = length(aws_autoscaling_group.ec2_worker) > 0 ? aws_autoscaling_group.ec2_worker[0].name : ""
 }
