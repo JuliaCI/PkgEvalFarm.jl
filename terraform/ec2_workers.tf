@@ -46,11 +46,10 @@ resource "aws_iam_role" "ec2_worker" {
   })
 }
 
-resource "aws_iam_role_policy" "ec2_worker" {
-  count  = local.ec2_workers
-  name   = "worker-access"
-  role   = aws_iam_role.ec2_worker[0].id
-  policy = local.worker_policy
+resource "aws_iam_role_policy_attachment" "ec2_worker" {
+  count      = local.ec2_workers
+  role       = aws_iam_role.ec2_worker[0].name
+  policy_arn = aws_iam_policy.worker.arn
 }
 
 resource "aws_iam_role_policy_attachment" "ec2_worker_ssm" {

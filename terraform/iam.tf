@@ -150,10 +150,19 @@ locals {
   })
 }
 
-resource "aws_iam_role_policy" "worker" {
-  name   = "worker-access"
-  role   = aws_iam_role.worker.id
-  policy = local.worker_policy
+# A single managed policy attached to every identity that runs jobs (the
+# brokered role and, when enabled, the EC2 instance profile). They differ only
+# in *how* they authenticate — the brokered role trusts the broker Lambda, the
+# EC2 role trusts ec2.amazonaws.com — so their permissions live in one place.
+resource "aws_iam_policy" "worker" {
+  name        = "${var.name_prefix}-worker-access"
+  description = "Consume the job queue, update run/job state, upload logs"
+  policy      = local.worker_policy
+}
+
+resource "aws_iam_role_policy_attachment" "worker" {
+  role       = aws_iam_role.worker.name
+  policy_arn = aws_iam_policy.worker.arn
 }
 
 # --- Submitter role ----------------------------------------------------------
@@ -219,8 +228,15 @@ locals {
   })
 }
 
-resource "aws_iam_role_policy" "submitter" {
-  name   = "submitter-access"
-  role   = aws_iam_role.submitter.id
-  policy = local.submitter_policy
+# One managed policy for every identity that submits runs and writes reports:
+# the brokered submitter role and the bot Lambda's execution role.
+resource "aws_iam_policy" "submitter" {
+  name        = "${var.name_prefix}-submitter-access"
+  description = "Create runs, read job state, publish reports"
+  policy      = local.submitter_policy
+}
+
+resource "aws_iam_role_policy_attachment" "submitter" {
+  role       = aws_iam_role.submitter.name
+  policy_arn = aws_iam_policy.submitter.arn
 }

@@ -35,11 +35,10 @@ resource "aws_iam_role_policy" "bot_logs" {
 
 # the bot is a submitter; its execution role carries the policy directly, so it
 # needs neither the broker nor GitHub team membership
-resource "aws_iam_role_policy" "bot" {
-  count  = local.bot_enabled
-  name   = "submitter-access"
-  role   = aws_iam_role.bot[0].id
-  policy = local.submitter_policy
+resource "aws_iam_role_policy_attachment" "bot" {
+  count      = local.bot_enabled
+  role       = aws_iam_role.bot[0].name
+  policy_arn = aws_iam_policy.submitter.arn
 }
 
 resource "aws_s3_object" "bot_zip" {
