@@ -48,27 +48,6 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
-  # Temporary: prints the claims GitHub actually mints, to diff against the
-  # deploy role's trust policy. Safe to remove once deploys are green (the JWT
-  # payload is public metadata; the signature is never printed).
-  oidc-claims:
-    name: Debug OIDC claims
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Decode token claims
-        run: |
-          tok=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-          payload=$(echo "$tok" | cut -d. -f2 | tr '_-' '/+')
-          pad=$(( (4 - ${#payload} % 4) % 4 ))
-          payload="$payload$(printf '=%.0s' $(seq 0 $pad | head -c $pad))"
-          echo "$payload" | base64 -d 2>/dev/null | jq '{sub, aud, repository, repository_id,
-            repository_owner, job_workflow_ref, workflow_ref, event_name, ref, runner_environment}'
-
   build:
     name: Build Lambda bundles
     runs-on: ubuntu-latest
