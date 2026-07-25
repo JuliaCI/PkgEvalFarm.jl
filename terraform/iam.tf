@@ -71,19 +71,32 @@ resource "aws_iam_role_policy" "broker_assume" {
 
 # --- Worker role -------------------------------------------------------------
 
-resource "aws_iam_role" "worker" {
-  name = "${var.name_prefix}-worker"
+# Trust is pinned to the exact broker *function*, not just its role:
+# lambda:SourceFunctionArn is stamped on requests made with Lambda-vended
+# credentials, so broker credentials exfiltrated from the Lambda (or any other
+# function someone attaches the broker role to) cannot assume these roles.
+# Built as a string to keep the resource graph acyclic.
+locals {
+  broker_function_arn = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.name_prefix}-broker"
 
-  assume_role_policy = jsonencode({
+  farm_role_trust = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect    = "Allow"
         Principal = { AWS = aws_iam_role.broker.arn }
         Action    = "sts:AssumeRole"
+        Condition = {
+          ArnEquals = { "lambda:SourceFunctionArn" = local.broker_function_arn }
+        }
       }
     ]
   })
+}
+
+resource "aws_iam_role" "worker" {
+  name               = "${var.name_prefix}-worker"
+  assume_role_policy = local.farm_role_trust
 }
 
 # shared between the brokered worker role and the EC2 instance profile.
@@ -146,18 +159,8 @@ resource "aws_iam_role_policy" "worker" {
 # --- Submitter role ----------------------------------------------------------
 
 resource "aws_iam_role" "submitter" {
-  name = "${var.name_prefix}-submitter"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.broker.arn }
-        Action    = "sts:AssumeRole"
-      }
-    ]
-  })
+  name               = "${var.name_prefix}-submitter"
+  assume_role_policy = local.farm_role_trust
 }
 
 # shared between the submitter role (brokered humans/CLIs) and the bot Lambda's
