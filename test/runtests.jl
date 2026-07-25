@@ -54,20 +54,20 @@ end
 @testset "bot command parsing" begin
     parse_command = PEF.FarmBot.parse_command
     @test parse_command("hello world") === nothing
-    let c = parse_command("@nanosoldier2 runtests()")
+    let c = parse_command("@pkgeval runtests()")
         @test c.packages == String[] && c.vs === nothing && c.error === nothing
     end
-    let c = parse_command("@nanosoldier2 runtests([\"Foo\", \"Bar\"])")
+    let c = parse_command("@pkgeval runtests([\"Foo\", \"Bar\"])")
         @test c.packages == ["Foo", "Bar"] && c.vs === nothing
     end
-    let c = parse_command("please @nanosoldier2 runtests(ALL, vs = \":master\")")
+    let c = parse_command("please @pkgeval runtests(ALL, vs = \":master\")")
         @test c.packages == String[] && c.vs == ":master"
     end
-    let c = parse_command("@nanosoldier2 runtests(vs=\"v1.12.0\")")
+    let c = parse_command("@pkgeval runtests(vs=\"v1.12.0\")")
         @test c.vs == "v1.12.0"
     end
-    @test parse_command("@nanosoldier2 runtests(rm(\"/\"))").error !== nothing
-    @test parse_command("@nanosoldier2 runtests(") === nothing
+    @test parse_command("@pkgeval runtests(rm(\"/\"))").error !== nothing
+    @test parse_command("@pkgeval runtests(") === nothing
 
     resolve_vs = PEF.FarmBot.resolve_vs
     @test resolve_vs(":master", "JuliaLang/julia") == "JuliaLang/julia#master"

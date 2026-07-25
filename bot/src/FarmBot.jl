@@ -1,11 +1,12 @@
 """
-The @nanosoldier2 bot: turns GitHub PR comments (`@nanosoldier2 runtests(...)`) into
+The @pkgeval bot: turns GitHub PR comments (`@pkgeval runtests(...)`) into
 farm runs and posts the report back when a run finishes.
 
 Deployed as a juliac-compiled Lambda invoked on an EventBridge schedule; each
 invocation performs one poll (mentions + finished runs). It carries the submitter IAM
 policy on its execution role, so unlike human submitters it needs neither the broker
-nor GitHub team membership — only its GitHub account token (`NANOSOLDIER2_GITHUB_TOKEN`).
+nor GitHub team membership — only its GitHub account token, read from the SSM
+parameter named by `BOT_TOKEN_PARAM` (or, outside Lambda, from `BOT_GITHUB_TOKEN`).
 
 All state lives in the runs table and GitHub, so the bot is also runnable anywhere
 else (`farm bot` runs the same code in a polling loop).
@@ -19,7 +20,7 @@ include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
 using .FarmLite: Attr, Item, attr, str, int, opt_str, json_item, ddb, sqs_send_message,
                  s3_put, is_conditional_failure, GitHubCtx, github_request, urlencode,
-                 error_message, lambda_loop, ctx_from_env,
+                 error_message, lambda_loop, ctx_from_env, ssm_parameter,
                  LazyVal, parse_json, json_string, json_bool, json_int,
                  json_string_vector, jsontype, isnullval, json_expected
 import .FarmLite: json_make
@@ -379,13 +380,32 @@ end
 
 ## polling GitHub for commands
 
-function bot_gh()
-    token = get(ENV, "NANOSOLDIER2_GITHUB_TOKEN", get(ENV, "GITHUB_TOKEN", ""))
-    isempty(token) && error("set NANOSOLDIER2_GITHUB_TOKEN to the bot account's token")
+# Secrets come from SSM SecureString parameters when *_PARAM names one (the
+# Lambda: env vars there are readable by anyone with GetFunctionConfiguration
+# and would sit in terraform state), or plain env otherwise (running `farm bot`
+# on a box of your own). Cached: warm invocations and the poll loop must not
+# re-read SSM every time, and IAM only allows the two known parameters anyway.
+const SECRET_CACHE = Dict{String,String}()
+
+function secret_from(ctx::LiteCtx, param_env::String, plain_env::String)
+    param = get(ENV, param_env, "")::String
+    isempty(param) && return get(ENV, plain_env, "")::String
+    cached = get(SECRET_CACHE, param, "")::String
+    isempty(cached) || return cached
+    value = ssm_parameter(ctx, param)::String
+    SECRET_CACHE[param] = value
+    return value
+end
+
+function bot_gh(ctx::LiteCtx=ctx_from_env())
+    token = secret_from(ctx, "BOT_TOKEN_PARAM", "BOT_GITHUB_TOKEN")
+    isempty(token) && (token = get(ENV, "GITHUB_TOKEN", "")::String)
+    isempty(token) &&
+        error("set BOT_GITHUB_TOKEN (or BOT_TOKEN_PARAM) to the bot account's token")
     return GitHubCtx(token)
 end
 
-bot_name() = get(ENV, "BOT_NAME", "nanosoldier2")
+bot_name() = get(ENV, "BOT_NAME", "pkgeval")
 
 function poll_mentions(ctx::LiteCtx, gh::GitHubCtx, name::String)
     resp = github_request(gh, "GET", "/notifications?participating=true")
@@ -1000,7 +1020,7 @@ fnurl_response(status::Int, payload::String) =
 
 "Handle a verified GitHub webhook delivery."
 function handle_webhook(ctx::LiteCtx, gh::GitHubCtx, event::TopEvent)
-    secret = get(ENV, "GITHUB_WEBHOOK_SECRET", "")
+    secret = secret_from(ctx, "WEBHOOK_SECRET_PARAM", "GITHUB_WEBHOOK_SECRET")
     raw = something(event.body, "")
     event.is_base64 && (raw = String(FarmLite.base64decode_lite(raw)))
     if !FarmLite.valid_signature(secret, raw, event.signature)

@@ -1,5 +1,5 @@
-# Deployment-specific values (nothing here is secret; bot/webhook tokens are
-# passed at apply time or via TF_VAR_* environment variables).
+# Deployment-specific values (nothing here is secret; the bot's GitHub token
+# and webhook secret live in SSM parameters, set out of band — see bot.tf).
 github_org = "KenoAIStaging"
 
 # this account already has a GitHub Actions OIDC provider (AWS allows only one
@@ -13,3 +13,7 @@ github_oidc_provider_arn = "arn:aws:iam::873569884612:oidc-provider/token.action
 ec2_worker_max     = 4
 ec2_worker_min     = 0
 ec2_worker_disk_gb = 400
+
+# The @pkgeval bot. Its GitHub token and webhook secret go into SSM after the
+# first apply (see the put-parameter commands in bot.tf).
+enable_bot = true

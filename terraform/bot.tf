@@ -7,7 +7,59 @@
 #   julia --project=bot bot/build/build.jl
 
 locals {
-  bot_enabled = var.github_bot_token == "" ? 0 : 1
+  bot_enabled = var.enable_bot ? 1 : 0
+}
+
+# Like the Buildkite token: the values here are placeholders because a real
+# secret in terraform state is exactly what this design avoids. Set them out of
+# band and never through terraform:
+#
+#   aws ssm put-parameter --name /pkgeval/bot-github-token --type SecureString \
+#     --value "ghp_..." --overwrite
+#   aws ssm put-parameter --name /pkgeval/bot-webhook-secret --type SecureString \
+#     --value "$(openssl rand -hex 32)" --overwrite
+resource "aws_ssm_parameter" "bot_token" {
+  count       = local.bot_enabled
+  name        = var.bot_token_parameter
+  description = "GitHub token of the @${var.bot_name} bot account"
+  type        = "SecureString"
+  value       = "placeholder-set-out-of-band"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "bot_webhook_secret" {
+  count       = local.bot_enabled
+  name        = var.bot_webhook_secret_parameter
+  description = "HMAC secret for the @${var.bot_name} GitHub webhook"
+  type        = "SecureString"
+  value       = "placeholder-set-out-of-band"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_iam_role_policy" "bot_secrets" {
+  count = local.bot_enabled
+  name  = "read-secrets"
+  role  = aws_iam_role.bot[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          aws_ssm_parameter.bot_token[0].arn,
+          aws_ssm_parameter.bot_webhook_secret[0].arn,
+        ]
+      }
+    ]
+  })
 }
 
 resource "aws_iam_role" "bot" {
@@ -81,9 +133,9 @@ resource "aws_lambda_function" "bot" {
 
   environment {
     variables = {
-      NANOSOLDIER2_GITHUB_TOKEN = var.github_bot_token
-      GITHUB_WEBHOOK_SECRET     = var.github_webhook_secret
-      BOT_NAME                  = var.bot_name
+      BOT_TOKEN_PARAM      = var.bot_token_parameter
+      WEBHOOK_SECRET_PARAM = var.bot_webhook_secret_parameter
+      BOT_NAME             = var.bot_name
       # commands are only executed for authorized authors (the bot's token
       # needs read:org to check); empty team = any org member
       GITHUB_ORG         = var.github_org
@@ -99,8 +151,11 @@ resource "aws_lambda_function" "bot" {
 
 # --- Trigger 1: GitHub issue_comment webhook (HMAC-verified in the bot) --------
 
+# Always created with the bot: HMAC verification is inside the function, and
+# with the secret parameter still on its placeholder every delivery gets a 401,
+# so an unconfigured webhook endpoint is inert rather than open.
 resource "aws_lambda_function_url" "bot" {
-  count              = var.github_webhook_secret == "" ? 0 : local.bot_enabled
+  count              = local.bot_enabled
   function_name      = aws_lambda_function.bot[0].function_name
   authorization_type = "NONE"
 }

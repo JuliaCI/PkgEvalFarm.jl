@@ -20,7 +20,7 @@ temporary AWS credentials to authorized GitHub users.
   membership in `github_org`, and vends temporary credentials by assuming the
   `<prefix>-worker` or `<prefix>-submitter` IAM role (scoped to exactly the
   queue/tables/bucket operations each side needs).
-- **`<prefix>-bot` (Lambda, optional)** — the `@nanosoldier2` bot. Created only
+- **`<prefix>-bot` (Lambda, optional)** — the `@pkgeval` bot. Created only
   when `github_bot_token` is set. Its execution role carries the submitter
   policy directly, so it needs neither the broker nor team membership.
   Triggers: a Function URL receiving HMAC-verified GitHub `issue_comment`
@@ -136,7 +136,7 @@ itself would still be a welcome belt-and-braces improvement.
 | `github_bot_token` | no | `""` | Token of the bot's GitHub account; empty disables the bot Lambda. |
 | `bot_submitter_team` | no | `null` | Team gating bot commands (null = `submitter_team`; `""` = any org member). |
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
-| `bot_name` | no | `"nanosoldier2"` | GitHub handle the bot answers to. |
+| `bot_name` | no | `"pkgeval"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
 | `ec2_worker_max` | no | `0` | EC2 worker ceiling (0 = disabled; validated ≤ 4 for now). |
 | `ec2_worker_min` | no | `0` | EC2 worker floor (= max to pin capacity). |

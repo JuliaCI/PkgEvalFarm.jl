@@ -51,30 +51,34 @@ variable "public_reports" {
   default     = true
 }
 
-variable "github_bot_token" {
-  description = "GitHub token of the @nanosoldier2 bot account. Empty disables the bot Lambda."
+variable "enable_bot" {
+  description = "Create the bot Lambda. Its GitHub token and webhook secret are read from the SSM parameters below, set out of band."
+  type        = bool
+  default     = false
+}
+
+variable "bot_token_parameter" {
+  description = "SSM parameter holding the bot account's GitHub token."
   type        = string
-  default     = ""
-  sensitive   = true
+  default     = "/pkgeval/bot-github-token"
+}
+
+variable "bot_webhook_secret_parameter" {
+  description = "SSM parameter holding the GitHub webhook secret. While it still holds the placeholder, every webhook delivery is rejected (401) and the bot relies on the scheduled poll."
+  type        = string
+  default     = "/pkgeval/bot-webhook-secret"
 }
 
 variable "bot_name" {
   description = "GitHub handle the bot answers to (without @)."
   type        = string
-  default     = "nanosoldier2"
+  default     = "pkgeval"
 }
 
 variable "bot_schedule" {
   description = "EventBridge schedule for fallback bot polls (webhook + stream are the primary triggers)."
   type        = string
   default     = "rate(1 hour)"
-}
-
-variable "github_webhook_secret" {
-  description = "Secret for verifying GitHub issue_comment webhooks. Empty disables the webhook endpoint (the bot then relies on the scheduled poll)."
-  type        = string
-  default     = ""
-  sensitive   = true
 }
 
 variable "ec2_worker_max" {

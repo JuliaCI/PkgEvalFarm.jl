@@ -275,14 +275,14 @@ try
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/comments/1",
             req -> TestHTTP.Response(200, JSON.json(Dict(
                 "id" => 987654,
-                "body" => "@nanosoldier2 runtests([\"Example\"])",
+                "body" => "@pkgeval runtests([\"Example\"])",
                 "user" => Dict("login" => "keno")))))
         # same command comment as the webhook test delivers (id 555111), for the
         # webhook+poll overlap check
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/comments/2",
             req -> TestHTTP.Response(200, JSON.json(Dict(
                 "id" => 555111,
-                "body" => "@nanosoldier2 runtests([\"Example\"])",
+                "body" => "@pkgeval runtests([\"Example\"])",
                 "user" => Dict("login" => "keno")))))
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/issues/12345",
             req -> TestHTTP.Response(200, JSON.json(Dict(
@@ -339,7 +339,7 @@ try
             @test run["status"] == "expanding"
             @test run["packages"] == ["Example"]
             @test run["context"]["repo"] == "JuliaLang/julia"
-            @test run["submitter"] == "keno via @nanosoldier2"
+            @test run["submitter"] == "keno via @pkgeval"
             @test run["configs"][1]["name"] == "primary"
             @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
             @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
@@ -379,7 +379,7 @@ try
             payload = JSON.json(Dict(
                 "action" => "created",
                 "comment" => Dict("id" => 555111,
-                                  "body" => "@nanosoldier2 runtests([\"Example\"])",
+                                  "body" => "@pkgeval runtests([\"Example\"])",
                                   "user" => Dict("login" => "keno")),
                 "issue" => Dict("number" => 12345,
                                 "pull_request" => Dict("url" => "$(gh_base[])/repos/JuliaLang/julia/pulls/12345")),
@@ -444,7 +444,7 @@ try
             end
             run = PEF.get_run(ctx, webhook_run_id)
             @test run["packages"] == ["Example"]
-            @test run["submitter"] == "keno via @nanosoldier2"
+            @test run["submitter"] == "keno via @pkgeval"
 
             # 6. stream path: a run flipping to done triggers the report directly
             expand_claim = PEF.claim_job(ctx; wait=1)

@@ -13,7 +13,7 @@ const CLI_HELP = """
                                                   submit a run (all packages if none given)
       status   RUN_ID                             show run progress
       report   RUN_ID                             aggregate, upload and print the report
-      bot      [--interval SECS] [--name NAME]    run the @nanosoldier2 bot
+      bot      [--interval SECS] [--name NAME]    run the @pkgeval bot
 
     The broker URL can also be set via PKGEVAL_FARM_BROKER. Julia SPECs are release
     names ("nightly", "v1.12.0") or repo specs ("JuliaLang/julia#0123abc").

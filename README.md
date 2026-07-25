@@ -14,7 +14,7 @@ each worker.
                  ┌─────────────────────────────────────────────────┐
                  │                     AWS                          │
   submitter ───▶ │  DynamoDB (runs, jobs)      SQS (job queue+DLQ) │ ◀─── worker
-  (@nanosoldier2 │                                                  │      (any Linux box,
+  (@pkgeval │                                                  │      (any Linux box,
    bot or CLI)   │  S3 (results, logs, reports)                     │       enrolled via
                  │                                                  │       GitHub login)
                  │  Lambda: credential broker (juliac-compiled)     │
@@ -36,7 +36,7 @@ each worker.
   (receive/delete queue messages, update job items, `PutObject` under `runs/` — nothing
   else). Credentials auto-refresh through the broker; revoking a person's team
   membership cuts off their workers within the hour.
-- **Submission** is decoupled: the `@nanosoldier2` bot (or a human with the CLI)
+- **Submission** is decoupled: the `@pkgeval` bot (or a human with the CLI)
   authenticates the same way but through a separate GitHub team, receiving a
   broader "submitter" role that can create runs and write reports.
 
@@ -121,7 +121,7 @@ The `broker_function_url` output is the only thing workers and the bot need
 
 ## Running the bot
 
-The `@nanosoldier2` bot is a second juliac-compiled Lambda with three triggers:
+The `@pkgeval` bot is a second juliac-compiled Lambda with three triggers:
 
 1. a **GitHub webhook** (`issue_comment` events, HMAC-verified against
    `github_webhook_secret`) delivered to its Function URL — commands are handled the
@@ -139,7 +139,7 @@ It is created by the same terraform when `github_bot_token` is set (register the
 same secret). Its execution role carries the submitter policy directly — no broker
 hop, no long-running server.
 
-Mention it on a PR: `@nanosoldier2 runtests()`, `runtests(["Foo"])`, or
+Mention it on a PR: `@pkgeval runtests()`, `runtests(["Foo"])`, or
 `runtests(vs = ":master")`. Commands are only executed for authorized authors —
 by default active members of the submitter team, or (with
 `bot_submitter_team = ""`) any org member. Classic Nanosoldier's collaborator
@@ -150,7 +150,8 @@ The identical bot code also runs interactively anywhere (state lives in the runs
 table and GitHub, so Lambda and interactive bots can even coexist):
 
 ```sh
-export NANOSOLDIER2_GITHUB_TOKEN=...   # token of the bot account
+export BOT_GITHUB_TOKEN=...            # token of the bot account (the Lambda
+                                       # reads it from SSM instead, see bot.tf)
 bin/farm login                          # operator must be in the submitters team
 bin/farm bot
 ```
