@@ -159,22 +159,19 @@ variable "github_oidc_provider_arn" {
 }
 
 variable "github_deploy_subjects" {
-  description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles. Push-to-branch subjects look like repo:OWNER/REPO:ref:refs/heads/BRANCH; if the deploy job declares an `environment`, the subject becomes repo:OWNER/REPO:environment:NAME instead."
+  description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles. The exact format is org-dependent — dump a real token before changing it (README), since a mismatch denies with no explanation."
   type        = list(string)
-  # IAM can only condition on `aud`/`sub`/`amr`, so all authorization lives
-  # here. This org mints the immutable subject format, which embeds numeric
-  # owner/repo ids — confirm the exact value for your org (README shows how)
-  # before changing it, since a mismatch denies with no explanation.
-  # Empty: the specific claims below pin the same things in a format GitHub
-  # cannot reconfigure (this org mints the immutable subject variant,
-  # repo:OWNER@<id>/REPO@<id>:ref:..., not the documented form).
-  default = []
+  # This org mints the immutable subject variant, which embeds the numeric
+  # owner and repo ids *and* the branch — so this one standard claim pins
+  # everything the GitHub-specific keys below would, and `sub` is supported
+  # unconditionally. Value observed in a real token (see README claim dump).
+  default = ["repo:KenoAIStaging@216627359/PkgEvalFarm.jl@1311559445:ref:refs/heads/master"]
 }
 
 variable "github_repository_id" {
-  description = "Numeric repository id, pinned via the repository_id claim (immutable across renames). null omits."
+  description = "Numeric repository id, pinned via the repository_id claim. null omits. Off by default: AWS's GitHub-specific claim mapping did not authorize on this account's provider (see README), so only standard claims are used."
   type        = string
-  default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
+  default     = null
   nullable    = true
 }
 
@@ -186,16 +183,16 @@ variable "github_repository_owner_id" {
 }
 
 variable "github_deploy_ref" {
-  description = "Git ref allowed to deploy, matched against the `ref` claim. null omits."
+  description = "Git ref allowed to deploy, matched against the `ref` claim. null omits (the branch is already pinned inside the immutable `sub`)."
   type        = string
-  default     = "refs/heads/master"
+  default     = null
   nullable    = true
 }
 
 variable "github_deploy_workflow_ref" {
   description = "Workflow file allowed to deploy (OWNER/REPO/.github/workflows/FILE@REF), matched against `job_workflow_ref`. null omits."
   type        = string
-  default     = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
+  default     = null
   nullable    = true
 }
 
