@@ -41,12 +41,21 @@ resource "aws_iam_role_policy" "bot" {
   policy = local.submitter_policy
 }
 
+resource "aws_s3_object" "bot_zip" {
+  count       = local.bot_enabled
+  bucket      = aws_s3_bucket.results.id
+  key         = "lambda/bot.zip"
+  source      = "${path.module}/../bot/build/bootstrap.zip"
+  source_hash = try(filemd5("${path.module}/../bot/build/bootstrap.zip"), null)
+}
+
 resource "aws_lambda_function" "bot" {
   count         = local.bot_enabled
   function_name = "${var.name_prefix}-bot"
   role          = aws_iam_role.bot[0].arn
 
-  filename         = "${path.module}/../bot/build/bootstrap.zip"
+  s3_bucket        = aws_s3_object.bot_zip[0].bucket
+  s3_key           = aws_s3_object.bot_zip[0].key
   source_code_hash = try(filebase64sha256("${path.module}/../bot/build/bootstrap.zip"), null)
 
   runtime       = "provided.al2023"

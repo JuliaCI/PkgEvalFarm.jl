@@ -1,9 +1,10 @@
 # Build the broker Lambda bundle: a juliac-compiled `bootstrap` executable plus the
 # Julia runtime libraries it needs, zipped up for the `provided.al2023` runtime.
 #
-#   julia --project=broker broker/build/build.jl [--trim=safe]
+#   julia +1.13 --project=broker broker/build/build.jl [--trim=safe]
 #
-# produces broker/build/bootstrap.zip, which terraform deploys.
+# produces broker/build/bootstrap.zip, which terraform deploys. Use Julia 1.13:
+# 1.12's Downloads stdlib does not pass the `--trim=safe` verifier.
 
 using Pkg
 
