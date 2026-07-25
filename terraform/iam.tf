@@ -24,9 +24,30 @@ resource "aws_iam_role" "broker" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "broker_logs" {
-  role       = aws_iam_role.broker.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+# scoped replacement for AWSLambdaBasicExecutionRole (which grants logs on *)
+data "aws_caller_identity" "current" {}
+
+locals {
+  lambda_log_policy = { for fn in ["broker", "bot"] : fn => jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.name_prefix}-${fn}*"
+      }
+    ]
+  }) }
+}
+
+resource "aws_iam_role_policy" "broker_logs" {
+  name   = "logs"
+  role   = aws_iam_role.broker.id
+  policy = local.lambda_log_policy["broker"]
 }
 
 resource "aws_iam_role_policy" "broker_assume" {
@@ -65,7 +86,14 @@ resource "aws_iam_role" "worker" {
   })
 }
 
-# shared between the brokered worker role and the test-instance profile
+# shared between the brokered worker role and the EC2 instance profile.
+# Every action maps to a specific code path; keep it that way:
+#   sqs receive/delete/changevis   claim_job / record_result / heartbeat
+#   sqs send                       expand fan-out (enqueue_jobs)
+#   runs get/update                run spec fetch, completion counter, expand flip
+#   jobs update                    claim + record (conditional writes)
+#   jobs batchwrite                expand fan-out (write_jobs)
+#   s3 put runs/*                  log upload
 locals {
   worker_policy = jsonencode({
     Version = "2012-10-17"
@@ -77,28 +105,26 @@ locals {
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
           "sqs:ChangeMessageVisibility",
-          "sqs:GetQueueAttributes",
-          # workers fan out job messages when expanding a run's package list
           "sqs:SendMessage",
         ]
         Resource = aws_sqs_queue.jobs.arn
       },
       {
-        Sid    = "UpdateJobAndRunState"
+        Sid    = "RunState"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
         ]
-        Resource = [
-          aws_dynamodb_table.jobs.arn,
-          aws_dynamodb_table.runs.arn,
-        ]
+        Resource = aws_dynamodb_table.runs.arn
       },
       {
-        Sid      = "ExpandRunJobs"
-        Effect   = "Allow"
-        Action   = "dynamodb:BatchWriteItem"
+        Sid    = "JobState"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:UpdateItem",
+          "dynamodb:BatchWriteItem",
+        ]
         Resource = aws_dynamodb_table.jobs.arn
       },
       {
@@ -135,48 +161,56 @@ resource "aws_iam_role" "submitter" {
 }
 
 # shared between the submitter role (brokered humans/CLIs) and the bot Lambda's
-# execution role
+# execution role. Code paths:
+#   runs put/get/update/scan   create_run, status, reported-claim, finished-run scan
+#   jobs query                 report aggregation (fan-out itself is the workers' job)
+#   sqs send                   the expand message
+#   s3 under runs/ only        report upload, log fetch — the lambda/ deployment
+#                              prefix is deliberately out of reach
 locals {
   submitter_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "ManageRunsAndJobs"
+        Sid    = "ManageRuns"
         Effect = "Allow"
-        # job-item fan-out (BatchWriteItem) is the workers' job, even for explicit
-        # package lists, so submitters get by with single-item operations
         Action = [
           "dynamodb:PutItem",
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
-          "dynamodb:Query",
           "dynamodb:Scan",
         ]
-        Resource = [
-          aws_dynamodb_table.runs.arn,
-          aws_dynamodb_table.jobs.arn,
-        ]
+        Resource = aws_dynamodb_table.runs.arn
       },
       {
-        Sid      = "EnqueueJobs"
+        Sid      = "ReadJobs"
+        Effect   = "Allow"
+        Action   = "dynamodb:Query"
+        Resource = aws_dynamodb_table.jobs.arn
+      },
+      {
+        Sid      = "EnqueueExpand"
         Effect   = "Allow"
         Action   = "sqs:SendMessage"
         Resource = aws_sqs_queue.jobs.arn
       },
       {
-        Sid      = "ListBucket"
+        Sid      = "ListRunObjects"
         Effect   = "Allow"
         Action   = "s3:ListBucket"
         Resource = aws_s3_bucket.results.arn
+        Condition = {
+          StringLike = { "s3:prefix" = "runs/*" }
+        }
       },
       {
-        Sid    = "ReadWriteObjects"
+        Sid    = "ReadWriteRunObjects"
         Effect = "Allow"
         Action = [
           "s3:GetObject",
           "s3:PutObject",
         ]
-        Resource = "${aws_s3_bucket.results.arn}/*"
+        Resource = "${aws_s3_bucket.results.arn}/runs/*"
       },
     ]
   })

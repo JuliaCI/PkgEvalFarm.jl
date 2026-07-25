@@ -26,10 +26,11 @@ resource "aws_iam_role" "bot" {
   })
 }
 
-resource "aws_iam_role_policy_attachment" "bot_logs" {
-  count      = local.bot_enabled
-  role       = aws_iam_role.bot[0].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+resource "aws_iam_role_policy" "bot_logs" {
+  count  = local.bot_enabled
+  name   = "logs"
+  role   = aws_iam_role.bot[0].id
+  policy = local.lambda_log_policy["bot"]
 }
 
 # the bot is a submitter; its execution role carries the policy directly, so it

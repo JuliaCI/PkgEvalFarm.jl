@@ -29,6 +29,10 @@ resource "aws_lambda_function" "broker" {
   memory_size   = 512
   timeout       = 30
 
+  # the function URL is publicly invokable (auth happens against GitHub inside);
+  # a concurrency cap bounds the cost/abuse blast radius of URL spam
+  reserved_concurrent_executions = 10
+
   environment {
     variables = {
       GITHUB_ORG         = var.github_org
