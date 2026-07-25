@@ -39,9 +39,31 @@ function build_lambda_bundle(app_dir::String;
     mkpath(stage_dir)
     exe = joinpath(stage_dir, "bootstrap")
 
-    @info "compiling $app with juliac" trim
+    # juliac otherwise compiles for the *build host's* CPU, and Julia refuses to
+    # load a code image whose target uses features the runtime host lacks
+    # ("Rejecting this target due to use of runtime-disabled features"). Lambda's
+    # microVMs mask AVX-512, so a build on e.g. a Zen 4 machine dies during init.
+    #
+    # `sandybridge` is the ISA floor: old enough for any Lambda host (and any
+    # plausible worker), new enough that codegen inlines `floor` & co. instead of
+    # calling libm — juliac's link line has no `-lm`, so a `generic` build fails
+    # to link. A single target (rather than a multiversioned `a;b;c` string) also
+    # keeps `julia -C $target -e ...` legal, which the cache warm-up below needs.
+    cpu_target = get(ENV, "JULIA_CPU_TARGET", "sandybridge")
+
+    @info "compiling $app with juliac" trim cpu_target
     env = copy(ENV)
     env["JULIA_PROJECT"] = app_dir
+    env["JULIA_CPU_TARGET"] = cpu_target
+
+    # Warm the precompile caches *for the target CPU* first. juliac runs its own
+    # `Pkg.precompile()` but without the target flag (juliac.jl:162 uses
+    # `julia_cmd`, not `julia_cmd_target`), so the caches it builds are the wrong
+    # ones and the build script then tries to precompile mid-compile — which
+    # fails with "cannot register new atexit hook; already exiting".
+    run(setenv(`$(Base.julia_cmd()[1]) -C $cpu_target --startup-file=no
+                -e "using Pkg; Pkg.instantiate(); Pkg.precompile()"`,
+               env; dir=app_dir))
     run(setenv(`$(Base.julia_cmd()[1]) $juliac --output-exe $exe --experimental $trim
                 --relative-rpath $(joinpath(app_dir, "src", "main.jl"))`,
                env; dir=app_dir))

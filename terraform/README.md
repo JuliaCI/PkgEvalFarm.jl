@@ -152,3 +152,18 @@ itself would still be a welcome belt-and-braces improvement.
 
 Re-run steps 1–2 whenever the broker code changes; the `source_code_hash`
 picks up the new zip automatically.
+
+## Build portability note
+
+The Lambda bundles are compiled for the `sandybridge` CPU target
+(`JULIA_CPU_TARGET`, overridable). Without that, `juliac` targets the *build
+host's* CPU: on a modern machine that bakes in AVX-512, which Lambda's
+microVMs mask, and the function dies during init with
+
+```
+ERROR: Unable to find compatible target in cached code image.
+Target 0 (znver4): Rejecting this target due to use of runtime-disabled features
+```
+
+Verify a build with `objdump -d broker/build/stage/bootstrap | grep -c '%zmm'`
+— it must be 0.
