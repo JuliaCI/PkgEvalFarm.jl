@@ -856,6 +856,9 @@ function json_make(::Type{TopEvent}, x::LazyVal)
     is_base64 = Ref(false)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
+        # NB: locals in the nested closures carry unique names — reusing an outer
+        # closure's variable names (`s`, `p`, ...) would make Julia treat them as
+        # shared (boxed) captures, which the trim verifier rejects as `Any`
         if k == "Records"
             return JSON.applyarray(v) do i, record
                 jsontype(record) == JSON.JSONTypes.OBJECT || json_expected("stream record")
@@ -865,9 +868,9 @@ function json_make(::Type{TopEvent}, x::LazyVal)
                     JSON.applyobject(rv) do dk, dv
                         isnullval(dv) && return nothing
                         dk == "NewImage" || return nothing
-                        item, p = json_make(Item, dv)
-                        push!(new_images, item)
-                        return p
+                        image, image_pos = json_make(Item, dv)
+                        push!(new_images, image)
+                        return image_pos
                     end
                 end
             end
@@ -876,7 +879,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
                 rk == "http" || return nothing
                 JSON.applyobject(rv) do hk, hv
                     if hk == "method"
-                        s, p = json_string(hv); method[] = s; return p
+                        mstr, mpos = json_string(hv); method[] = mstr; return mpos
                     end
                     return nothing
                 end
@@ -886,9 +889,9 @@ function json_make(::Type{TopEvent}, x::LazyVal)
                 isnullval(hv) && return nothing
                 header = lowercase(convert(String, hk)::String)  # hk is a lazy PtrString
                 if header == "x-hub-signature-256"
-                    s, p = json_string(hv); signature[] = s; return p
+                    hstr, hpos = json_string(hv); signature[] = hstr; return hpos
                 elseif header == "x-github-event"
-                    s, p = json_string(hv); ghevent[] = s; return p
+                    hstr, hpos = json_string(hv); ghevent[] = hstr; return hpos
                 end
                 return nothing
             end
