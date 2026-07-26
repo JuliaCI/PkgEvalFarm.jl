@@ -146,6 +146,15 @@ by default active members of the submitter team, or (with
 check was disabled in 2021, leaving it open to any commenter; this bot
 deliberately does not replicate that.
 
+**Baseline reuse**: when the `against` side of a run is an exact commit or
+release that an earlier completed run also evaluated (with identical settings),
+those results are reused instead of re-evaluated — the bot pins branch specs
+like `vs = ":master"` to a sha at submission precisely so this can match. The
+report notes which run the baseline came from. If the existing baseline looks
+flaky, force a re-evaluation with `runtests(..., fresh_baseline = true)` (CLI:
+`farm submit --fresh-baseline ...`). Moving specs that stay unpinned (a plain
+`nightly`) are never reused.
+
 The identical bot code also runs interactively anywhere (state lives in the runs
 table and GitHub, so Lambda and interactive bots can even coexist):
 

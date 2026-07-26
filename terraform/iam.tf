@@ -128,6 +128,9 @@ locals {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
+          # baseline reuse scans for donor runs at expansion (the table has one
+          # item per run, so this stays cheap)
+          "dynamodb:Scan",
         ]
         Resource = aws_dynamodb_table.runs.arn
       },
@@ -137,6 +140,8 @@ locals {
         Action = [
           "dynamodb:UpdateItem",
           "dynamodb:BatchWriteItem",
+          # baseline reuse reads the donor run's job results
+          "dynamodb:Query",
         ]
         Resource = aws_dynamodb_table.jobs.arn
       },

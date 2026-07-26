@@ -48,6 +48,24 @@ split_job_key(key::AbstractString) = Tuple(split(key, "#"; limit=2))
 log_key(run_id, config, package) = "runs/$run_id/logs/$config/$package.log"
 report_key(run_id, name) = "runs/$run_id/report/$name"
 
+"""
+Content fingerprint of a configuration dict, ignoring its display `name`:
+two configs with equal fingerprints request the same evaluation, which is what
+makes results transferable between runs (see `expand_run`'s baseline reuse).
+"""
+config_fingerprint(d::AbstractDict) =
+    bytes2hex(SHA.sha256(join(("$k=$(JSON.json(d[k]))" for k in sort!([String(k) for k in keys(d)])
+                               if k != "name"), "\n")))
+
+"""
+Whether a julia spec names an immutable build — an exact commit or a release
+tag. Only those are sound to reuse results for: a moving ref like `#master` or
+`nightly` names different Julias at different times, so runs against it only
+ever match if the submitter pinned the sha (the bot always does).
+"""
+reusable_julia_spec(spec::AbstractString) =
+    occursin(r"^[^#]+#[0-9a-f]{40}$", spec) || occursin(r"^v\d+\.\d+\.\d+$", spec)
+
 
 ## DynamoDB attribute-value marshalling
 #

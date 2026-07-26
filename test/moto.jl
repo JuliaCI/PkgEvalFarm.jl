@@ -236,7 +236,21 @@ try
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "active"
         @test run["total_jobs"] == 4
-        @test length(PEF.run_jobs(ctx, run_id)) == 4
+        jobs = PEF.run_jobs(ctx, run_id)
+        @test length(jobs) == 4
+
+        # baseline reuse: the first run is `done` with an identical `against`
+        # config (immutable spec v1.12.0), so its results transferred — those
+        # jobs arrive pre-completed, pointing at the donor's logs, and only the
+        # primary side was enqueued
+        reused = filter(j -> get(j, "reused_from", nothing) !== nothing, jobs)
+        @test length(reused) == 2
+        @test all(j -> j["config"] == "against", reused)
+        @test all(j -> j["reused_from"] == RUN_ID, reused)
+        @test only(filter(j -> j["job_key"] == "against#Example", jobs))["status"] == "test"
+        @test startswith(only(filter(j -> j["job_key"] == "against#JSON", jobs))["log_key"],
+                         "runs/$RUN_ID/")
+        @test run["completed_jobs"] == 2
 
         # a duplicate expand message after the flip only re-enqueues, never resets
         first_claim = PEF.claim_job(ctx; wait=1)
@@ -258,6 +272,36 @@ try
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
         @test run["completed_jobs"] == 4
+    end
+
+    @testset "fresh baseline opts out of reuse" begin
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        # the previous testset may leave swallowed-duplicate messages behind, so
+        # claim until the expand message surfaces
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
+        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+
+        jobs = PEF.run_jobs(ctx, run_id)
+        @test length(jobs) == 2
+        @test all(j -> j["status"] == "pending", jobs)   # nothing was reused
+        @test all(j -> !haskey(j, "reused_from"), jobs)
+        @test PEF.get_run(ctx, run_id)["completed_jobs"] == 0
+
+        # drain, so later testsets start from an empty queue
+        for _ in 1:4
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+        end
+        @test PEF.get_run(ctx, run_id)["status"] == "done"
     end
 
     @testset "bot end-to-end (stub GitHub)" begin

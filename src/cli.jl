@@ -9,8 +9,10 @@ const CLI_HELP = """
       login    [--broker URL]                     enroll this machine (GitHub device flow)
       worker   [--broker URL] [--ninstances N] [--once]
                                                   evaluate jobs from the queue
-      submit   --primary SPEC [--against SPEC] [--assertions] [PKG...]
-                                                  submit a run (all packages if none given)
+      submit   --primary SPEC [--against SPEC] [--assertions] [--fresh-baseline] [PKG...]
+                                                  submit a run (all packages if none given);
+                                                  --fresh-baseline re-evaluates the against
+                                                  side even when reusable results exist
       status   RUN_ID                             show run progress
       report   RUN_ID                             aggregate, upload and print the report
       bot      [--interval SECS] [--name NAME]    run the @pkgeval bot
@@ -27,7 +29,7 @@ function cli_main(args::Vector{String}=ARGS)
     # split --flag [value] options from positional arguments
     options = Dict{String,String}()
     positional = String[]
-    flags = Set(["--once", "--assertions"])
+    flags = Set(["--once", "--assertions", "--fresh-baseline"])
     i = 1
     while i <= length(rest)
         arg = rest[i]
@@ -57,7 +59,8 @@ function cli_main(args::Vector{String}=ARGS)
         configs = build_configs(options["--primary"];
                                 against=get(options, "--against", nothing), buildflags)
         ctx, user = farm_ctx(; broker, role="submitter")
-        run_id = submit_run(ctx; configs, packages=positional, submitter=user)
+        run_id = submit_run(ctx; configs, packages=positional, submitter=user,
+                            reuse=!haskey(options, "--fresh-baseline"))
         println(run_id)
     elseif command == "status"
         length(positional) == 1 || error("status requires exactly one RUN_ID")

@@ -37,6 +37,7 @@ const BOT_COMMAND = r"@([\w-]+)\s+`?runtests\((.*?)\)`?"s
 struct Command
     packages::Vector{String}
     vs::Union{Nothing,String}
+    fresh_baseline::Bool
     error::Union{Nothing,String}
 end
 
@@ -51,6 +52,10 @@ allowed, matching classic Nanosoldier usage). Supported forms:
     runtests(vs = ":master")      against a branch of the same repo
     runtests(vs = "@0123abc")     against a commit of the same repo
     runtests(vs = "v1.12.0")      against a Julia release
+    runtests(fresh_baseline = true)
+                                  re-evaluate the baseline even when results
+                                  from an identical earlier run exist (use when
+                                  the baseline looks flaky)
 
 The argument expression is parsed, never evaluated.
 """
@@ -59,18 +64,22 @@ function parse_command(body::AbstractString)
     m === nothing && return nothing
     packages = String[]
     vs = nothing
+    fresh_baseline = false
     args = strip(something(m.captures[2]))
     if !isempty(args)
         expr = try
             Meta.parse("runtests($args)")
         catch
-            return Command(packages, vs, "could not parse command arguments")
+            return Command(packages, vs, fresh_baseline, "could not parse command arguments")
         end
-        Meta.isexpr(expr, :call) || return Command(packages, vs, "could not parse command arguments")
+        Meta.isexpr(expr, :call) || return Command(packages, vs, fresh_baseline, "could not parse command arguments")
         for arg in (expr::Expr).args[2:end]
             if (Meta.isexpr(arg, :kw) || Meta.isexpr(arg, :(=))) &&
                (arg::Expr).args[1] === :vs && (arg::Expr).args[2] isa String
                 vs = (arg::Expr).args[2]::String
+            elseif (Meta.isexpr(arg, :kw) || Meta.isexpr(arg, :(=))) &&
+                   (arg::Expr).args[1] === :fresh_baseline && (arg::Expr).args[2] isa Bool
+                fresh_baseline = (arg::Expr).args[2]::Bool
             elseif Meta.isexpr(arg, :vect) && all(x -> x isa String, (arg::Expr).args)
                 packages = String[x::String for x in (arg::Expr).args]
             elseif arg === :ALL
@@ -81,11 +90,11 @@ function parse_command(body::AbstractString)
                 argdesc = arg isa Symbol ? String(arg) :
                           arg isa String ? arg :
                           arg isa Number ? "a number" : "an expression"
-                return Command(packages, vs, "unsupported argument `$argdesc`")
+                return Command(packages, vs, fresh_baseline, "unsupported argument `$argdesc`")
             end
         end
     end
-    return Command(packages, vs, nothing)
+    return Command(packages, vs, fresh_baseline, nothing)
 end
 
 "Resolve a `vs` spec against the repo the PR targets."
@@ -93,6 +102,26 @@ function resolve_vs(vs::AbstractString, repo::AbstractString)
     startswith(vs, ":") && return "$repo#$(chop(vs; head=1, tail=0))"
     startswith(vs, "@") && return "$repo#$(chop(vs; head=1, tail=0))"
     return String(vs)
+end
+
+"""
+Pin a `repo#ref` spec to the exact commit the ref names right now. Two reasons:
+every worker then evaluates the same Julia even if the branch moves mid-run,
+and baseline reuse (expand_run) only matches immutable specs, so an unpinned
+`#master` baseline could never be reused. Non-repo specs (releases, `nightly`)
+and already-pinned shas pass through; so does anything the API cannot resolve —
+the workers' own resolution is the fallback, as before.
+"""
+function pin_commit(gh::GitHubCtx, spec::String)
+    m = match(r"^([^#]+)#(.+)$", spec)
+    m === nothing && return spec
+    repo, ref = something(m.captures[1]), something(m.captures[2])
+    occursin(r"^[0-9a-f]{40}$", ref) && return spec
+    resp = github_request(gh, "GET", "/repos/$repo/commits/$(urlencode(ref))")
+    resp.status == 200 || return spec
+    sha = parse_json(resp.body, GhCommit).sha
+    sha === nothing && return spec
+    return "$repo#$(something(sha))"
 end
 
 
@@ -350,7 +379,8 @@ is (re-)sent either way — duplicates are harmless by design, and skipping it
 could strand a run whose first submission crashed between put and send.
 """
 function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
-                    packages::Vector{String}, context_json::String, submitter::String)
+                    packages::Vector{String}, context_json::String, submitter::String,
+                    reuse::Bool=true)
     item = Item(
         "run_id" => attr(run_id),
         "created_at" => attr(isodate()),
@@ -360,7 +390,8 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
         "packages" => attr(JSON.json(packages)),
         "context" => attr(context_json),
         "total_jobs" => attr(0),
-        "completed_jobs" => attr(0))
+        "completed_jobs" => attr(0),
+        "reuse" => attr(reuse))
     payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
               "\"Item\":$(json_item(item))," *
               "\"ConditionExpression\":\"attribute_not_exists(run_id)\"}"
@@ -552,6 +583,9 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
         base === nothing && error("PR without base ref")
         "$repo#$(something(base))"
     end
+    # pin branches to the commit they name right now: consistent across workers,
+    # and immutable specs are what makes baseline reuse possible at all
+    against = pin_commit(gh, against)
 
     configs_json = "[" * config_json("primary", primary; assertions=true) * "," *
                          config_json("against", against; assertions=true) * "]"
@@ -562,7 +596,8 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     # all collapse into one run (kicking off a run is expensive)
     run_id = comment_id === nothing ? new_run_id() : "gh-$(something(comment_id))"
     created = create_run(ctx; run_id, configs_json, packages=command.packages,
-                         context_json, submitter="$requester via @$name")
+                         context_json, submitter="$requester via @$name",
+                         reuse=!command.fresh_baseline)
     if !created
         @info "command already processed; skipping duplicate delivery" run_id repo number
         return
@@ -759,7 +794,19 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     end
     ndone = count(j -> str(j, "status") in TERMINAL_STATUSES, jobs)
     println(io, "- jobs: $ndone/$(length(jobs)) finished, submitted by ",
-            str(run, "submitter", "?"), " at ", str(run, "created_at", "?"), "\n")
+            str(run, "submitter", "?"), " at ", str(run, "created_at", "?"))
+    # (a Set, not unique!: unique!'s issorted-with-keywords is untrimmable)
+    donor_set = Set{String}()
+    for j in jobs
+        d = opt_str(j, "reused_from")
+        d === nothing || push!(donor_set, something(d))
+    end
+    donors = sort!(collect(donor_set))
+    isempty(donors) ||
+        println(io, "- ", count(j -> opt_str(j, "reused_from") !== nothing, jobs),
+                " baseline results reused from run ", join(map(d -> "`$d`", donors), ", "),
+                " (pass `fresh_baseline = true` to re-evaluate)")
+    println(io)
 
     config_names = String[something(c.name, "?") for c in configs]
     summary = ""

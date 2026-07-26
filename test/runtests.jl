@@ -58,6 +58,12 @@ end
         @test c.packages == ["Example"]
         @test c.vs === nothing && c.error === nothing
     end
+    let c = parse_command("@pkgeval runtests(fresh_baseline = true)")
+        @test c.fresh_baseline && c.error === nothing && isempty(c.packages)
+    end
+    let c = parse_command("@pkgeval `runtests([\"Foo\"], fresh_baseline = true)`")
+        @test c.fresh_baseline && c.packages == ["Foo"]
+    end
     let c = parse_command("@pkgeval runtests()")
         @test c.packages == String[] && c.vs === nothing && c.error === nothing
     end

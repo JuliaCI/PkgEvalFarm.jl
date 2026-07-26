@@ -39,7 +39,7 @@ build under test, so it cannot happen on submitters. Keeping submission this sma
 also lets the bot Lambda submit runs without an AWS SDK.
 """
 function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
-                    run_id::AbstractString=new_run_id())
+                    run_id::AbstractString=new_run_id(), reuse::Bool=true)
     config_names = [cfg.name for cfg in spec.configs]
     allunique(config_names) || error("configuration names must be unique: $config_names")
 
@@ -53,6 +53,9 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
             "context" => JSON.json(spec.context),
             "total_jobs" => 0,
             "completed_jobs" => 0,
+            # baseline reuse (expand_run); false = the submitter wants a fresh
+            # evaluation of the against side even if matching results exist
+            "reuse" => reuse,
         )), ctx.cfg.runs_table,
         Dict("ConditionExpression" => "attribute_not_exists(run_id)");
         aws_config=ctx.aws)
@@ -62,6 +65,101 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
                          ctx.cfg.queue_url; aws_config=ctx.aws)
     end
     return run_id
+end
+
+"""
+Find reusable baseline results for a run: the `against` config's jobs, taken
+from the most recent `done` run containing a config with the same content
+fingerprint. Reuse is sound only when the julia spec is immutable (exact sha or
+release tag) — the bot pins branch specs to shas at submission for this reason
+— and the submitter can veto it (`reuse = false` / `--fresh-baseline`) when the
+existing baseline looks flaky.
+
+Returns `(config_name, donor_run_id, Dict(package => donor job item))`, with an
+empty dict when there is nothing to reuse. Infrastructure failures ("error")
+are never reused; real results (including fail/crash/kill) are.
+"""
+function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String})
+    none = ("", "", Dict{String,Dict{String,Any}}())
+    get(run, "reuse", true) == true || return none
+    i = findfirst(c -> c["name"] == "against", run["configs"])
+    i === nothing && return none
+    against = run["configs"][i]
+    reusable_julia_spec(String(against["julia"])) || return none
+    fp = config_fingerprint(against)
+
+    # the runs table is small (one item per submitted run), so a scan is fine
+    donors = Tuple{String,String,String}[]  # (created_at, run_id, config name)
+    start_key = nothing
+    while true
+        params = Dict{String,Any}(
+            "FilterExpression" => "#s = :done",
+            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeValues" => ddb_item(Dict(":done" => "done")),
+            "ProjectionExpression" => "run_id, created_at, configs")
+        start_key === nothing || (params["ExclusiveStartKey"] = start_key)
+        resp = aws_retry() do
+            Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
+        end
+        for item in ddb_parse.(resp["Items"])
+            item["run_id"] == run["run_id"] && continue
+            for cfg in JSON.parse(item["configs"])
+                config_fingerprint(cfg) == fp || continue
+                push!(donors, (String(get(item, "created_at", "")),
+                               String(item["run_id"]), String(cfg["name"])))
+            end
+        end
+        start_key = get(resp, "LastEvaluatedKey", nothing)
+        start_key === nothing && break
+    end
+    isempty(donors) && return none
+
+    wanted = Set(packages)
+    for (_, donor_id, donor_cfg) in sort!(donors; rev=true)
+        results = Dict{String,Dict{String,Any}}()
+        for job in run_jobs(ctx, donor_id)
+            job["config"] == donor_cfg || continue
+            job["package"] in wanted || continue
+            status = get(job, "status", "")
+            status in TERMINAL_STATUSES && status != "error" || continue
+            results[String(job["package"])] = job
+        end
+        isempty(results) || return ("against", donor_id, results)
+    end
+    return none
+end
+
+"Write already-completed job items carrying a donor's results (batched)."
+function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::AbstractString,
+                           jobs::Vector{JobRef}, results::AbstractDict)
+    now = isodate()
+    for batch in Iterators.partition(jobs, 25)
+        requests = map(batch) do job
+            donor = results[job.package]
+            Dict("PutRequest" => Dict("Item" => ddb_item(Dict(
+                "run_id" => job.run_id,
+                "job_key" => job_key(job),
+                "config" => job.config,
+                "package" => job.package,
+                "status" => donor["status"],
+                "reason" => get(donor, "reason", nothing),
+                "reason_message" => get(donor, "reason_message", nothing),
+                "version" => get(donor, "version", nothing),
+                "duration" => get(donor, "duration", 0.0),
+                # the donor's log verbatim: log_key is stored per job precisely
+                # so a result can point outside its own run's prefix
+                "log_key" => get(donor, "log_key", nothing),
+                "reused_from" => donor_id,
+                "finished_at" => now,
+                "attempts" => 0))))
+        end
+        aws_retry() do
+            resp = Dynamodb.batch_write_item(Dict(ctx.cfg.jobs_table => collect(requests));
+                                             aws_config=ctx.aws)
+            unprocessed = get(resp, "UnprocessedItems", Dict())
+            isempty(unprocessed) || error("unprocessed DynamoDB writes; retrying")
+        end
+    end
 end
 
 "Create the DynamoDB job items (25 per BatchWriteItem), idempotently."
@@ -102,27 +200,41 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     jobs = [JobRef(run_id, cfg, pkg) for cfg in config_names for pkg in packages]
     isempty(jobs) && error("expansion of $run_id produced no jobs")
 
+    # baseline reuse: against-side jobs with a matching prior result are written
+    # pre-completed (pointing at the donor's log) and never enqueued
+    reuse_cfg, donor_id, reused_results = baseline_reuse_plan(ctx, run, packages)
+    reused = [j for j in jobs if j.config == reuse_cfg && haskey(reused_results, j.package)]
+    fresh = setdiff(jobs, reused)
+    isempty(reused) || @info "reusing baseline results" run_id donor_id n=length(reused)
+
     # don't rewrite (= reset) job items once the run went active — after that point a
     # redelivered expand message only needs to make sure the messages went out
-    run["status"] == "expanding" && write_jobs(ctx, jobs)
+    if run["status"] == "expanding"
+        write_jobs(ctx, fresh)
+        isempty(reused) || write_reused_jobs(ctx, run_id, donor_id, reused, reused_results)
+    end
     try
         Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
             Dict("ConditionExpression" => "#s = :expanding",
-                 "UpdateExpression" => "SET #s = :active, total_jobs = :total",
+                 "UpdateExpression" => "SET #s = :active, total_jobs = :total, " *
+                                       "completed_jobs = :reused",
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":expanding" => "expanding", ":active" => "active",
-                     ":total" => length(jobs))));
+                     ":total" => length(jobs), ":reused" => length(reused))));
             aws_config=ctx.aws)
     catch err
         if is_conditional_failure(err)
             # already expanded by an earlier (interrupted) attempt; messages may or
-            # may not have been sent, so fall through and (re-)enqueue everything
+            # may not have been sent, so fall through and (re-)enqueue everything —
+            # claim_job drops messages for jobs that are already completed (which
+            # covers the reused ones), so over-enqueueing is merely a little churn
+            fresh = jobs
         else
             rethrow()
         end
     end
-    enqueue_jobs(ctx, jobs)
+    enqueue_jobs(ctx, fresh)
     return length(jobs)
 end
 

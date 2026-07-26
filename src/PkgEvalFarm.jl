@@ -6,6 +6,7 @@ using HTTP
 using JSON
 using Logging
 using Random
+import SHA
 using TOML
 
 using AWS: @service
