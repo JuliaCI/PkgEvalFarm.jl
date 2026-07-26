@@ -487,20 +487,29 @@ error_message(err) = @trim_errmsg err
 Run the Lambda custom-runtime loop forever: fetch each invocation, call
 `handle(event_body::String)::String`, and post the returned JSON as the response.
 """
-function lambda_loop(handle::F) where {F}
-    api = ENV["AWS_LAMBDA_RUNTIME_API"]
-    next_url = "http://$api/2018-06-01/runtime/invocation/next"
-    # Lambda freezes the process while this GET waits for the next event and
-    # thaws it when one arrives, so libcurl wakes to minutes of wall clock with
-    # zero bytes transferred and Downloads' stalled-transfer default (1 byte/s
-    # over 20s) aborts the request — eating the very invocation that woke us.
-    # A dedicated downloader with the low-speed guard off; other requests are
-    # never frozen mid-flight and keep the default.
-    next_dl = Downloads.Downloader()
-    next_dl.easy_hook = (easy, _) -> begin
+# The `next` long poll is the one request that must be allowed to stall
+# indefinitely: Lambda freezes the process while it waits and thaws it when an
+# event arrives, at which point libcurl sees minutes of wall clock with zero
+# bytes moved and Downloads' stalled-transfer guard (1 byte/s over 20s) aborts
+# the request — eating the very invocation that woke us. The guard is disabled
+# through a Downloader easy_hook; in the trimmed Lambdas that hook must be the
+# concretely-typed `Downloads.FarmEasyHook` from the trim-compat layer, because
+# the stock `easy_hook` dispatch (`invokelatest` on an arbitrary Function) is
+# unverifiable and stubbed out there. Anywhere else a plain closure works.
+# (A raw-socket client would avoid libcurl entirely, but Sockets' uv_readcb
+# is itself trim-incompatible, so this is the road that exists.)
+disable_low_speed_hook() =
+    isdefined(Downloads, :FarmEasyHook) ? Downloads.FarmEasyHook() :
+    (easy, _) -> begin
         Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_LOW_SPEED_LIMIT, 0)
         Downloads.Curl.setopt(easy, Downloads.Curl.CURLOPT_LOW_SPEED_TIME, 0)
     end
+
+function lambda_loop(handle::F) where {F}
+    api = ENV["AWS_LAMBDA_RUNTIME_API"]::String
+    next_url = "http://$api/2018-06-01/runtime/invocation/next"
+    next_dl = Downloads.Downloader()
+    next_dl.easy_hook = disable_low_speed_hook()
     while true
         request_id = ""
         try

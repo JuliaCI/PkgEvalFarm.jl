@@ -147,10 +147,25 @@ using Downloads
 using JSON
 
 # The stock definition calls a `Downloader.easy_hook::Union{Function,Nothing}` via
-# `invokelatest`, an unverifiable dynamic call. The broker never installs a hook.
+# `invokelatest`, an unverifiable dynamic call — so hooks are stubbed out, with
+# one typed exception the farm relies on.
 @eval Downloads begin
+    # The one hook the farm installs (see FarmLite.disable_low_speed_hook):
+    # concretely typed so the replacement `easy_hook` below can execute it
+    # without the unverifiable dispatch. It disables libcurl's stalled-transfer
+    # guard for the Lambda runtime-API long poll, which legitimately sits
+    # frozen for arbitrarily long between invocations.
+    struct FarmEasyHook <: Function end
+    function (::FarmEasyHook)(easy::Curl.Easy, info::NamedTuple)
+        Curl.setopt(easy, Curl.CURLOPT_LOW_SPEED_LIMIT, 0)
+        Curl.setopt(easy, Curl.CURLOPT_LOW_SPEED_TIME, 0)
+        nothing
+    end
+
     function easy_hook(downloader::Downloader, easy::Curl.Easy, info::NamedTuple)
-        downloader.easy_hook === nothing ||
+        hook = downloader.easy_hook
+        hook isa FarmEasyHook && return hook(easy, info)
+        hook === nothing ||
             Core.print(Core.stderr, "WARNING: Downloader.easy_hook ignored in trimmed binary\n")
         nothing
     end
