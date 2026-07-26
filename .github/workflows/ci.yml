@@ -122,12 +122,14 @@ jobs:
       - name: Add swap
         # emitting and linking a ~700MB image spikes past the hosted runner's
         # RAM often enough to kill it outright ("the hosted runner lost
-        # communication with the server"); swap absorbs the peak
+        # communication with the server"); swap absorbs the peak. On /mnt: the
+        # runner already has an active /swapfile (small), and /mnt is the large
+        # scratch disk.
         run: |
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
           free -h
       - name: Build sysimage
         run: |
