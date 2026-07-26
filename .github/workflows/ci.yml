@@ -119,6 +119,16 @@ jobs:
           # must match ec2_worker_julia_channel in terraform/variables.tf
           version: '1.12'
       - uses: julia-actions/cache@v2
+      - name: Add swap
+        # emitting and linking a ~700MB image spikes past the hosted runner's
+        # RAM often enough to kill it outright ("the hosted runner lost
+        # communication with the server"); swap absorbs the peak
+        run: |
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - name: Build sysimage
         run: |
           julia --project=sysimage -e 'using Pkg; Pkg.instantiate()'
