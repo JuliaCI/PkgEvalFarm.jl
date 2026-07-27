@@ -251,8 +251,15 @@ function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
     try
         resp = Lambda.invoke(fn, Dict{String,Any}("Payload" => body); aws_config=ctx.aws)
         payload = resp isa AbstractDict ? JSON.json(resp) : String(copy(resp))
-        @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant response=first(payload, 200)
-        return true
+        # the handler reports its own outcome as {"statusCode": ...}; an invoke
+        # that reaches the function but is refused is still a failure here
+        ok = occursin(r"\"statusCode\":2\d\d", payload)
+        if ok
+            @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant response=first(payload, 200)
+        else
+            @error "build request refused" miss.sha response=first(payload, 300)
+        end
+        return ok
     catch err
         @error "build request failed" miss.sha exception=(err, catch_backtrace())
         return false
