@@ -562,6 +562,40 @@ try
         end
     end
 
+    @testset "build request on missing staged Julia" begin
+        # a stub build-request Lambda: record the (signed) request, answer 202
+        seen = Ref{Any}(nothing)
+        router = TestHTTP.Router()
+        TestHTTP.register!(router, "POST", "/", req -> begin
+            seen[] = (headers = Dict(lowercase(String(k)) => String(v) for (k, v) in req.headers),
+                      body = JSON.parse(String(req.body)))
+            TestHTTP.Response(202, "{\"status\":\"requested\"}")
+        end)
+        brport = rand(50001:60000)
+        server = TestHTTP.serve!(router, "127.0.0.1", brport)
+
+        cfg2 = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
+                          runs_table="pkgeval-runs", jobs_table="pkgeval-jobs",
+                          bucket="pkgeval-results",
+                          build_request_url="http://127.0.0.1:$brport/")
+        ctx2 = PEF.FarmCtx(cfg2, aws)
+        miss = PkgEval.MissingStagedBuild("JuliaLang/julia",
+            "1234567890abcdef1234567890abcdef12345678", "linuxassert")
+        @test PEF.request_julia_build(ctx2, miss)
+        req = seen[]
+        @test req.body["repo"] == "JuliaLang/julia"
+        @test req.body["sha"] == miss.sha
+        @test req.body["variant"] == "linuxassert"
+        # SigV4-signed: the Lambda's AWS_IAM gate rejects anything unsigned
+        @test haskey(req.headers, "authorization")
+        @test startswith(req.headers["authorization"], "AWS4-HMAC-SHA256")
+        @test haskey(req.headers, "x-amz-date")
+
+        # no broker configured => explicit failure, no exception
+        @test !PEF.request_julia_build(ctx, miss)
+        close(server)
+    end
+
     @testset "fleet drain (scale-in protection)" begin
         # a two-instance ASG in moto, with this "worker" playing the newest one
         Auto_Scaling.create_launch_configuration("pkgeval-lc",

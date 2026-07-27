@@ -146,6 +146,14 @@ by default active members of the submitter team, or (with
 check was disabled in 2021, leaving it open to any commenter; this bot
 deliberately does not replicate that.
 
+**Missing Julia builds**: workers never compile Julia from source. A config
+whose Julia is not staged in the CI buckets (`julialang-ephemeral-{ci,pr,request}`)
+surfaces as `MissingStagedBuild` during expansion; the worker asks the
+build-request Lambda (SigV4, its own credentials) to have the
+`julia-build-request` Buildkite pipeline build that exact commit into the
+request bucket, and releases the expand message for retry. The Lambda holds
+the (pipeline-scoped) Buildkite token in SSM and deduplicates requests.
+
 **Straggler avoidance**: long jobs are routed to a separate slow queue that
 workers drain first, so they start while plenty of short work remains to
 backfill behind them; the duration cutoff is computed per run from estimates

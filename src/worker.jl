@@ -25,6 +25,9 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     HTTP.set_default_connection_limit!(max(64, 4 * ninstances))
 
     ctx, user = farm_ctx(; broker, role="worker")
+    # a farm worker must never sink ~30 minutes into compiling Julia: a missing
+    # build surfaces as MissingStagedBuild and is requested from CI instead
+    PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
 
     draining = Ref(false)
@@ -227,6 +230,40 @@ end
 "An instance of seniority `rank` (0 = oldest) drains iff the backlog is below `rank` × slots."
 drain_decision(backlog::Int, rank::Int, slots::Int) = backlog < rank * slots
 
+"""
+Ask the build-request broker (SigV4-signed Function URL; the worker's own
+credentials are the authentication) to have CI build a missing Julia. The
+Lambda deduplicates, so re-requesting on every retry is free. Returns whether
+a request was made (or already pending).
+"""
+function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
+    url = ctx.cfg.build_request_url
+    if isempty(url)
+        @error "no build-request broker configured; cannot obtain a build" miss.repo miss.sha
+        return false
+    end
+    body = JSON.json(Dict("repo" => miss.repo, "sha" => miss.sha,
+                          "variant" => miss.variant))
+    uri = HTTP.URIs.URI(url)
+    host = uri.host
+    # lambda URLs are <id>.lambda-url.<region>.on.aws
+    region = split(host, '.')[3]
+    c = AWS.credentials(ctx.aws)
+    headers = FarmLite.sigv4_headers(; method="POST", host=String(host), path="/",
+        body, region=String(region), service="lambda",
+        creds=FarmLite.AwsCreds(c.access_key_id, c.secret_key,
+                                isempty(c.token) ? nothing : c.token),
+        content_type="application/json")
+    resp = HTTP.post(url, headers, body; status_exception=false)
+    ok = resp.status in (200, 202)
+    if ok
+        @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant resp.status
+    else
+        @error "build request failed" resp.status body=String(resp.body)[1:min(end, 300)]
+    end
+    return ok
+end
+
 "Compute the package set for an `expanding` run and fan out its jobs."
 function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
     @info "expanding run" claimed.run_id
@@ -250,8 +287,18 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
         SQS.delete_message(ctx.cfg.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
         @info "expanded run" claimed.run_id njobs
     catch err
-        @error "failed to expand run; releasing for retry" claimed.run_id exception=(err, catch_backtrace())
-        release_job(ctx, claimed)
+        if err isa PkgEval.MissingStagedBuild
+            # determining package compatibility needs the Julia under test; ask
+            # CI to build it and retry once the queue redelivers this message.
+            # The Lambda dedups, so the periodic re-request while the build runs
+            # is harmless — and refreshes the ask if a build failed.
+            @info "expansion needs a Julia build that is not staged" claimed.run_id sha=err.sha[1:10] err.variant
+            request_julia_build(ctx, err)
+            release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+        else
+            @error "failed to expand run; releasing for retry" claimed.run_id exception=(err, catch_backtrace())
+            release_job(ctx, claimed)
+        end
     finally
         stop_heartbeat()
     end

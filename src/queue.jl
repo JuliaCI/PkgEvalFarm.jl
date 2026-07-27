@@ -10,6 +10,9 @@ const HEARTBEAT_INTERVAL = 5 * 60
 # ~3 hours: beyond any legitimate job (PkgEval's own limit is 45 min, doubled for
 # slow packages), so a hung worker eventually lets its job return to the queue
 const MAX_HEARTBEATS = 36
+# redelivery delay while waiting for a requested CI build (~30-40 min builds;
+# see the raised maxReceiveCount on the queues, which must cover build_time/delay)
+const BUILD_RETRY_DELAY = 10 * 60
 
 isodate(t=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 

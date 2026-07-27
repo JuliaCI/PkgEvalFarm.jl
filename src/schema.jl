@@ -19,6 +19,9 @@ Base.@kwdef struct FarmConfig
     # queues are nowhere near FIFO under backlog (observed to be close to
     # recency-biased), so priority *between* queues is the only ordering tool.
     slow_queue_url::String = ""
+    # Function URL of the build-request Lambda (AWS_IAM-gated); empty when the
+    # deployment has no build-request broker
+    build_request_url::String = ""
 end
 
 "The slow-jobs queue, falling back to the main queue when none is configured."
@@ -28,19 +31,22 @@ slow_queue(cfg::FarmConfig) =
 FarmConfig(d::AbstractDict) = FarmConfig(; region=d["region"], queue_url=d["queue_url"],
                                          runs_table=d["runs_table"], jobs_table=d["jobs_table"],
                                          bucket=d["bucket"],
-                                         slow_queue_url=get(d, "slow_queue_url", ""))
+                                         slow_queue_url=get(d, "slow_queue_url", ""),
+                                         build_request_url=get(d, "build_request_url", ""))
 
 function farm_config_from_env(env=ENV)
     FarmConfig(; region=env["AWS_REGION"], queue_url=env["PKGEVAL_QUEUE_URL"],
                runs_table=env["PKGEVAL_RUNS_TABLE"], jobs_table=env["PKGEVAL_JOBS_TABLE"],
                bucket=env["PKGEVAL_BUCKET"],
-               slow_queue_url=get(env, "PKGEVAL_SLOW_QUEUE_URL", ""))
+               slow_queue_url=get(env, "PKGEVAL_SLOW_QUEUE_URL", ""),
+               build_request_url=get(env, "PKGEVAL_BUILD_REQUEST_URL", ""))
 end
 
 Base.Dict(cfg::FarmConfig) =
     Dict("region" => cfg.region, "queue_url" => cfg.queue_url, "runs_table" => cfg.runs_table,
          "jobs_table" => cfg.jobs_table, "bucket" => cfg.bucket,
-         "slow_queue_url" => cfg.slow_queue_url)
+         "slow_queue_url" => cfg.slow_queue_url,
+         "build_request_url" => cfg.build_request_url)
 
 "A FarmConfig plus the AWS credentials/config used to talk to it."
 struct FarmCtx

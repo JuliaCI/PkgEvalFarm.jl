@@ -13,7 +13,11 @@ resource "aws_sqs_queue" "jobs" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
-    maxReceiveCount     = 4
+    # must cover a job's worth of worker crashes AND an expand message cycling
+    # every BUILD_RETRY_DELAY (10 min) while CI builds a requested Julia
+    # (~30-40 min): package jobs give up on themselves after 3 attempts anyway,
+    # so the extra headroom only serves the build-wait
+    maxReceiveCount = 8
   })
 }
 
@@ -29,6 +33,6 @@ resource "aws_sqs_queue" "jobs_slow" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
-    maxReceiveCount     = 4
+    maxReceiveCount     = 8 # see above; expand messages ride this queue
   })
 }
