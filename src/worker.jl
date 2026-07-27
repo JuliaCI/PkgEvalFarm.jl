@@ -231,40 +231,32 @@ end
 drain_decision(backlog::Int, rank::Int, slots::Int) = backlog < rank * slots
 
 """
-Ask the build-request broker (SigV4-signed Function URL; the worker's own
-credentials are the authentication) to have CI build a missing Julia. The
-Lambda deduplicates, so re-requesting on every retry is free. Returns whether
-a request was made (or already pending).
+Ask the build-request broker to have CI build a missing Julia, via the plain
+Lambda Invoke API — the workers are AWS-credentialed already, so this is the
+best-trodden auth path there is. (The original SigV4-signed Function URL
+design was abandoned after assumed-role sessions were consistently 403'd by
+the URL auth layer despite valid identity- and resource-policy allows — the
+same signed requests from an IAM user worked. Undiagnosable from outside.)
+The Lambda deduplicates, so re-requesting on every retry is free. Returns
+whether a request was made (or already pending).
 """
 function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
-    url = ctx.cfg.build_request_url
-    if isempty(url)
+    fn = ctx.cfg.build_request_function
+    if isempty(fn)
         @error "no build-request broker configured; cannot obtain a build" miss.repo miss.sha
         return false
     end
     body = JSON.json(Dict("repo" => miss.repo, "sha" => miss.sha,
                           "variant" => miss.variant))
-    uri = HTTP.URIs.URI(url)
-    host = uri.host
-    # lambda URLs are <id>.lambda-url.<region>.on.aws
-    region = split(host, '.')[3]
-    c = AWS.credentials(ctx.aws)
-    headers = FarmLite.sigv4_headers(; method="POST", host=String(host), path="/",
-        body, region=String(region), service="lambda",
-        creds=FarmLite.AwsCreds(c.access_key_id, c.secret_key,
-                                isempty(c.token) ? nothing : c.token),
-        content_type="application/json",
-        # Function URLs, like S3, refuse SigV4 requests without a signed
-        # payload-hash header (403 before the function ever runs)
-        extra_headers=["x-amz-content-sha256" => FarmLite.hexdigest(body)])
-    resp = HTTP.post(url, headers, body; status_exception=false)
-    ok = resp.status in (200, 202)
-    if ok
-        @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant resp.status
-    else
-        @error "build request failed" resp.status body=String(resp.body)[1:min(end, 300)]
+    try
+        resp = Lambda.invoke(fn, Dict{String,Any}("Payload" => body); aws_config=ctx.aws)
+        payload = resp isa AbstractDict ? JSON.json(resp) : String(copy(resp))
+        @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant response=first(payload, 200)
+        return true
+    catch err
+        @error "build request failed" miss.sha exception=(err, catch_backtrace())
+        return false
     end
-    return ok
 end
 
 "Compute the package set for an `expanding` run and fan out its jobs."

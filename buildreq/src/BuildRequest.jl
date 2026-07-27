@@ -155,10 +155,15 @@ end
 
 function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
     event = parse_json(event_body, FnUrlEvent)
-    event.method == "POST" || return json_response(405, "{\"error\":\"POST only\"}")
-
-    raw = something(event.body, "")
-    event.is_base64 && (raw = String(FarmLite.base64decode_lite(raw)))
+    raw = if event.method === nothing
+        # not a Function-URL event: a direct Lambda Invoke, whose payload is
+        # the BuildAsk JSON itself (the workers' path; see request_julia_build)
+        event_body
+    else
+        event.method == "POST" || return json_response(405, "{\"error\":\"POST only\"}")
+        b = something(event.body, "")
+        event.is_base64 ? String(FarmLite.base64decode_lite(b)) : b
+    end
     ask = try
         parse_json(raw, BuildAsk)
     catch

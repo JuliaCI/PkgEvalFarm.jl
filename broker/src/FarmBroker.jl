@@ -69,7 +69,7 @@ struct FarmConfig
     region::String
     queue_url::String
     slow_queue_url::String
-    build_request_url::String
+    build_request_function::String
     runs_table::String
     jobs_table::String
     bucket::String
@@ -77,7 +77,7 @@ end
 
 farm_config() = FarmConfig(env("FARM_REGION"), env("PKGEVAL_QUEUE_URL"),
                            get(ENV, "PKGEVAL_SLOW_QUEUE_URL", "")::String,
-                           get(ENV, "PKGEVAL_BUILD_REQUEST_URL", "")::String,
+                           get(ENV, "PKGEVAL_BUILD_REQUEST_FUNCTION", "")::String,
                            env("PKGEVAL_RUNS_TABLE"), env("PKGEVAL_JOBS_TABLE"),
                            env("PKGEVAL_BUCKET"))
 

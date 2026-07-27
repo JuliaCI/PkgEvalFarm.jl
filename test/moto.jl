@@ -563,40 +563,11 @@ try
     end
 
     @testset "build request on missing staged Julia" begin
-        # a stub build-request Lambda: record the (signed) request, answer 202
-        seen = Ref{Any}(nothing)
-        router = TestHTTP.Router()
-        TestHTTP.register!(router, "POST", "/", req -> begin
-            seen[] = (headers = Dict(lowercase(String(k)) => String(v) for (k, v) in req.headers),
-                      body = JSON.parse(String(req.body)))
-            TestHTTP.Response(202, "{\"status\":\"requested\"}")
-        end)
-        brport = rand(50001:60000)
-        server = TestHTTP.serve!(router, "127.0.0.1", brport)
-
-        cfg2 = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
-                          runs_table="pkgeval-runs", jobs_table="pkgeval-jobs",
-                          bucket="pkgeval-results",
-                          build_request_url="http://127.0.0.1:$brport/")
-        ctx2 = PEF.FarmCtx(cfg2, aws)
+        # no broker configured => explicit failure, no exception (the positive
+        # path is a Lambda.invoke, exercised live; moto cannot run our binary)
         miss = PkgEval.MissingStagedBuild("JuliaLang/julia",
             "1234567890abcdef1234567890abcdef12345678", "linuxassert")
-        @test PEF.request_julia_build(ctx2, miss)
-        req = seen[]
-        @test req.body["repo"] == "JuliaLang/julia"
-        @test req.body["sha"] == miss.sha
-        @test req.body["variant"] == "linuxassert"
-        # SigV4-signed: the Lambda's AWS_IAM gate rejects anything unsigned
-        @test haskey(req.headers, "authorization")
-        @test startswith(req.headers["authorization"], "AWS4-HMAC-SHA256")
-        @test haskey(req.headers, "x-amz-date")
-        # Function URLs 403 anything without a signed payload hash
-        @test haskey(req.headers, "x-amz-content-sha256")
-        @test occursin("x-amz-content-sha256", req.headers["authorization"])
-
-        # no broker configured => explicit failure, no exception
         @test !PEF.request_julia_build(ctx, miss)
-        close(server)
     end
 
     @testset "build-request claim/release" begin
@@ -618,6 +589,14 @@ try
         @test !BuildRequest.claim_build(lctx, "pkgeval-builds", key, "test")  # deduped
         BuildRequest.release_build_claim(lctx, "pkgeval-builds", key)
         @test BuildRequest.claim_build(lctx, "pkgeval-builds", key, "test")  # retryable
+
+        # direct-invoke payloads (no requestContext) are accepted by the handler
+        resp = BuildRequest.handle_event(
+            "{\"repo\":\"JuliaLang/julia\",\"sha\":\"short\",\"variant\":\"linux\"}", lctx)
+        @test occursin("400", resp) && occursin("40-character", resp)
+        resp = BuildRequest.handle_event(
+            "{\"repo\":\"Someone/else\",\"sha\":\"1234567890abcdef1234567890abcdef12345678\"}", lctx)
+        @test occursin("403", resp)
     end
 
     @testset "fleet drain (scale-in protection)" begin

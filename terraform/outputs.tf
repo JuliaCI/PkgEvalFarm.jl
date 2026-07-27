@@ -68,9 +68,9 @@ output "debug_role_arn" {
   value       = length(aws_iam_role.debug) > 0 ? aws_iam_role.debug[0].arn : ""
 }
 
-output "build_request_url" {
-  description = "Function URL workers call to request a Julia build (empty when disabled)."
-  value       = length(aws_lambda_function_url.build_request) > 0 ? aws_lambda_function_url.build_request[0].function_url : ""
+output "build_request_function" {
+  description = "Name of the build-request Lambda workers invoke (empty when disabled)."
+  value       = length(aws_lambda_function.build_request) > 0 ? aws_lambda_function.build_request[0].function_name : ""
 }
 
 output "slow_queue_url" {

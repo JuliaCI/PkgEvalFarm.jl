@@ -55,7 +55,7 @@ resource "aws_lambda_function" "broker" {
       PKGEVAL_QUEUE_URL      = aws_sqs_queue.jobs.url
       PKGEVAL_SLOW_QUEUE_URL = aws_sqs_queue.jobs_slow.url
       # vended to workers so they can ask CI for missing Julia builds
-      PKGEVAL_BUILD_REQUEST_URL = local.build_request_enabled == 1 ? aws_lambda_function_url.build_request[0].function_url : ""
+      PKGEVAL_BUILD_REQUEST_FUNCTION = local.build_request_enabled == 1 ? aws_lambda_function.build_request[0].function_name : ""
       PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
       PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket

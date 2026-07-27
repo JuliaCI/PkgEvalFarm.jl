@@ -229,7 +229,7 @@ Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
 Environment=PKGEVAL_SLOW_QUEUE_URL=${slow_queue_url}
 # fleet-drain coordination: the worker manages its own ASG scale-in protection
-Environment=PKGEVAL_BUILD_REQUEST_URL=${build_request_url}
+Environment=PKGEVAL_BUILD_REQUEST_FUNCTION=${build_request_function}
 Environment=PKGEVAL_ASG_NAME=${asg_name}
 Environment=PKGEVAL_INSTANCE_ID=$INSTANCE_ID
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}

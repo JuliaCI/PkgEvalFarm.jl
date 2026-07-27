@@ -149,35 +149,11 @@ resource "aws_lambda_function" "build_request" {
   }
 }
 
-# AWS_IAM: unauthenticated callers get 403 outright. Within the account,
-# authorization comes from identity policies (only the worker roles hold
-# lambda:InvokeFunctionUrl on this function); the resource policy below is an
-# additional grant for those same roles, NOT a filter — same-account callers
-# with their own identity grant (i.e. admins) can always invoke.
-resource "aws_lambda_function_url" "build_request" {
-  count              = local.build_request_enabled
-  function_name      = aws_lambda_function.build_request[0].function_name
-  authorization_type = "AWS_IAM"
-}
-
-locals {
-  # every identity that runs jobs, and nothing else
-  build_request_callers = local.build_request_enabled == 0 ? {} : merge(
-    { worker = aws_iam_role.worker.arn },
-    local.ec2_workers == 0 ? {} : { ec2_worker = aws_iam_role.ec2_worker[0].arn },
-  )
-}
-
-resource "aws_lambda_permission" "build_request_workers" {
-  for_each = local.build_request_callers
-
-  statement_id           = "AllowInvokeFrom${title(each.key)}"
-  action                 = "lambda:InvokeFunctionUrl"
-  function_name          = aws_lambda_function.build_request[0].function_name
-  principal              = each.value
-  function_url_auth_type = "AWS_IAM"
-}
-
+# Workers call the broker through the plain Invoke API. (The original design
+# used a SigV4-signed Function URL, but the URL auth layer consistently 403'd
+# assumed-role sessions despite valid identity- and resource-policy allows —
+# the same signed requests from an IAM user worked. Abandoned as
+# undiagnosable; the Invoke API is the best-trodden auth path there is.)
 resource "aws_iam_policy" "request_builds" {
   count       = local.build_request_enabled
   name        = "${var.name_prefix}-request-builds"
@@ -188,13 +164,8 @@ resource "aws_iam_policy" "request_builds" {
     Statement = [
       {
         Effect   = "Allow"
-        Action   = "lambda:InvokeFunctionUrl"
+        Action   = "lambda:InvokeFunction"
         Resource = aws_lambda_function.build_request[0].arn
-        # no FunctionUrlAuthType condition: real InvokeFunctionUrl evaluation
-        # does not populate that key (verified live: with the condition the
-        # worker role got 403 while iam simulate-principal-policy — which only
-        # sees keys the caller supplies — said "allowed"). The resource pin to
-        # this one function is the guarantee that matters; its URL is AWS_IAM.
       }
     ]
   })
