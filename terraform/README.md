@@ -88,6 +88,14 @@ juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 (worker logs via `journalctl -u pkgeval-worker`).
 
+**Cost tracking**: the provider stamps every resource `Project = pkgeval,
+Component = control-plane`; the EC2 worker fleet (instances and their gp3
+volumes, via launch-template tag specs and ASG-propagated tags) overrides
+`Component = workers`. Activate both under Billing → Cost allocation tags
+(one-time, console-only; categorizes usage from activation onward), then split
+the two pools in Cost Explorer — optionally as Cost Categories, with an AWS
+Budget alert on the workers pool.
+
 **Gradual scale-down**: instances launch with scale-in protection and each
 worker manages its own — dropping it once drained, restoring it on the next
 claim — so the idle policy fires on empty *queues* alone and only ever reaps

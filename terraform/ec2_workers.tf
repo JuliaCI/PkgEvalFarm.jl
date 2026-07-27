@@ -233,7 +233,18 @@ resource "aws_launch_template" "ec2_worker" {
   tag_specifications {
     resource_type = "instance"
     tags = {
-      Name = "${var.name_prefix}-ec2-worker"
+      Name      = "${var.name_prefix}-ec2-worker"
+      Project   = "pkgeval"
+      Component = "workers"
+    }
+  }
+  # the worker disks are a real line item at ec2_worker_disk_gb per instance
+  tag_specifications {
+    resource_type = "volume"
+    tags = {
+      Name      = "${var.name_prefix}-ec2-worker"
+      Project   = "pkgeval"
+      Component = "workers"
     }
   }
 }
@@ -241,6 +252,19 @@ resource "aws_launch_template" "ec2_worker" {
 resource "aws_autoscaling_group" "ec2_worker" {
   count               = local.ec2_workers
   name                = "${var.name_prefix}-ec2-worker"
+
+  # belt-and-braces with the launch template's tag_specifications: ASG-launched
+  # capacity (including spot replacements) always carries the cost tags
+  tag {
+    key                 = "Project"
+    value               = "pkgeval"
+    propagate_at_launch = true
+  }
+  tag {
+    key                 = "Component"
+    value               = "workers"
+    propagate_at_launch = true
+  }
   min_size            = var.ec2_worker_min
   max_size            = var.ec2_worker_max
   desired_capacity    = var.ec2_worker_min
