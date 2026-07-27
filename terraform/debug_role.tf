@@ -107,6 +107,7 @@ resource "aws_iam_role_policy" "debug" {
         Action = [
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceStatus",
+          "ec2:DescribeSpotPriceHistory",
           "ec2:GetConsoleOutput",
           "logs:DescribeLogGroups",
           "autoscaling:Describe*",
