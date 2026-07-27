@@ -22,6 +22,7 @@ module BuildRequest
 
 using Dates
 using JSON
+import Downloads  # @trim_errmsg escapes into this module and names Downloads.RequestError
 
 include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
@@ -195,8 +196,10 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
         try
             release_build_claim(ctx, table, key)
         catch release_err
-            println(Core.stderr, "failed to release build claim for " * key * ": " *
-                                 error_message(release_err))
+            # @trim_errmsg: `error_message(::Any)` on a caught exception is an
+            # unverifiable dynamic call under --trim=safe
+            msg = (FarmLite.@trim_errmsg release_err)::String
+            println(Core.stderr, "failed to release build claim for " * key * ": " * msg)
         end
         rethrow()
     end
