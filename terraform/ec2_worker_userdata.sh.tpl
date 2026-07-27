@@ -230,6 +230,10 @@ Environment=PKGEVAL_QUEUE_URL=${queue_url}
 Environment=PKGEVAL_SLOW_QUEUE_URL=${slow_queue_url}
 # fleet-drain coordination: the worker manages its own ASG scale-in protection
 Environment=PKGEVAL_BUILD_REQUEST_FUNCTION=${build_request_function}
+# graceful drain: ExecStop (and the spot-notice watcher) touch this file; the
+# worker fast-releases every claimed message and exits, so a dying host's jobs
+# redeliver in seconds instead of after the 30-minute visibility timeout
+Environment=PKGEVAL_DRAIN_FILE=/run/pkgeval/drain
 Environment=PKGEVAL_ASG_NAME=${asg_name}
 Environment=PKGEVAL_INSTANCE_ID=$INSTANCE_ID
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}
@@ -239,7 +243,15 @@ Environment=PKGEVAL_BUCKET=${bucket}
 # (IMDS itself is firewalled to root); the token file is root:worker 640 and
 # systemd injects it, so it never exists in sandbox-visible files or env
 EnvironmentFile=/etc/pkgeval-worker.env
+RuntimeDirectory=pkgeval
+RuntimeDirectoryPreserve=yes
+# a drain file left over from the previous stop must not kill the new worker
+ExecStartPre=/bin/rm -f /run/pkgeval/drain
 ExecStart=/home/worker/PkgEvalFarm.jl/bin/farm worker
+# stop sequence: request the drain, give the worker up to 60s to fast-release
+# and exit cleanly; only then does systemd escalate to SIGTERM/SIGKILL
+ExecStop=/bin/sh -c 'touch /run/pkgeval/drain; for i in $(seq 60); do kill -0 $MAINPID 2>/dev/null || exit 0; sleep 1; done'
+TimeoutStopSec=90
 Restart=always
 RestartSec=30
 
@@ -247,6 +259,40 @@ RestartSec=30
 WantedBy=multi-user.target
 UNIT
 
+# Spot interruptions give a 2-minute warning through IMDS (root-only here);
+# turning it into a normal `systemctl stop` gives the worker the whole window
+# to drain instead of the few seconds an ACPI shutdown leaves.
+cat >/usr/local/bin/pkgeval-spot-watch <<'SPOT'
+#!/bin/bash
+while true; do
+    TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token                  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+    CODE=$(curl -s -o /dev/null -w '%{http_code}'                 -H "X-aws-ec2-metadata-token: $TOKEN"                 http://169.254.169.254/latest/meta-data/spot/instance-action)
+    if [ "$CODE" = "200" ]; then
+        echo "spot interruption notice received; draining the worker"
+        systemctl stop pkgeval-worker
+        exit 0
+    fi
+    sleep 5
+done
+SPOT
+chmod 755 /usr/local/bin/pkgeval-spot-watch
+
+cat >/etc/systemd/system/pkgeval-spot-watch.service <<UNIT
+[Unit]
+Description=Drain the PkgEval worker on spot interruption notice
+After=network-online.target
+
+[Service]
+User=root
+ExecStart=/usr/local/bin/pkgeval-spot-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
 systemctl enable --now pkgeval-imds-proxy
+systemctl enable --now pkgeval-spot-watch
 systemctl enable --now pkgeval-worker

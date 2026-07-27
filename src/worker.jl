@@ -42,6 +42,34 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
     fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
 
+    # Fast-release on shutdown: systemd's ExecStop (and the spot-notice timer)
+    # touch PKGEVAL_DRAIN_FILE; the watcher below then releases every claimed
+    # message immediately (visibility 0) and exits. Without this, jobs running
+    # on a dying host only redeliver after the full visibility timeout.
+    active_claims = Dict{String,Any}()    # receipt handle => claimed
+    claims_lock = ReentrantLock()
+    drain_file = get(ENV, "PKGEVAL_DRAIN_FILE", "")
+    if !isempty(drain_file)
+        errormonitor(@async begin
+            while !isfile(drain_file)
+                sleep(2)
+            end
+            @info "drain requested; releasing claimed jobs and exiting"
+            draining[] = true
+            lock(claims_lock) do
+                for claimed in values(active_claims)
+                    try
+                        release_job(ctx, claimed; delay=0)
+                    catch err
+                        @warn "failed to fast-release a job" err
+                    end
+                end
+            end
+            # the host is going away; evaluations in flight cannot finish
+            exit(0)
+        end)
+    end
+
     slots = map(1:ninstances) do i
         errormonitor(@async begin
             for claimed in work
@@ -52,6 +80,9 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                         process_job(ctx, claimed, i - 1, run_cache, run_cache_lock)
                     end
                 finally
+                    lock(claims_lock) do
+                        delete!(active_claims, claimed.receipt_handle)
+                    end
                     Threads.atomic_sub!(busy, 1)
                     Base.release(free_slots)
                 end
@@ -84,6 +115,9 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                 end
                 idle_polls = 0
                 Threads.atomic_add!(busy, 1)
+                lock(claims_lock) do
+                    active_claims[claimed.receipt_handle] = claimed
+                end
                 put!(work, claimed)   # released by the slot that runs it
             end
         finally

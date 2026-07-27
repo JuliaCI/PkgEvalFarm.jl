@@ -650,6 +650,69 @@ try
         @test protected(last(ids))                  # ...but 3 jobs still running
     end
 
+    @testset "DLQ consumer closes out dead jobs and runs" begin
+        # a run with two jobs; one completes normally, one dies to the DLQ
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Alive", "Dead"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        expand = nothing
+        for _ in 1:10
+            expand = PEF.claim_job(ctx; wait=1)
+            expand isa PEF.ClaimedExpand && break
+        end
+        @test PEF.expand_run(ctx, run_id, ["Alive", "Dead"]) == 2
+        SQS.delete_message(expand.queue_url, expand.receipt_handle; aws_config=aws)
+        for _ in 1:6
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            if c.job.package == "Alive"
+                PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+            else
+                PEF.release_job(ctx, c; delay=3600)  # never completes
+            end
+        end
+
+        # what Lambda delivers when the Dead job's message hits the DLQ
+        sqs_event(bodies) = JSON.json(Dict("Records" => [Dict("body" => b) for b in bodies]))
+        gh_stub = PEF.FarmLite.GitHubCtx("unused", "http://127.0.0.1:1")  # must not be contacted
+        lctx2 = PEF.FarmLite.LiteCtx(; region="us-east-1",
+                    creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+                    queue_url, slow_queue_url, runs_table="pkgeval-runs",
+                    jobs_table="pkgeval-jobs", bucket="pkgeval-results",
+                    endpoint="http://127.0.0.1:$port")
+        resp = PEF.FarmBot.handle_event(
+            sqs_event(["{\"run_id\":\"$run_id\",\"config\":\"primary\",\"package\":\"Dead\"}"]),
+            lctx2, gh_stub)
+        @test occursin("ok", resp)
+
+        jobs = PEF.run_jobs(ctx, run_id)
+        dead = only(filter(j -> j["package"] == "Dead", jobs))
+        @test dead["status"] == "error"
+        @test dead["reason"] == "undeliverable"
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"          # the dead job was the last one
+        @test run["completed_jobs"] == 2
+
+        # double delivery of the same dead message must not double-count
+        PEF.FarmBot.handle_event(
+            sqs_event(["{\"run_id\":\"$run_id\",\"config\":\"primary\",\"package\":\"Dead\"}"]),
+            lctx2, gh_stub)
+        @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2
+
+        # a dead *expand* message fails the whole run
+        run2 = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], String[], Dict{String,Any}());
+                              submitter="tester", reuse=false)
+        PEF.FarmBot.handle_event(sqs_event(["{\"run_id\":\"$run2\",\"expand\":true}"]),
+                                 lctx2, gh_stub)
+        @test PEF.get_run(ctx, run2)["status"] == "failed"
+
+        # drain run2's expand message so later testsets start clean
+        for _ in 1:6
+            c = PEF.claim_job(ctx; wait=1)
+            c === nothing && break
+            c isa PEF.ClaimedExpand && SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
+        end
+    end
+
     @testset "broker STS against moto" begin
         with_env(Dict("AWS_ACCESS_KEY_ID" => "testing", "AWS_SECRET_ACCESS_KEY" => "testing",
                       "FARM_REGION" => "us-east-1", "STS_ENDPOINT" => endpoint)) do

@@ -205,6 +205,50 @@ resource "aws_lambda_event_source_mapping" "bot_runs_stream" {
   depends_on = [aws_iam_role_policy.bot_stream]
 }
 
+# --- Trigger 2b: the jobs DLQ ---------------------------------------------------
+# Messages the queue gave up on flow back into the bot, which records them as
+# error results (or fails the run, for expand messages) so runs still complete
+# and reports still get posted — the DLQ is part of the completion path, not a
+# graveyard needing a human.
+
+resource "aws_iam_role_policy" "bot_dlq" {
+  count = local.bot_enabled
+  name  = "consume-jobs-dlq"
+  role  = aws_iam_role.bot[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = aws_sqs_queue.jobs_dlq.arn
+      },
+      {
+        # recording dead jobs as error results
+        Effect   = "Allow"
+        Action   = "dynamodb:UpdateItem"
+        Resource = aws_dynamodb_table.jobs.arn
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_event_source_mapping" "bot_jobs_dlq" {
+  count            = local.bot_enabled
+  event_source_arn = aws_sqs_queue.jobs_dlq.arn
+  function_name    = aws_lambda_function.bot[0].arn
+  batch_size       = 10
+  # dead messages are hours old already; a little batching latency is free
+  maximum_batching_window_in_seconds = 30
+
+  depends_on = [aws_iam_role_policy.bot_dlq]
+}
+
 # --- Trigger 3: infrequent scheduled poll as a fallback ------------------------
 
 resource "aws_cloudwatch_event_rule" "bot_schedule" {

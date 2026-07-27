@@ -14,6 +14,7 @@ else (`farm bot` runs the same code in a polling loop).
 module FarmBot
 
 using Dates
+import Downloads  # @trim_errmsg escapes into this module and names Downloads.RequestError
 using JSON
 
 include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
@@ -653,6 +654,160 @@ function check_finished_runs(ctx::LiteCtx, gh::GitHubCtx)
     end
 end
 
+## the jobs-DLQ consumer: dead messages close out their jobs/runs
+
+struct DeadRef
+    run_id::Union{Nothing,String}
+    config::Union{Nothing,String}
+    package::Union{Nothing,String}
+    expand::Bool
+end
+
+function json_make(::Type{DeadRef}, x::LazyVal)
+    drun = Ref{Union{Nothing,String}}(nothing)
+    dcfg = Ref{Union{Nothing,String}}(nothing)
+    dpkg = Ref{Union{Nothing,String}}(nothing)
+    dexp = Ref(false)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "run_id"
+            dstr, dpos = json_string(v); drun[] = dstr; return dpos
+        elseif k == "config"
+            cstr, cpos = json_string(v); dcfg[] = cstr; return cpos
+        elseif k == "package"
+            pstr, ppos = json_string(v); dpkg[] = pstr; return ppos
+        elseif k == "expand"
+            bval, bpos = FarmLite.json_bool(v); dexp[] = bval; return bpos
+        end
+        return nothing
+    end
+    return DeadRef(drun[], dcfg[], dpkg[], dexp[]), pos::Int
+end
+
+struct AttrResp                        # UpdateItem with ReturnValues
+    Attributes::Union{Nothing,Item}
+end
+
+function json_make(::Type{AttrResp}, x::LazyVal)
+    attrs = Ref{Union{Nothing,Item}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        k == "Attributes" || return nothing
+        aitem, apos = json_make(Item, v)
+        attrs[] = aitem
+        return apos
+    end
+    return AttrResp(attrs[]), pos::Int
+end
+
+function handle_dead_messages(ctx::LiteCtx, gh::GitHubCtx, bodies::Vector{String})
+    for raw in bodies
+        try
+            handle_dead_message(ctx, gh, raw)
+        catch err
+            # best effort by design: an unprocessable dead message must not
+            # wedge the batch (there is no DLQ behind the DLQ)
+            dmsg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "failed to process dead message: " * dmsg)
+        end
+    end
+end
+
+function handle_dead_message(ctx::LiteCtx, gh::GitHubCtx, raw::String)
+    ref = parse_json(raw, DeadRef)
+    ref.run_id === nothing && return
+    run_id = something(ref.run_id)
+    if ref.expand
+        # the run can never expand; fail it and tell the submitter
+        mark_run_failed(ctx, gh, run_id,
+                        "its package set could not be expanded (the expand message was dead-lettered)")
+    elseif ref.config !== nothing && ref.package !== nothing
+        dead_job(ctx, gh, run_id, something(ref.config), something(ref.package))
+    end
+    return nothing
+end
+
+"Record a dead-lettered job as an error result and complete the run if it was last."
+function dead_job(ctx::LiteCtx, gh::GitHubCtx, run_id::String, config::String, package::String)
+    job_key = string(config, "#", package)
+    # only jobs that never finished: a duplicate delivery of a completed job
+    # can also die here, and must not double-count
+    payload = "{\"TableName\":$(JSON.json(ctx.jobs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}," *
+              "\"job_key\":{\"S\":$(JSON.json(job_key))}}," *
+              "\"ConditionExpression\":\"attribute_exists(run_id) AND #s IN (:p, :r)\"," *
+              "\"UpdateExpression\":\"SET #s = :e, reason = :why, reason_message = :rm, finished_at = :now\"," *
+              "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+              "\"ExpressionAttributeValues\":{" *
+              "\":p\":{\"S\":\"pending\"},\":r\":{\"S\":\"running\"}," *
+              "\":e\":{\"S\":\"error\"},\":why\":{\"S\":\"undeliverable\"}," *
+              "\":rm\":{\"S\":\"the job could not be delivered to any worker\"}," *
+              "\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        err isa ErrorException && is_conditional_failure(err) && return
+        rethrow()
+    end
+    @info "dead-lettered job recorded as error" run_id job_key
+
+    bump = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+           "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+           "\"UpdateExpression\":\"ADD completed_jobs :one\"," *
+           "\"ExpressionAttributeValues\":{\":one\":{\"N\":\"1\"}}," *
+           "\"ReturnValues\":\"ALL_NEW\"}"
+    resp = parse_json(ddb(ctx, "UpdateItem", bump), AttrResp)
+    resp.Attributes === nothing && return
+    run = something(resp.Attributes)
+    if haskey(run, "completed_jobs") && haskey(run, "total_jobs") &&
+       int(run, "completed_jobs") >= int(run, "total_jobs") &&
+       str(run, "status", "") == "active"
+        flip = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+               "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+               "\"ConditionExpression\":\"#s = :active AND completed_jobs >= total_jobs\"," *
+               "\"UpdateExpression\":\"SET #s = :done, finished_at = :now\"," *
+               "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+               "\"ExpressionAttributeValues\":{\":active\":{\"S\":\"active\"}," *
+               "\":done\":{\"S\":\"done\"},\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+        try
+            ddb(ctx, "UpdateItem", flip)
+        catch err
+            err isa ErrorException && is_conditional_failure(err) && return
+            rethrow()
+        end
+        # the stream's "done" filter now fires and posts the report as usual
+        @info "run completed via dead-letter accounting" run_id
+    end
+    return nothing
+end
+
+"Mark a run failed (from any non-terminal state) and tell its submitter."
+function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::String)
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+              "\"ConditionExpression\":\"#s IN (:expanding, :active)\"," *
+              "\"UpdateExpression\":\"SET #s = :failed, finished_at = :now\"," *
+              "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+              "\"ExpressionAttributeValues\":{\":expanding\":{\"S\":\"expanding\"}," *
+              "\":active\":{\"S\":\"active\"},\":failed\":{\"S\":\"failed\"}," *
+              "\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        err isa ErrorException && is_conditional_failure(err) && return
+        rethrow()
+    end
+    @info "run marked failed" run_id why
+    # the stream filter only fires on "done", so failure is reported here
+    run = get_run(ctx, run_id)
+    context = parse_json(str(run, "context", "{}"), RunContext)
+    (context.repo === nothing || context.issue === nothing) && return
+    mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
+    post_comment(gh, something(context.repo), something(context.issue),
+                 mention * "run `" * run_id * "` **failed** — " * why * ".")
+    return nothing
+end
+
 function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     run_id = str(run, "run_id")
 
@@ -966,6 +1121,7 @@ end
 "One Lambda invocation event, whatever its trigger (fields absent when N/A)."
 struct TopEvent
     new_images::Vector{Item}            # DynamoDB stream records (runs items)
+    dead_bodies::Vector{String}         # SQS records (the jobs DLQ)
     method::Union{Nothing,String}       # Function URL fields
     signature::Union{Nothing,String}    # x-hub-signature-256
     ghevent::Union{Nothing,String}      # x-github-event
@@ -1008,6 +1164,7 @@ end
 
 function json_make(::Type{TopEvent}, x::LazyVal)
     new_images = Item[]
+    dead_bodies = String[]
     method = Ref{Union{Nothing,String}}(nothing)
     signature = Ref{Union{Nothing,String}}(nothing)
     ghevent = Ref{Union{Nothing,String}}(nothing)
@@ -1023,14 +1180,21 @@ function json_make(::Type{TopEvent}, x::LazyVal)
                 jsontype(record) == JSON.JSONTypes.OBJECT || json_expected("stream record")
                 JSON.applyobject(record) do rk, rv
                     isnullval(rv) && return nothing
-                    rk == "dynamodb" || return nothing
-                    JSON.applyobject(rv) do dk, dv
-                        isnullval(dv) && return nothing
-                        dk == "NewImage" || return nothing
-                        image, image_pos = json_make(Item, dv)
-                        push!(new_images, image)
-                        return image_pos
+                    if rk == "dynamodb"
+                        return JSON.applyobject(rv) do dk, dv
+                            isnullval(dv) && return nothing
+                            dk == "NewImage" || return nothing
+                            image, image_pos = json_make(Item, dv)
+                            push!(new_images, image)
+                            return image_pos
+                        end
+                    elseif rk == "body"
+                        # an SQS record: a message the jobs DLQ gave up on
+                        bstr, bpos = json_string(rv)
+                        push!(dead_bodies, bstr)
+                        return bpos
                     end
+                    return nothing
                 end
             end
         elseif k == "requestContext"
@@ -1061,7 +1225,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
         end
         return nothing
     end
-    return TopEvent(new_images, method[], signature[], ghevent[], body[], is_base64[]),
+    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[]),
            pos::Int
 end
 
@@ -1108,7 +1272,13 @@ scheduled fallback poll. Returns the response JSON.
 function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
                       gh::GitHubCtx=bot_gh())
     event = parse_json(event_body, TopEvent)
-    if !isempty(event.new_images)
+    if !isempty(event.dead_bodies)
+        # the jobs DLQ: messages the queue gave up on become recorded results,
+        # so runs still complete (with errors) and reports still get posted
+        # instead of the run waiting forever on a job that will never arrive
+        handle_dead_messages(ctx, gh, event.dead_bodies)
+        return "{\"ok\":true}"
+    elseif !isempty(event.new_images)
         # runs that just flipped to done (event source mapping filters on status)
         for run in event.new_images
             str(run, "status", "") == "done" || continue
