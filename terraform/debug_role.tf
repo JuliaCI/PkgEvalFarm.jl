@@ -124,6 +124,15 @@ resource "aws_iam_role_policy" "debug" {
         aws_sqs_queue.jobs_dlq.arn]
       },
       {
+        # The one deliberate write: re-driving a job by enqueueing a duplicate
+        # message (claim_job drops duplicates for completed jobs, so this is
+        # safe by construction). Debugging stuck deliveries needs it.
+        Sid      = "RedriveJobs"
+        Effect   = "Allow"
+        Action   = "sqs:SendMessage"
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
+      },
+      {
         Sid    = "ReadFarmState"
         Effect = "Allow"
         Action = [
