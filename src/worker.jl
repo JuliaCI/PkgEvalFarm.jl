@@ -249,7 +249,10 @@ function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
     body = JSON.json(Dict("repo" => miss.repo, "sha" => miss.sha,
                           "variant" => miss.variant))
     try
-        resp = Lambda.invoke(fn, Dict{String,Any}("Payload" => body); aws_config=ctx.aws)
+        # "body" is AWS.jl's key for the raw HTTP body (as in S3.put_object);
+        # anything else -- including the API's own "Payload" name -- is turned
+        # into a query parameter and the function receives an empty event
+        resp = Lambda.invoke(fn, Dict{String,Any}("body" => body); aws_config=ctx.aws)
         payload = resp isa AbstractDict ? JSON.json(resp) : String(copy(resp))
         # the handler reports its own outcome as {"statusCode": ...}; an invoke
         # that reaches the function but is refused is still a failure here
