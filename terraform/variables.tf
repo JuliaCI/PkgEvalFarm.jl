@@ -113,9 +113,9 @@ variable "ec2_worker_idle_minutes" {
 }
 
 variable "ec2_worker_instance_types" {
-  description = "Instance types the spot fleet may use, in order of preference. 4 GB/vCPU recommended (heavy package tests); one machine amortizes Julia builds and caches across all its job slots, so prefer fewer, larger instances."
+  description = "Instance types the spot fleet may use. 4 GB/vCPU recommended (heavy package tests); one machine amortizes Julia builds and caches across all its job slots, so prefer fewer, larger instances. Keep the list uniform in size (32 vCPU): the scheduler's slot math (PKGEVAL_FLEET_SLOTS, backlog-per-instance target) assumes identical instances. More entries = deeper spot pools for price-capacity-optimized to choose from; x86 only (the sysimage and result comparability assume it)."
   type        = list(string)
-  default     = ["m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge"]
+  default     = ["m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge"]
 }
 
 variable "ec2_worker_on_demand_percent" {
