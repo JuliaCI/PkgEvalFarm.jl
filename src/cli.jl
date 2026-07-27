@@ -74,6 +74,7 @@ function cli_main(args::Vector{String}=ARGS)
         provider = lite_ctx_provider(; broker)
         report = FarmBot.generate_report(provider(), only(positional))
         println(report.markdown)
+        println("uploaded to: ", report.url)
     elseif command == "bot"
         haskey(options, "--name") && (ENV["BOT_NAME"] = options["--name"])
         FarmBot.run_bot(lite_ctx_provider(; broker);

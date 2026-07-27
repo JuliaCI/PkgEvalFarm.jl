@@ -871,7 +871,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            content_type="text/markdown; charset=utf-8")
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
-    return (; summary, markdown)
+    return (; summary, markdown, url=report_url(ctx, run_id))
 end
 
 # machine-readable dump of the run + job records (attribute values unwrapped)
