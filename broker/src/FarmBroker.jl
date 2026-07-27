@@ -68,12 +68,14 @@ role_arn(role::String) = role == "worker" ? env("WORKER_ROLE_ARN") : env("SUBMIT
 struct FarmConfig
     region::String
     queue_url::String
+    slow_queue_url::String
     runs_table::String
     jobs_table::String
     bucket::String
 end
 
 farm_config() = FarmConfig(env("FARM_REGION"), env("PKGEVAL_QUEUE_URL"),
+                           get(ENV, "PKGEVAL_SLOW_QUEUE_URL", "")::String,
                            env("PKGEVAL_RUNS_TABLE"), env("PKGEVAL_JOBS_TABLE"),
                            env("PKGEVAL_BUCKET"))
 

@@ -120,17 +120,25 @@ Base.@kwdef struct LiteCtx
     region::String
     creds::AwsCreds
     queue_url::String
+    # long-jobs queue; expand messages ride it (expansion is a long job). Falls
+    # back to queue_url when the deployment is single-queue.
+    slow_queue_url::String = ""
     runs_table::String
     jobs_table::String
     bucket::String
     endpoint::Union{Nothing,String} = nothing  # emulator override (moto in tests)
 end
 
+slow_queue(ctx::LiteCtx) =
+    isempty(ctx.slow_queue_url) ? ctx.queue_url : ctx.slow_queue_url
+
 function ctx_from_env()
     LiteCtx(; region=get(ENV, "FARM_REGION") do
                 ENV["AWS_REGION"]  # set by the Lambda runtime; FARM_REGION elsewhere
             end, creds=env_creds(),
-            queue_url=ENV["PKGEVAL_QUEUE_URL"], runs_table=ENV["PKGEVAL_RUNS_TABLE"],
+            queue_url=ENV["PKGEVAL_QUEUE_URL"],
+            slow_queue_url=get(ENV, "PKGEVAL_SLOW_QUEUE_URL", "")::String,
+            runs_table=ENV["PKGEVAL_RUNS_TABLE"],
             jobs_table=ENV["PKGEVAL_JOBS_TABLE"], bucket=ENV["PKGEVAL_BUCKET"],
             endpoint=get(ENV, "FARM_ENDPOINT", nothing))
 end
@@ -168,8 +176,9 @@ function is_conditional_failure(err)
            occursin("conditional request failed", lowercase(msg))
 end
 
-function sqs_send_message(ctx::LiteCtx, body::String)
-    payload = JSON.json((; QueueUrl=ctx.queue_url, MessageBody=body))
+function sqs_send_message(ctx::LiteCtx, body::String;
+                          queue_url::String=ctx.queue_url)
+    payload = JSON.json((; QueueUrl=queue_url, MessageBody=body))
     aws_json(ctx, "sqs", "AmazonSQS.SendMessage", payload)
     return nothing
 end

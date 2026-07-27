@@ -120,7 +120,7 @@ locals {
           "sqs:ChangeMessageVisibility",
           "sqs:SendMessage",
         ]
-        Resource = aws_sqs_queue.jobs.arn
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
       },
       {
         Sid    = "RunState"
@@ -209,7 +209,7 @@ locals {
         Sid      = "EnqueueExpand"
         Effect   = "Allow"
         Action   = "sqs:SendMessage"
-        Resource = aws_sqs_queue.jobs.arn
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
       },
       {
         Sid      = "ListRunObjects"

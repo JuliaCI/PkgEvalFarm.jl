@@ -58,6 +58,25 @@ end
         @test c.packages == ["Example"]
         @test c.vs === nothing && c.error === nothing
     end
+    @testset "duration cutoff" begin
+        # plenty of short work: cutoff lands just above the mass needed to
+        # backfill behind the longest job
+        ests = [fill(60.0, 1000); fill(600.0, 50); [3000.0, 2700.0]]
+        cutoff = PkgEvalFarm.duration_cutoff(ests; slots=4, margin=2.0)
+        @test cutoff == 60.0                     # the mass condition crosses within
+                                                 # the short jobs, so only they are fast
+        @test sum(e for e in ests if e <= cutoff) >= 2.0 * 3000.0 * 4
+        @test count(>(cutoff), ests) == 52       # 600s jobs and both stragglers: slow
+
+        # a run too small to backfill anything degrades to a single class
+        @test PkgEvalFarm.duration_cutoff([300.0, 600.0]; slots=128) == Inf
+        @test PkgEvalFarm.duration_cutoff(Float64[]) == Inf
+
+        # uniform durations (e.g. a first run with no history): single class
+        @test PkgEvalFarm.duration_cutoff(fill(2700.0, 500); slots=128) == Inf ||
+              count(>(PkgEvalFarm.duration_cutoff(fill(2700.0, 500); slots=128)), fill(2700.0, 500)) == 0
+    end
+
     let c = parse_command("@pkgeval runtests(fresh_baseline = true)")
         @test c.fresh_baseline && c.error === nothing && isempty(c.packages)
     end

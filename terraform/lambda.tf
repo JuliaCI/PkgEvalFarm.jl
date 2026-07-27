@@ -52,7 +52,8 @@ resource "aws_lambda_function" "broker" {
       WORKER_ROLE_ARN    = aws_iam_role.worker.arn
       SUBMITTER_ROLE_ARN = aws_iam_role.submitter.arn
       CRED_DURATION      = tostring(var.cred_duration_seconds)
-      PKGEVAL_QUEUE_URL  = aws_sqs_queue.jobs.url
+      PKGEVAL_QUEUE_URL      = aws_sqs_queue.jobs.url
+      PKGEVAL_SLOW_QUEUE_URL = aws_sqs_queue.jobs_slow.url
       PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
       PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket

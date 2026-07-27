@@ -407,7 +407,8 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
         # run already past expansion doesn't need (churn-y) extra messages
         str(get_run(ctx, run_id), "status") == "expanding" || return false
     end
-    sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}")
+    sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}";
+                     queue_url=FarmLite.slow_queue(ctx))
     return created
 end
 

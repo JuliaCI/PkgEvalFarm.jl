@@ -46,6 +46,11 @@ systemctl daemon-reload
 loginctl enable-linger worker
 WORKER_UID=$(id -u worker)
 
+# instance identity for fleet-drain coordination, fetched as root (IMDS is
+# firewalled to root; the worker only ever needs the resulting string)
+IMDS_TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
 sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
 sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
 
@@ -215,6 +220,10 @@ Environment=JULIA=/home/worker/.juliaup/bin/julia
 # bin/farm passes it to julia as -J
 Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
+Environment=PKGEVAL_SLOW_QUEUE_URL=${slow_queue_url}
+# fleet-drain coordination: the worker manages its own ASG scale-in protection
+Environment=PKGEVAL_ASG_NAME=${asg_name}
+Environment=PKGEVAL_INSTANCE_ID=$INSTANCE_ID
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}
 Environment=PKGEVAL_JOBS_TABLE=${jobs_table}
 Environment=PKGEVAL_BUCKET=${bucket}

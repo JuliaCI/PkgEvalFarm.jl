@@ -36,6 +36,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # so nothing sits claimed-but-unheartbeated waiting for capacity.
     work = Channel{Any}(ninstances)
     free_slots = Base.Semaphore(ninstances)
+    busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
+    fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
 
     slots = map(1:ninstances) do i
         errormonitor(@async begin
@@ -47,6 +49,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                         process_job(ctx, claimed, i - 1, run_cache, run_cache_lock)
                     end
                 finally
+                    Threads.atomic_sub!(busy, 1)
                     Base.release(free_slots)
                 end
             end
@@ -57,6 +60,11 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         idle_polls = 0
         try
             while !draining[]
+                if pause_claiming!(ctx, fleet, busy[])
+                    once && break   # a draining --once worker is done
+                    sleep(30)
+                    continue
+                end
                 Base.acquire(free_slots)
                 claimed = try
                     draining[] ? nothing : claim_job(ctx)
@@ -72,6 +80,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                     continue
                 end
                 idle_polls = 0
+                Threads.atomic_add!(busy, 1)
                 put!(work, claimed)   # released by the slot that runs it
             end
         finally
@@ -95,6 +104,128 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         end
     end
 end
+
+## EC2 fleet coordination (enabled by PKGEVAL_ASG_NAME/PKGEVAL_INSTANCE_ID)
+#
+# Two cooperating mechanisms let the fleet scale down *gradually* at the end of
+# a run instead of holding every instance until the last job exits:
+#
+#  1. Scale-in protection tracks busyness. Instances launch protected; a worker
+#     with no running jobs and no claimable work removes its own protection,
+#     making it — and only it — reclaimable by the idle policy (which can then
+#     trigger on an empty queue alone, without waiting for in-flight jobs
+#     elsewhere). Protection is restored before claiming again.
+#
+#  2. Consolidation: when the visible backlog is smaller than the fleet's spare
+#     capacity, the *newest* instances stop claiming so the remaining work
+#     concentrates on the oldest (warmest-cached) machines. Decentralized and
+#     deterministic: an instance with seniority rank r (0 = oldest, by launch
+#     time) drains iff backlog < r × its slot count — rank n-1 drains first,
+#     rank 0 never does.
+#
+# Everything here is best effort: any API failure leaves the worker claiming
+# and protected, which is exactly the pre-feature behavior.
+
+Base.@kwdef mutable struct FleetDrain
+    asg::String
+    instance_id::String
+    slots::Int
+    draining::Bool = false
+    protected::Bool = true    # ASG launches instances protected
+    last_check::Float64 = 0.0
+end
+
+function fleet_drain_init(slots::Int)
+    asg = get(ENV, "PKGEVAL_ASG_NAME", "")
+    instance_id = get(ENV, "PKGEVAL_INSTANCE_ID", "")
+    (isempty(asg) || isempty(instance_id)) && return nothing
+    @info "fleet drain coordination enabled" asg instance_id
+    FleetDrain(; asg, instance_id, slots)
+end
+
+"Visible messages across both job queues."
+function visible_backlog(ctx::FarmCtx)
+    total = 0
+    for queue in unique([ctx.cfg.queue_url, slow_queue(ctx.cfg)])
+        resp = SQS.get_queue_attributes(queue,
+            Dict("AttributeNames" => ["ApproximateNumberOfMessages"]);
+            aws_config=ctx.aws)
+        total += parse(Int, resp["Attributes"]["ApproximateNumberOfMessages"])
+    end
+    return total
+end
+
+"""
+Seniority rank of `instance_id` (0 = oldest launch) among the ASG's in-service
+instances, from a DescribeAutoScalingGroups + DescribeInstances-free source:
+the ASG member list itself carries no launch time, so rank falls back to
+instance-id order for equal standing — deterministic is what matters, not
+which tiebreak. Returns `(rank, ninstances)`.
+"""
+function fleet_rank(ctx::FarmCtx, fleet::FleetDrain)
+    resp = Auto_Scaling.describe_auto_scaling_groups(
+        Dict{String,Any}("AutoScalingGroupNames" => [fleet.asg]); aws_config=ctx.aws)
+    group = resp["DescribeAutoScalingGroupsResult"]["AutoScalingGroups"]["member"]
+    group isa AbstractVector && (group = first(group))
+    members = get(group, "Instances", nothing)
+    (members === nothing || !haskey(members, "member")) && return (0, 1)
+    members = members["member"]
+    members isa AbstractVector || (members = [members])
+    # instance-id order as the seniority tiebreak: the ASG member list carries
+    # no launch time, and deterministic is what matters, not which tiebreak
+    ids = sort!([String(m["InstanceId"]) for m in members
+                 if m["LifecycleState"] == "InService"])
+    rank = something(findfirst(==(fleet.instance_id), ids), 1) - 1
+    return (rank, length(ids))
+end
+
+set_protection(ctx::FarmCtx, fleet::FleetDrain, protected::Bool) =
+    Auto_Scaling.set_instance_protection(fleet.asg, [fleet.instance_id], protected;
+                                         aws_config=ctx.aws)
+
+"""
+Called by the receiver before each claim. Returns `true` when this instance
+should not take new work right now. Throttled to one evaluation per minute;
+manages this instance's scale-in protection as a side effect (unprotected only
+while draining with zero running jobs).
+"""
+function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::Int)
+    fleet === nothing && return false
+    now = time()
+    if now - fleet.last_check >= 60
+        fleet.last_check = now
+        try
+            backlog = visible_backlog(ctx)
+            rank, n = fleet_rank(ctx, fleet)
+            should_drain = drain_decision(backlog, rank, fleet.slots)
+            if should_drain != fleet.draining
+                @info(should_drain ? "draining: backlog below spare capacity" :
+                                     "resuming claims", backlog, rank, n)
+                fleet.draining = should_drain
+            end
+        catch err
+            @warn "fleet drain check failed; continuing to claim" err
+            fleet.draining = false
+        end
+    end
+    try
+        if fleet.draining && busy == 0 && fleet.protected
+            set_protection(ctx, fleet, false)
+            fleet.protected = false
+            @info "idle and draining; removed scale-in protection"
+        elseif !fleet.draining && !fleet.protected
+            set_protection(ctx, fleet, true)
+            fleet.protected = true
+            @info "restored scale-in protection"
+        end
+    catch err
+        @warn "failed to update scale-in protection" err
+    end
+    return fleet.draining
+end
+
+"An instance of seniority `rank` (0 = oldest) drains iff the backlog is below `rank` × slots."
+drain_decision(backlog::Int, rank::Int, slots::Int) = backlog < rank * slots
 
 "Compute the package set for an `expanding` run and fan out its jobs."
 function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)

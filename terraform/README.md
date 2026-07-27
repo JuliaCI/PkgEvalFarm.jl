@@ -88,6 +88,26 @@ juliaup + PkgEvalFarm.jl (`ec2_worker_farm_repo`/`_ref`) and starts a
 No SSH ingress; debug with `aws ssm start-session --target <instance-id>`
 (worker logs via `journalctl -u pkgeval-worker`).
 
+**Gradual scale-down**: instances launch with scale-in protection and each
+worker manages its own — dropping it once drained, restoring it on the next
+claim — so the idle policy fires on empty *queues* alone and only ever reaps
+machines with nothing running. Near the end of a run, when the visible backlog
+falls below the fleet's spare capacity, the newest instances additionally stop
+claiming (seniority rank r drains iff backlog < r × slots; the oldest, with the
+warmest caches, never does), consolidating the tail onto fewer machines. All
+best-effort: any API failure leaves an instance busy-and-protected, which is
+the pre-feature behavior.
+
+**Two-tier job scheduling**: at expansion, jobs above a duration cutoff go to
+`<prefix>-jobs-slow`, which workers drain before the main queue. The cutoff is
+derived from the run's own duration mix (estimates from recent completed runs;
+unknown packages classed slow): the smallest value such that the fast class
+still holds enough aggregate work to backfill behind the longest job. The
+cutoff bounds the end-of-run straggler tail. Queue *priority* is used because
+SQS standard-queue delivery under backlog is nowhere near FIFO (empirically
+roughly recency-biased), so enqueue order carries no information. Scaling
+policies sum both queues.
+
 **Sysimage bootstrap**: bringing the depot up from cold costs 137s, of which
 ~75s is precompiling AWS.jl, PkgEval and their dependency trees, and EC2
 workers launch constantly (spot replacement, queue-driven scale-out,

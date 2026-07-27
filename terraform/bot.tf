@@ -140,7 +140,8 @@ resource "aws_lambda_function" "bot" {
       # needs read:org to check); empty team = any org member
       GITHUB_ORG         = var.github_org
       SUBMITTER_TEAM     = var.bot_submitter_team == null ? var.submitter_team : var.bot_submitter_team
-      PKGEVAL_QUEUE_URL  = aws_sqs_queue.jobs.url
+      PKGEVAL_QUEUE_URL      = aws_sqs_queue.jobs.url
+      PKGEVAL_SLOW_QUEUE_URL = aws_sqs_queue.jobs_slow.url
       PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
       PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket

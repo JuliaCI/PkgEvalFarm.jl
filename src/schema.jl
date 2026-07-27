@@ -14,21 +14,33 @@ Base.@kwdef struct FarmConfig
     runs_table::String
     jobs_table::String
     bucket::String
+    # queue for jobs with long estimated durations (see expand_run's dynamic
+    # cutoff); workers poll it first. Empty = single-queue mode: SQS standard
+    # queues are nowhere near FIFO under backlog (observed to be close to
+    # recency-biased), so priority *between* queues is the only ordering tool.
+    slow_queue_url::String = ""
 end
+
+"The slow-jobs queue, falling back to the main queue when none is configured."
+slow_queue(cfg::FarmConfig) =
+    isempty(cfg.slow_queue_url) ? cfg.queue_url : cfg.slow_queue_url
 
 FarmConfig(d::AbstractDict) = FarmConfig(; region=d["region"], queue_url=d["queue_url"],
                                          runs_table=d["runs_table"], jobs_table=d["jobs_table"],
-                                         bucket=d["bucket"])
+                                         bucket=d["bucket"],
+                                         slow_queue_url=get(d, "slow_queue_url", ""))
 
 function farm_config_from_env(env=ENV)
     FarmConfig(; region=env["AWS_REGION"], queue_url=env["PKGEVAL_QUEUE_URL"],
                runs_table=env["PKGEVAL_RUNS_TABLE"], jobs_table=env["PKGEVAL_JOBS_TABLE"],
-               bucket=env["PKGEVAL_BUCKET"])
+               bucket=env["PKGEVAL_BUCKET"],
+               slow_queue_url=get(env, "PKGEVAL_SLOW_QUEUE_URL", ""))
 end
 
 Base.Dict(cfg::FarmConfig) =
     Dict("region" => cfg.region, "queue_url" => cfg.queue_url, "runs_table" => cfg.runs_table,
-         "jobs_table" => cfg.jobs_table, "bucket" => cfg.bucket)
+         "jobs_table" => cfg.jobs_table, "bucket" => cfg.bucket,
+         "slow_queue_url" => cfg.slow_queue_url)
 
 "A FarmConfig plus the AWS credentials/config used to talk to it."
 struct FarmCtx

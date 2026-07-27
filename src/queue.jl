@@ -62,9 +62,90 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
 
     aws_retry() do
         SQS.send_message(JSON.json(Dict("run_id" => run_id, "expand" => true)),
-                         ctx.cfg.queue_url; aws_config=ctx.aws)
+                         slow_queue(ctx.cfg); aws_config=ctx.aws)
     end
     return run_id
+end
+
+# packages with no history are estimated at PkgEval's default time limit: the
+# conservative direction, since an unknown straggler scheduled early costs
+# nothing while one scheduled late costs the whole tail
+const DEFAULT_DURATION_ESTIMATE = 45.0 * 60
+
+# assumed fleet slot capacity for the cutoff computation (overridable per
+# deployment). Overestimating pushes the cutoff up (more jobs classed slow) —
+# again the conservative direction.
+fleet_slots() = parse(Int, get(ENV, "PKGEVAL_FLEET_SLOTS", "128"))
+
+"Completed runs, newest first, as `(created_at, run_id, configs)` tuples."
+function completed_runs(ctx::FarmCtx)
+    runs = Tuple{String,String,Any}[]
+    start_key = nothing
+    while true
+        params = Dict{String,Any}(
+            "FilterExpression" => "#s = :done",
+            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeValues" => ddb_item(Dict(":done" => "done")),
+            "ProjectionExpression" => "run_id, created_at, configs")
+        start_key === nothing || (params["ExclusiveStartKey"] = start_key)
+        resp = aws_retry() do
+            Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
+        end
+        for item in ddb_parse.(resp["Items"])
+            push!(runs, (String(get(item, "created_at", "")), String(item["run_id"]),
+                         JSON.parse(item["configs"])))
+        end
+        start_key = get(resp, "LastEvaluatedKey", nothing)
+        start_key === nothing && break
+    end
+    return sort!(runs; rev=true)
+end
+
+"""
+Per-package duration estimates from recent completed runs (newest first, up to
+`max_donors` of them). Duration is mostly package-intrinsic, so estimates
+transfer across Julia versions where results would not; the max over configs
+and donors is used, since underestimating is what causes stragglers.
+"""
+function duration_estimates(ctx::FarmCtx, packages::Vector{String},
+                            donors::Vector{<:Tuple}; max_donors::Int=3)
+    est = Dict{String,Float64}()
+    wanted = Set(packages)
+    for (_, donor_id, _) in first(donors, max_donors)
+        length(est) == length(wanted) && break
+        for job in run_jobs(ctx, donor_id)
+            pkg = String(job["package"])
+            pkg in wanted || continue
+            get(job, "status", "") in TERMINAL_STATUSES || continue
+            get(job, "status", "") == "error" && continue
+            duration = Float64(get(job, "duration", 0.0))
+            duration > 0 || continue
+            est[pkg] = max(get(est, pkg, 0.0), duration)
+        end
+    end
+    return est
+end
+
+"""
+Duration above which a job goes to the slow queue, chosen from the run's own
+mix: the smallest cutoff such that the fast class still holds `margin` × (the
+longest estimated job) × (fleet slot capacity) of aggregate work. The cutoff
+directly bounds the end-of-run tail (once only the fast queue remains, no
+machine is extended by more than one fast job), while the backfill condition
+guarantees every slow job — claimed in whatever order SQS feels like — starts
+with enough short work queued behind it. Runs too small to satisfy the
+condition get `Inf`: a single class, since there is nothing to backfill with.
+"""
+function duration_cutoff(estimates::Vector{Float64}; slots::Int=fleet_slots(),
+                         margin::Float64=2.0)
+    isempty(estimates) && return Inf
+    need = margin * maximum(estimates) * slots
+    acc = 0.0
+    for d in sort(estimates)
+        acc += d
+        acc >= need && return d
+    end
+    return Inf
 end
 
 """
@@ -79,7 +160,8 @@ Returns `(config_name, donor_run_id, Dict(package => donor job item))`, with an
 empty dict when there is nothing to reuse. Infrastructure failures ("error")
 are never reused; real results (including fail/crash/kill) are.
 """
-function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String})
+function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String},
+                             completed::Vector{<:Tuple}=completed_runs(ctx))
     none = ("", "", Dict{String,Dict{String,Any}}())
     get(run, "reuse", true) == true || return none
     i = findfirst(c -> c["name"] == "against", run["configs"])
@@ -88,34 +170,18 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
     reusable_julia_spec(String(against["julia"])) || return none
     fp = config_fingerprint(against)
 
-    # the runs table is small (one item per submitted run), so a scan is fine
     donors = Tuple{String,String,String}[]  # (created_at, run_id, config name)
-    start_key = nothing
-    while true
-        params = Dict{String,Any}(
-            "FilterExpression" => "#s = :done",
-            "ExpressionAttributeNames" => Dict("#s" => "status"),
-            "ExpressionAttributeValues" => ddb_item(Dict(":done" => "done")),
-            "ProjectionExpression" => "run_id, created_at, configs")
-        start_key === nothing || (params["ExclusiveStartKey"] = start_key)
-        resp = aws_retry() do
-            Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
+    for (created_at, run_id, configs) in completed
+        run_id == run["run_id"] && continue
+        for cfg in configs
+            config_fingerprint(cfg) == fp || continue
+            push!(donors, (created_at, run_id, String(cfg["name"])))
         end
-        for item in ddb_parse.(resp["Items"])
-            item["run_id"] == run["run_id"] && continue
-            for cfg in JSON.parse(item["configs"])
-                config_fingerprint(cfg) == fp || continue
-                push!(donors, (String(get(item, "created_at", "")),
-                               String(item["run_id"]), String(cfg["name"])))
-            end
-        end
-        start_key = get(resp, "LastEvaluatedKey", nothing)
-        start_key === nothing && break
     end
     isempty(donors) && return none
 
     wanted = Set(packages)
-    for (_, donor_id, donor_cfg) in sort!(donors; rev=true)
+    for (_, donor_id, donor_cfg) in donors
         results = Dict{String,Dict{String,Any}}()
         for job in run_jobs(ctx, donor_id)
             job["config"] == donor_cfg || continue
@@ -200,12 +266,21 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     jobs = [JobRef(run_id, cfg, pkg) for cfg in config_names for pkg in packages]
     isempty(jobs) && error("expansion of $run_id produced no jobs")
 
+    completed = completed_runs(ctx)
+
     # baseline reuse: against-side jobs with a matching prior result are written
     # pre-completed (pointing at the donor's log) and never enqueued
-    reuse_cfg, donor_id, reused_results = baseline_reuse_plan(ctx, run, packages)
+    reuse_cfg, donor_id, reused_results = baseline_reuse_plan(ctx, run, packages, completed)
     reused = [j for j in jobs if j.config == reuse_cfg && haskey(reused_results, j.package)]
     fresh = setdiff(jobs, reused)
     isempty(reused) || @info "reusing baseline results" run_id donor_id n=length(reused)
+
+    # straggler avoidance: jobs above the (run-mix-derived) duration cutoff go
+    # to the slow queue, which workers drain first
+    est = duration_estimates(ctx, [j.package for j in fresh], completed)
+    job_est(j) = get(est, j.package, DEFAULT_DURATION_ESTIMATE)
+    cutoff = duration_cutoff([job_est(j) for j in fresh])
+    is_slow(j) = job_est(j) > cutoff
 
     # don't rewrite (= reset) job items once the run went active — after that point a
     # redelivered expand message only needs to make sure the messages went out
@@ -234,17 +309,23 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
             rethrow()
         end
     end
-    enqueue_jobs(ctx, fresh)
+    slow_jobs = [j for j in fresh if is_slow(j)]
+    fast_jobs = [j for j in fresh if !is_slow(j)]
+    isempty(slow_jobs) ||
+        @info "routing long jobs to the slow queue" run_id nslow=length(slow_jobs) cutoff
+    enqueue_jobs(ctx, slow_jobs; queue_url=slow_queue(ctx.cfg))
+    enqueue_jobs(ctx, fast_jobs)
     return length(jobs)
 end
 
 "Enqueue SQS messages for jobs (also used to re-drive stalled jobs)."
-function enqueue_jobs(ctx::FarmCtx, jobs::Vector{JobRef})
+function enqueue_jobs(ctx::FarmCtx, jobs::Vector{JobRef};
+                      queue_url::AbstractString=ctx.cfg.queue_url)
     for batch in Iterators.partition(jobs, 10)
         entries = [Dict("Id" => string(i), "MessageBody" => json_message(job))
                    for (i, job) in enumerate(batch)]
         aws_retry() do
-            resp = SQS.send_message_batch(entries, ctx.cfg.queue_url; aws_config=ctx.aws)
+            resp = SQS.send_message_batch(entries, queue_url; aws_config=ctx.aws)
             failed = get(resp, "Failed", nothing)
             failed === nothing || isempty(failed) || error("failed to enqueue $(length(failed)) messages; retrying")
         end
@@ -258,12 +339,14 @@ struct ClaimedJob
     job::JobRef
     receipt_handle::String
     attempts::Int
+    queue_url::String   # receipt handles are queue-specific
 end
 
 "A received *expand* message: the worker should compute and fan out the run's jobs."
 struct ClaimedExpand
     run_id::String
     receipt_handle::String
+    queue_url::String
 end
 
 """
@@ -274,17 +357,31 @@ the queue was empty or the received job turned out to be already finished (its s
 duplicate message is deleted).
 """
 function claim_job(ctx::FarmCtx; wait::Int=20)
-    resp = SQS.receive_message(ctx.cfg.queue_url,
-        Dict("WaitTimeSeconds" => wait, "MaxNumberOfMessages" => 1,
-             "VisibilityTimeout" => VISIBILITY_TIMEOUT,
-             "AttributeNames" => ["ApproximateReceiveCount"]);
-        aws_config=ctx.aws)
-    messages = get(resp, "Messages", nothing)
-    (messages === nothing || isempty(messages)) && return nothing
-    message = only(messages)
+    # Slow jobs first: the whole point of the second queue is that long jobs
+    # must start while short work remains to backfill behind them, and queue
+    # priority is the only ordering SQS actually honors. WaitTimeSeconds=1 is
+    # still a long poll (it consults every storage host, unlike wait=0 which
+    # samples and can miss), so an "empty" answer is trustworthy.
+    slow = slow_queue(ctx.cfg)
+    queues = slow == ctx.cfg.queue_url ?
+        ((ctx.cfg.queue_url, wait),) : ((slow, 1), (ctx.cfg.queue_url, wait))
+    message, from_queue = nothing, ""
+    for (queue, w) in queues
+        resp = SQS.receive_message(queue,
+            Dict("WaitTimeSeconds" => w, "MaxNumberOfMessages" => 1,
+                 "VisibilityTimeout" => VISIBILITY_TIMEOUT,
+                 "AttributeNames" => ["ApproximateReceiveCount"]);
+            aws_config=ctx.aws)
+        messages = get(resp, "Messages", nothing)
+        (messages === nothing || isempty(messages)) && continue
+        message, from_queue = only(messages), queue
+        break
+    end
+    message === nothing && return nothing
     receipt = message["ReceiptHandle"]
     body = JSON.parse(message["Body"])
-    get(body, "expand", false) == true && return ClaimedExpand(body["run_id"], receipt)
+    get(body, "expand", false) == true &&
+        return ClaimedExpand(body["run_id"], receipt, from_queue)
     job = JobRef(body)
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
 
@@ -303,12 +400,12 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
     catch err
         if is_conditional_failure(err)
             # already finished (duplicate delivery), or the run item was deleted
-            SQS.delete_message(ctx.cfg.queue_url, receipt; aws_config=ctx.aws)
+            SQS.delete_message(from_queue, receipt; aws_config=ctx.aws)
             return nothing
         end
         rethrow()
     end
-    return ClaimedJob(job, receipt, receive_count)
+    return ClaimedJob(job, receipt, receive_count, from_queue)
 end
 
 worker_identity() = string(get(ENV, "USER", "unknown"), "@", gethostname())
@@ -316,13 +413,13 @@ worker_identity() = string(get(ENV, "USER", "unknown"), "@", gethostname())
 "Extend the message visibility while the job is still being evaluated."
 heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
           extend::Int=VISIBILITY_TIMEOUT) =
-    SQS.change_message_visibility(ctx.cfg.queue_url, claimed.receipt_handle, extend;
+    SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, extend;
                                   aws_config=ctx.aws)
 
 "Give up on a claimed job without recording a result; it will be redelivered."
 function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
     try
-        SQS.change_message_visibility(ctx.cfg.queue_url, claimed.receipt_handle, delay;
+        SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, delay;
                                       aws_config=ctx.aws)
     catch err
         @warn "failed to release job; it will reappear after the visibility timeout" err
@@ -401,7 +498,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
             aws_config=ctx.aws)
     end
 
-    SQS.delete_message(ctx.cfg.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+    SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
     return nothing
 end
 

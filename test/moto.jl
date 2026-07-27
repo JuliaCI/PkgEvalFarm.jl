@@ -16,6 +16,7 @@ using ..BrokerTests: FarmBroker, with_env
 const PEF = PkgEvalFarm
 
 using AWS: @service
+@service Auto_Scaling
 @service Dynamodb
 @service SQS
 @service S3
@@ -66,9 +67,11 @@ try
             table, Dict("BillingMode" => "PAY_PER_REQUEST"); aws_config=aws)
     end
     queue_url = SQS.create_queue("pkgeval-jobs"; aws_config=aws)["QueueUrl"]
+    slow_queue_url = SQS.create_queue("pkgeval-jobs-slow"; aws_config=aws)["QueueUrl"]
     S3.create_bucket("pkgeval-results"; aws_config=aws)
 
-    cfg = FarmConfig(; region="us-east-1", queue_url, runs_table="pkgeval-runs",
+    cfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
+                     runs_table="pkgeval-runs",
                      jobs_table="pkgeval-jobs", bucket="pkgeval-results")
     ctx = FarmCtx(cfg, aws)
 
@@ -95,7 +98,7 @@ try
         @test claimed isa PEF.ClaimedExpand
         @test claimed.run_id == run_id
         @test PEF.expand_run(ctx, run_id, String.(run["packages"])) == 6
-        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "active"
@@ -194,7 +197,7 @@ try
         expand_claim = PEF.claim_job(ctx; wait=1)
         @test expand_claim isa PEF.ClaimedExpand
         PEF.expand_run(ctx, run_id, ["Broken"])
-        SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
+        SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
         for attempt in 1:3
             claimed = PEF.claim_job(ctx; wait=1)
             @test claimed !== nothing
@@ -231,7 +234,7 @@ try
         # what a worker does after computing the package set
         njobs = PEF.expand_run(ctx, run_id, ["Example", "JSON"])
         @test njobs == 4
-        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "active"
@@ -286,7 +289,7 @@ try
         end
         @test claimed isa PEF.ClaimedExpand
         @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
-        SQS.delete_message(queue_url, claimed.receipt_handle; aws_config=aws)
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
         jobs = PEF.run_jobs(ctx, run_id)
         @test length(jobs) == 2
@@ -294,8 +297,43 @@ try
         @test all(j -> !haskey(j, "reused_from"), jobs)
         @test PEF.get_run(ctx, run_id)["completed_jobs"] == 0
 
-        # drain, so later testsets start from an empty queue
-        for _ in 1:4
+        # drain, so later testsets start from an empty queue (stale duplicates
+        # from earlier testsets may be swallowed along the way)
+        for _ in 1:12
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+        end
+        @test PEF.get_run(ctx, run_id)["status"] == "done"
+    end
+
+    @testset "slow queue has priority" begin
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Zebra"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        expand = nothing
+        for _ in 1:10
+            expand = PEF.claim_job(ctx; wait=1)
+            expand isa PEF.ClaimedExpand && break
+        end
+        @test expand isa PEF.ClaimedExpand
+        @test expand.queue_url == slow_queue_url   # expand messages ride the slow queue
+        @test PEF.expand_run(ctx, run_id, ["Zebra"]) == 2
+        SQS.delete_message(expand.queue_url, expand.receipt_handle; aws_config=aws)
+
+        # duplicate one job onto the slow queue: despite being sent *after* the
+        # fast-queue messages, it must be claimed first
+        PEF.enqueue_jobs(ctx, [PEF.JobRef(run_id, "against", "Zebra")];
+                         queue_url=PEF.slow_queue(cfg))
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedJob
+        @test claimed.queue_url == PEF.slow_queue(cfg)
+        @test claimed.job.config == "against" && claimed.job.package == "Zebra"
+        PEF.heartbeat(ctx, claimed)   # visibility ops target the right queue
+        PEF.record_result(ctx, claimed, PEF.JobResult(; status="test", duration=1.0))
+
+        # drain the fast queue: one real job plus one now-stale duplicate
+        for _ in 1:12
             PEF.get_run(ctx, run_id)["status"] == "done" && break
             c = PEF.claim_job(ctx; wait=1)
             c isa PEF.ClaimedJob || continue
@@ -396,7 +434,7 @@ try
             expand_claim = PEF.claim_job(ctx; wait=1)
             @test expand_claim isa PEF.ClaimedExpand
             PEF.expand_run(ctx, run_id, ["Example"])
-            SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
+            SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
             for _ in 1:20  # claim_job also returns nothing for swallowed duplicates
                 PEF.get_run(ctx, run_id)["status"] == "done" && break
                 c = PEF.claim_job(ctx; wait=1)
@@ -494,7 +532,7 @@ try
             expand_claim = PEF.claim_job(ctx; wait=1)
             @test expand_claim isa PEF.ClaimedExpand
             PEF.expand_run(ctx, webhook_run_id, ["Example"])
-            SQS.delete_message(queue_url, expand_claim.receipt_handle; aws_config=aws)
+            SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
             for _ in 1:20
                 PEF.get_run(ctx, webhook_run_id)["status"] == "done" && break
                 c = PEF.claim_job(ctx; wait=1)
@@ -522,6 +560,57 @@ try
         finally
             close(server)
         end
+    end
+
+    @testset "fleet drain (scale-in protection)" begin
+        # a two-instance ASG in moto, with this "worker" playing the newest one
+        Auto_Scaling.create_launch_configuration("pkgeval-lc",
+            Dict{String,Any}("ImageId" => "ami-12345678", "InstanceType" => "m5.large");
+            aws_config=aws)
+        Auto_Scaling.create_auto_scaling_group("pkgeval-test-asg", 4, 0, Dict{String,Any}(
+            "DesiredCapacity" => 2, "LaunchConfigurationName" => "pkgeval-lc",
+            "AvailabilityZones" => ["us-east-1a"],
+            "NewInstancesProtectedFromScaleIn" => true); aws_config=aws)
+        resp = Auto_Scaling.describe_auto_scaling_groups(
+            Dict{String,Any}("AutoScalingGroupNames" => ["pkgeval-test-asg"]); aws_config=aws)
+        group = resp["DescribeAutoScalingGroupsResult"]["AutoScalingGroups"]["member"]
+        insts = group["Instances"]["member"]
+        ids = sort!([String(m["InstanceId"]) for m in insts])
+        @test length(ids) == 2
+
+        protected(id) = begin
+            r = Auto_Scaling.describe_auto_scaling_groups(
+                Dict{String,Any}("AutoScalingGroupNames" => ["pkgeval-test-asg"]); aws_config=aws)
+            ms = r["DescribeAutoScalingGroupsResult"]["AutoScalingGroups"]["member"]["Instances"]["member"]
+            only(filter(m -> m["InstanceId"] == id, ms))["ProtectedFromScaleIn"] == "true"
+        end
+
+        @test PEF.drain_decision(0, 1, 32)          # newest of two, empty queue
+        @test !PEF.drain_decision(0, 0, 32)         # the oldest never drains
+        @test !PEF.drain_decision(64, 1, 32)        # plenty of work: keep claiming
+        @test PEF.drain_decision(31, 1, 32)
+
+        fleet = PEF.FleetDrain(; asg="pkgeval-test-asg", instance_id=last(ids), slots=32)
+        @test PEF.fleet_rank(ctx, fleet) == (1, 2)  # newest by id order
+
+        # empty queues + no running jobs => drain and unprotect
+        @test PEF.pause_claiming!(ctx, fleet, 0)
+        @test !protected(last(ids))
+        @test protected(first(ids))                 # only ourselves, never others
+
+        # work appears => resume and re-protect (reset the check throttle)
+        PEF.enqueue_jobs(ctx, [PEF.JobRef("nonexistent-run", "primary", "P$i") for i in 1:40])
+        fleet.last_check = 0.0
+        @test !PEF.pause_claiming!(ctx, fleet, 0)
+        @test protected(last(ids))
+
+        # busy instance never unprotects, even while told to drain
+        for _ in 1:40   # drop the fake messages (claim_job swallows them)
+            PEF.claim_job(ctx; wait=0) === nothing || break
+        end
+        fleet.last_check = 0.0
+        @test PEF.pause_claiming!(ctx, fleet, 3)    # draining again (queue empty)...
+        @test protected(last(ids))                  # ...but 3 jobs still running
     end
 
     @testset "broker STS against moto" begin

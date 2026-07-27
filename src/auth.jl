@@ -205,7 +205,9 @@ function lite_ctx_provider(; broker::Union{AbstractString,Nothing}=nothing,
                 region=cfg["region"],
                 creds=FarmLite.AwsCreds(c["access_key_id"], c["secret_access_key"],
                                         c["session_token"]),
-                queue_url=cfg["queue_url"], runs_table=cfg["runs_table"],
+                queue_url=cfg["queue_url"],
+                slow_queue_url=String(get(cfg, "slow_queue_url", "")),
+                runs_table=cfg["runs_table"],
                 jobs_table=cfg["jobs_table"], bucket=cfg["bucket"])
             expires[] = parse_expiration(c["expiration"])
         end

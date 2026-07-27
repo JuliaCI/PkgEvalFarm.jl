@@ -80,6 +80,37 @@ resource "aws_iam_role_policy" "ec2_worker_sysimage" {
   })
 }
 
+# Fleet-drain coordination (src/worker.jl): the worker manages its *own*
+# scale-in protection and reads fleet membership + queue depth. Describe* has
+# no resource-level scoping in the AutoScaling API; SetInstanceProtection is
+# pinned to this one ASG (by its well-known name, to keep the graph acyclic).
+resource "aws_iam_role_policy" "ec2_worker_fleet" {
+  count = local.ec2_workers
+  name  = "fleet-drain"
+  role  = aws_iam_role.ec2_worker[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "autoscaling:SetInstanceProtection"
+        Resource = "arn:aws:autoscaling:${var.region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name_prefix}-ec2-worker"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = "sqs:GetQueueAttributes"
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
+      },
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "ec2_worker" {
   count = local.ec2_workers
   name  = "${var.name_prefix}-ec2-worker"
@@ -182,8 +213,11 @@ resource "aws_launch_template" "ec2_worker" {
   }
 
   user_data = base64encode(templatefile("${path.module}/ec2_worker_userdata.sh.tpl", {
-    region        = var.region
-    queue_url     = aws_sqs_queue.jobs.url
+    region         = var.region
+    queue_url      = aws_sqs_queue.jobs.url
+    slow_queue_url = aws_sqs_queue.jobs_slow.url
+    # by name, not reference: the launch template cannot depend on the ASG
+    asg_name = "${var.name_prefix}-ec2-worker"
     runs_table    = aws_dynamodb_table.runs.name
     jobs_table    = aws_dynamodb_table.jobs.name
     bucket        = aws_s3_bucket.results.bucket
@@ -217,6 +251,13 @@ resource "aws_autoscaling_group" "ec2_worker" {
 
   # the scale-out policy divides queue backlog by this metric
   enabled_metrics = ["GroupInServiceInstances"]
+
+  # Gradual scale-down: instances launch protected from scale-in and the worker
+  # removes its own protection once it has drained (and re-protects when it
+  # claims again) — see fleet drain in src/worker.jl. The idle policy can then
+  # fire on an *empty queue* alone: it only ever reaps drained instances, so
+  # stragglers running elsewhere no longer pin the whole fleet.
+  protect_from_scale_in = true
 
   mixed_instances_policy {
     instances_distribution {
@@ -276,6 +317,21 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         }
       }
       metrics {
+        id          = "backlog_slow"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesVisible"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs_slow.name
+            }
+          }
+        }
+      }
+      metrics {
         id          = "instances"
         return_data = false
         metric_stat {
@@ -295,7 +351,7 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         # CloudWatch metric math has no element-wise MAX against a constant, and
         # dividing by a zero instance count yields no data — guard with IF.
         # (Scaling up from zero is the kickstart policy's job, below.)
-        expression  = "IF(instances > 0, backlog / instances, backlog)"
+        expression  = "IF(instances > 0, (backlog + backlog_slow) / instances, backlog + backlog_slow)"
         label       = "queue backlog per in-service worker"
         return_data = true
       }
@@ -327,6 +383,17 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_kickstart" {
     }
   }
   metric_query {
+    id          = "backlog_slow"
+    return_data = false
+    metric {
+      namespace   = "AWS/SQS"
+      metric_name = "ApproximateNumberOfMessagesVisible"
+      period      = 60
+      stat        = "Average"
+      dimensions  = { QueueName = aws_sqs_queue.jobs_slow.name }
+    }
+  }
+  metric_query {
     id          = "instances"
     return_data = false
     metric {
@@ -341,7 +408,7 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_kickstart" {
     id = "needs_kickstart"
     # metric math has no AND: comparisons yield 0/1 series, so multiply them.
     # FILL covers the gap before the ASG has published any instance metric.
-    expression  = "(backlog > 0) * (FILL(instances, 0) < 1)"
+    expression  = "(backlog + backlog_slow > 0) * (FILL(instances, 0) < 1)"
     label       = "queue waiting with no workers"
     return_data = true
   }
@@ -369,7 +436,10 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_idle" {
   threshold           = 0
   evaluation_periods  = max(1, ceil(var.ec2_worker_idle_minutes / 5))
   treat_missing_data  = "breaching"
-  alarm_description   = "Job queue idle (no visible or in-flight messages)"
+  # visible only, deliberately: in-flight jobs are represented by their
+  # instances' scale-in protection, so drained machines are reclaimed while
+  # stragglers finish elsewhere instead of the fleet waiting on the last job
+  alarm_description   = "Job queues empty (in-flight work is covered by scale-in protection)"
   alarm_actions       = [aws_autoscaling_policy.ec2_worker_idle[0].arn]
 
   metric_query {
@@ -384,20 +454,20 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_idle" {
     }
   }
   metric_query {
-    id          = "inflight"
+    id          = "visible_slow"
     return_data = false
     metric {
       namespace   = "AWS/SQS"
-      metric_name = "ApproximateNumberOfMessagesNotVisible"
+      metric_name = "ApproximateNumberOfMessagesVisible"
       period      = 300
       stat        = "Maximum"
-      dimensions  = { QueueName = aws_sqs_queue.jobs.name }
+      dimensions  = { QueueName = aws_sqs_queue.jobs_slow.name }
     }
   }
   metric_query {
     id          = "total"
-    expression  = "visible + inflight"
-    label       = "total queued + running jobs"
+    expression  = "visible + visible_slow"
+    label       = "total visible jobs across both queues"
     return_data = true
   }
 }

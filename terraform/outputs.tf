@@ -72,3 +72,8 @@ output "build_request_url" {
   description = "Function URL workers call to request a Julia build (empty when disabled)."
   value       = length(aws_lambda_function_url.build_request) > 0 ? aws_lambda_function_url.build_request[0].function_url : ""
 }
+
+output "slow_queue_url" {
+  description = "URL of the long-jobs queue (workers drain it before the main queue)."
+  value       = aws_sqs_queue.jobs_slow.url
+}

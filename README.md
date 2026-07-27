@@ -146,6 +146,12 @@ by default active members of the submitter team, or (with
 check was disabled in 2021, leaving it open to any commenter; this bot
 deliberately does not replicate that.
 
+**Straggler avoidance**: long jobs are routed to a separate slow queue that
+workers drain first, so they start while plenty of short work remains to
+backfill behind them; the duration cutoff is computed per run from estimates
+out of recent completed runs. The end-of-run tail is thereby bounded by the
+cutoff instead of by the slowest package.
+
 **Baseline reuse**: when the `against` side of a run is an exact commit or
 release that an earlier completed run also evaluated (with identical settings),
 those results are reused instead of re-evaluated — the bot pins branch specs
