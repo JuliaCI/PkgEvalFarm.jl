@@ -414,7 +414,12 @@ function ssm_parameter(ctx::LiteCtx, name::String)
     result.Parameter === nothing && error("no such SSM parameter: $name")
     value = something(result.Parameter).Value
     value === nothing && error("SSM parameter has no value: $name")
-    return something(value)
+    # Secrets never legitimately carry surrounding whitespace, and a trailing
+    # newline (easy to store by accident) is catastrophic downstream: inside an
+    # Authorization header it terminates the HTTP header block early, so the
+    # request authenticates but loses its remaining headers and body. Seen
+    # live: Buildkite answering "Problems parsing JSON" to a build trigger.
+    return String(strip(something(value)))
 end
 
 

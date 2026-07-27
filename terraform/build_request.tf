@@ -186,9 +186,11 @@ resource "aws_iam_policy" "request_builds" {
         Effect   = "Allow"
         Action   = "lambda:InvokeFunctionUrl"
         Resource = aws_lambda_function.build_request[0].arn
-        Condition = {
-          StringEquals = { "lambda:FunctionUrlAuthType" = "AWS_IAM" }
-        }
+        # no FunctionUrlAuthType condition: real InvokeFunctionUrl evaluation
+        # does not populate that key (verified live: with the condition the
+        # worker role got 403 while iam simulate-principal-policy — which only
+        # sees keys the caller supplies — said "allowed"). The resource pin to
+        # this one function is the guarantee that matters; its URL is AWS_IAM.
       }
     ]
   })
