@@ -698,6 +698,69 @@ try
             lctx2, gh_stub)
         @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2
 
+        # a dead message whose Julia build is still pending gets RECYCLED:
+        # re-enqueued with a fresh receive budget, job untouched
+        shacfg = [PkgEval.Configuration(; name="primary",
+                      julia="JuliaLang/julia#1234567890abcdef1234567890abcdef12345678")]
+        run3 = PEF.create_run(ctx, PEF.RunSpec(shacfg, ["Waiting"], Dict{String,Any}());
+                              submitter="tester", reuse=false)
+        expand3 = nothing
+        for _ in 1:10
+            expand3 = PEF.claim_job(ctx; wait=1)
+            expand3 isa PEF.ClaimedExpand && break
+        end
+        PEF.expand_run(ctx, run3, ["Waiting"])
+        SQS.delete_message(expand3.queue_url, expand3.receipt_handle; aws_config=aws)
+        c3 = PEF.claim_job(ctx; wait=1)   # take the job in flight (like a worker would)
+        @test c3 isa PEF.ClaimedJob
+
+        # a fresh build claim => the dead message must be recycled, not buried
+        Dynamodb.put_item(Dict(
+            "build_key" => Dict("S" => "1234567890abcdef1234567890abcdef12345678/linux"),
+            "requested_at" => Dict("S" => PEF.FarmBot.isodate()),
+            "status" => Dict("S" => "requested")), "pkgeval-builds"; aws_config=aws)
+        withenv("PKGEVAL_BUILDS_TABLE" => "pkgeval-builds") do
+            PEF.FarmBot.handle_event(
+                sqs_event(["{\"run_id\":\"$run3\",\"config\":\"primary\",\"package\":\"Waiting\"}"]),
+                lctx2, gh_stub)
+        end
+        job3 = only(PEF.run_jobs(ctx, run3))
+        @test job3["status"] == "running"              # untouched, not errored
+        @test PEF.get_run(ctx, run3)["status"] == "active"
+        recycled = PEF.claim_job(ctx; wait=1)          # the re-enqueued message
+        @test recycled isa PEF.ClaimedJob
+        @test recycled.job.package == "Waiting"
+        PEF.record_result(ctx, recycled, PEF.JobResult(; status="test", duration=1.0))
+        PEF.release_job(ctx, c3; delay=0)
+        for _ in 1:4                                    # swallow the stale duplicate
+            PEF.claim_job(ctx; wait=1) === nothing && break
+        end
+
+        # a stale claim (old requested_at) no longer shields the message
+        Dynamodb.put_item(Dict(
+            "build_key" => Dict("S" => "1234567890abcdef1234567890abcdef12345678/linux"),
+            "requested_at" => Dict("S" => "2020-01-01T00:00:00Z"),
+            "status" => Dict("S" => "requested")), "pkgeval-builds"; aws_config=aws)
+        run4 = PEF.create_run(ctx, PEF.RunSpec(shacfg, ["Doomed"], Dict{String,Any}());
+                              submitter="tester", reuse=false)
+        expand4 = nothing
+        for _ in 1:10
+            expand4 = PEF.claim_job(ctx; wait=1)
+            expand4 isa PEF.ClaimedExpand && break
+        end
+        PEF.expand_run(ctx, run4, ["Doomed"])
+        SQS.delete_message(expand4.queue_url, expand4.receipt_handle; aws_config=aws)
+        withenv("PKGEVAL_BUILDS_TABLE" => "pkgeval-builds") do
+            PEF.FarmBot.handle_event(
+                sqs_event(["{\"run_id\":\"$run4\",\"config\":\"primary\",\"package\":\"Doomed\"}"]),
+                lctx2, gh_stub)
+        end
+        @test only(PEF.run_jobs(ctx, run4))["status"] == "error"
+        @test PEF.get_run(ctx, run4)["status"] == "done"
+        for _ in 1:4                                    # drain run4's job message
+            PEF.claim_job(ctx; wait=1) === nothing && break
+        end
+
         # a dead *expand* message fails the whole run
         run2 = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], String[], Dict{String,Any}());
                               submitter="tester", reuse=false)

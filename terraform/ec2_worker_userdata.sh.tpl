@@ -266,7 +266,7 @@ cat >/usr/local/bin/pkgeval-spot-watch <<'SPOT'
 #!/bin/bash
 while true; do
     TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token                  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
-    CODE=$(curl -s -o /dev/null -w '%{http_code}'                 -H "X-aws-ec2-metadata-token: $TOKEN"                 http://169.254.169.254/latest/meta-data/spot/instance-action)
+    CODE=$(curl -s -o /dev/null -w '%%{http_code}'                 -H "X-aws-ec2-metadata-token: $TOKEN"                 http://169.254.169.254/latest/meta-data/spot/instance-action)
     if [ "$CODE" = "200" ]; then
         echo "spot interruption notice received; draining the worker"
         systemctl stop pkgeval-worker

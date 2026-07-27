@@ -145,6 +145,9 @@ resource "aws_lambda_function" "bot" {
       PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
       PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket
+      # lets the DLQ consumer recognize (and recycle) messages that are only
+      # waiting on a pending CI build; empty when build requests are disabled
+      PKGEVAL_BUILDS_TABLE = local.build_request_enabled == 1 ? aws_dynamodb_table.builds[0].name : ""
       FARM_REGION        = var.region
     }
   }
@@ -233,6 +236,12 @@ resource "aws_iam_role_policy" "bot_dlq" {
         Effect   = "Allow"
         Action   = "dynamodb:UpdateItem"
         Resource = aws_dynamodb_table.jobs.arn
+      },
+      {
+        # checking whether a dead message is merely waiting on a pending build
+        Effect   = "Allow"
+        Action   = "dynamodb:GetItem"
+        Resource = concat([aws_dynamodb_table.jobs.arn], aws_dynamodb_table.builds[*].arn)
       },
     ]
   })

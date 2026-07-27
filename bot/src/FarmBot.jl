@@ -717,6 +717,16 @@ function handle_dead_message(ctx::LiteCtx, gh::GitHubCtx, raw::String)
     ref = parse_json(raw, DeadRef)
     ref.run_id === nothing && return
     run_id = something(ref.run_id)
+    # A message that died *because its Julia build is still being made* is not
+    # dead — the queue's receive budget is just shorter than a CI build. While
+    # the build is legitimately pending, re-enqueue the original message (a
+    # fresh message, so a fresh budget): the DLQ recycles instead of burying.
+    if waiting_on_build(ctx, ref)
+        sqs_send_message(ctx, raw;
+                         queue_url=ref.expand ? FarmLite.slow_queue(ctx) : ctx.queue_url)
+        @info "recycled dead message: its Julia build is still pending" run_id
+        return nothing
+    end
     if ref.expand
         # the run can never expand; fail it and tell the submitter
         mark_run_failed(ctx, gh, run_id,
@@ -904,6 +914,81 @@ function json_make(::Type{ConfigInfo}, x::LazyVal)
     end
     return ConfigInfo(name[], julia[], buildflags[]), pos::Int
 end
+
+# staging buckets, probed for a finished build whose claim record has aged out
+const STAGING_BUCKET_URLS = ["https://julialang-ephemeral-ci.s3.amazonaws.com",
+                             "https://julialang-ephemeral-pr.s3.amazonaws.com",
+                             "https://julialang-ephemeral-request.s3.amazonaws.com"]
+
+# a claim younger than this is "a build in progress"; older claims without a
+# staged artifact mean the build died, and the job should fail normally
+const BUILD_CLAIM_FRESH_SECONDS = 3 * 60 * 60
+
+"The (sha, variant) a config would need built, or nothing if not requestable."
+function build_key_of(config::ConfigInfo)
+    julia = config.julia
+    julia === nothing && return nothing
+    m = match(r"#([0-9a-f]{40})$", something(julia))
+    m === nothing && return nothing
+    flags = something(config.buildflags, String[])
+    variant = isempty(flags) ? "linux" :
+              Set(flags) == Set(["LLVM_ASSERTIONS=1", "FORCE_ASSERTIONS=1"]) ? "linuxassert" :
+              nothing
+    variant === nothing && return nothing
+    return (String(something(m.captures[1])), String(something(variant)))
+end
+
+"Whether the dead message's evaluation is blocked on a still-pending CI build."
+function waiting_on_build(ctx::LiteCtx, ref::DeadRef)
+    table = get(ENV, "PKGEVAL_BUILDS_TABLE", "")::String
+    run = try
+        get_run(ctx, something(ref.run_id))
+    catch
+        return false
+    end
+    configs = parse_json(str(run, "configs", "[]"), Vector{ConfigInfo})
+    for config in configs
+        # an expand message needs every config's Julia; a job message only its
+        # own — but recycling on any pending build errs harmlessly long
+        ref.expand || config.name === nothing ||
+            something(config.name) == something(ref.config, "") || continue
+        key = build_key_of(config)
+        key === nothing && continue
+        sha, variant = key
+        if !isempty(table)
+            claim = try
+                payload = "{\"TableName\":$(JSON.json(table))," *
+                          "\"Key\":{\"build_key\":{\"S\":$(JSON.json(string(sha, "/", variant)))}}}"
+                parse_json(ddb(ctx, "GetItem", payload), ItemResp).Item
+            catch
+                nothing
+            end
+            if claim !== nothing
+                requested = str(something(claim), "requested_at", "")
+                # our ISO timestamps sort lexicographically, so freshness is a
+                # string comparison — Dates *parsing* is untrimmable (its error
+                # formatter), while Dates *formatting* is fine (isodate uses it)
+                cutoff = Dates.format(
+                    Dates.now(Dates.UTC) - Dates.Second(BUILD_CLAIM_FRESH_SECONDS),
+                    Dates.dateformat"yyyy-mm-dd\THH:MM:SS\Z")
+                (!isempty(requested) && requested >= cutoff) && return true
+            end
+        end
+        # a finished build whose claim aged out: if it is staged, the retry
+        # will succeed, so the message deserves recycling too
+        filename = "julia-$(sha[1:10])-$(variant)-x86_64.tar.gz"
+        for base in STAGING_BUCKET_URLS
+            resp = try
+                http_request("HEAD", "$base/bin/$sha/$filename")
+            catch
+                continue
+            end
+            resp.status == 200 && return true
+        end
+    end
+    return false
+end
+
 
 function json_make(::Type{Vector{ConfigInfo}}, x::LazyVal)
     jsontype(x) == JSON.JSONTypes.ARRAY || json_expected("array")
