@@ -4,6 +4,9 @@
 resource "aws_sqs_queue" "jobs_dlq" {
   name                      = "${var.name_prefix}-jobs-dlq"
   message_retention_seconds = 14 * 24 * 60 * 60 # 14 days
+  # the bot consumes this queue via an event-source mapping, and Lambda
+  # requires the source queue's visibility to cover the function timeout
+  visibility_timeout_seconds = 1800
 }
 
 resource "aws_sqs_queue" "jobs" {
