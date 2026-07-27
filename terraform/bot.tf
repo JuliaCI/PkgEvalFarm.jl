@@ -1,4 +1,4 @@
-# The @nanosoldier2 bot Lambda: invoked on a schedule by EventBridge, each
+# The @pkgeval bot Lambda: invoked on a schedule by EventBridge, each
 # invocation polls GitHub notifications for runtests() commands, submits runs,
 # and posts reports for finished runs. Only created when a bot token is set.
 #

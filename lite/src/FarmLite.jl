@@ -1,6 +1,6 @@
 """
 FarmLite: a deliberately tiny, stdlib-only (+ JSON.jl) AWS/GitHub client shared by
-the farm's juliac-compiled Lambdas (credential broker, @nanosoldier2 bot).
+the farm's juliac-compiled Lambdas (credential broker, @pkgeval bot).
 
 Not a package — `include` this file and `using .FarmLite`. Anything heavier (the
 worker, the CLI) should use AWS.jl instead; this exists only because a trimmed static

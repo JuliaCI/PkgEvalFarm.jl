@@ -5,15 +5,15 @@ variable "name_prefix" {
 }
 
 variable "region" {
-  description = "AWS region to deploy into."
+  description = "AWS region to deploy into. us-east-2: spot capacity for our instance class runs 25-30% cheaper than us-east-1 (serverless pricing is identical); the julia build staging buckets stay in us-east-1, but cross-region build downloads cost pennies."
   type        = string
-  default     = "us-east-1"
+  default     = "us-east-2"
 }
 
 variable "bucket_name" {
-  description = "Name of the S3 bucket that stores PkgEval results (reports, logs, artifacts)."
+  description = "Name of the S3 bucket that stores PkgEval results (reports, logs, artifacts). Also prefixes the Lambda deploy bucket (\"<name>-lambda\")."
   type        = string
-  default     = "nanosoldier2"
+  default     = "pkgeval"
 }
 
 variable "github_org" {

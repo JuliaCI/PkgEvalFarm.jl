@@ -18,11 +18,13 @@ permissions:
 # repository variables — the workflow is then self-contained and a redeployment
 # elsewhere is a one-file edit.
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-2
   AWS_DEPLOY_ROLE: arn:aws:iam::873569884612:role/pkgeval-deploy
-  LAMBDA_BUCKET: nanosoldier2-lambda
+  LAMBDA_BUCKET: pkgeval-lambda
   NAME_PREFIX: pkgeval
-  BROKER_URL: https://xxwaguxec43lrpm2f74o4uftmy0wbxxd.lambda-url.us-east-1.on.aws
+  # empty skips the broker smoke test; fill in the broker_function_url output
+  # after the first apply in a fresh region
+  BROKER_URL: ''
 
 jobs:
   test:

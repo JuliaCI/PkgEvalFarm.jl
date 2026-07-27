@@ -165,7 +165,7 @@ itself would still be a welcome belt-and-braces improvement.
 | Name | Required | Default | Description |
 | ---- | -------- | ------- | ----------- |
 | `name_prefix` | no | `"pkgeval"` | Prefix for naming all resources. |
-| `region` | no | `"us-east-1"` | AWS region to deploy into. |
+| `region` | no | `"us-east-2"` | AWS region to deploy into. |
 | `bucket_name` | **yes** | — | S3 bucket for PkgEval results. |
 | `github_org` | **yes** | — | GitHub organization whose teams gate access. |
 | `worker_team` | no | `"pkgeval-workers"` | Team slug allowed to run workers. |
@@ -214,6 +214,14 @@ itself would still be a welcome belt-and-braces improvement.
 
 Re-run steps 1–2 whenever the broker code changes; the `source_code_hash`
 picks up the new zip automatically.
+
+**Changing regions**: never flip `region` against existing state — refresh
+would look in the new region, find nothing, and plan a full re-create while
+orphaning the still-running old stack. `tofu destroy` with the *old* region
+first, then change the variable and apply fresh. Rename the buckets in the
+same move (S3's global namespace releases deleted names only after an
+unbounded delay), and re-create the SSM secret parameters in the new region —
+SecureStrings are set out of band and are not carried by terraform.
 
 ## Build portability note
 
