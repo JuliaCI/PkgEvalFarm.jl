@@ -590,6 +590,9 @@ try
         @test haskey(req.headers, "authorization")
         @test startswith(req.headers["authorization"], "AWS4-HMAC-SHA256")
         @test haskey(req.headers, "x-amz-date")
+        # Function URLs 403 anything without a signed payload hash
+        @test haskey(req.headers, "x-amz-content-sha256")
+        @test occursin("x-amz-content-sha256", req.headers["authorization"])
 
         # no broker configured => explicit failure, no exception
         @test !PEF.request_julia_build(ctx, miss)

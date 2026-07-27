@@ -253,7 +253,10 @@ function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
         body, region=String(region), service="lambda",
         creds=FarmLite.AwsCreds(c.access_key_id, c.secret_key,
                                 isempty(c.token) ? nothing : c.token),
-        content_type="application/json")
+        content_type="application/json",
+        # Function URLs, like S3, refuse SigV4 requests without a signed
+        # payload-hash header (403 before the function ever runs)
+        extra_headers=["x-amz-content-sha256" => FarmLite.hexdigest(body)])
     resp = HTTP.post(url, headers, body; status_exception=false)
     ok = resp.status in (200, 202)
     if ok
