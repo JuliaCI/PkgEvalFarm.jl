@@ -139,9 +139,14 @@ function trigger_build(token::String, org::String, pipeline::String,
     # `branch` is required by the API but the agent checks out `commit`; naming
     # it after the sha keeps the build list readable and avoids implying the
     # commit is on master.
+    # ignore_pipeline_branch_filters: the pipeline has branch builds disabled
+    # (it is API-only by design), and Buildkite applies that filter to
+    # API-created builds too — 422 "Branches have been disabled" without it.
+    # Documented in julia-buildkite's pipelines/build_request/0_webui.yml.
     payload = "{\"commit\":$(JSON.json(sha))," *
               "\"branch\":$(JSON.json(sha))," *
               "\"message\":$(JSON.json("PkgEval build request ($variant)"))," *
+              "\"ignore_pipeline_branch_filters\":true," *
               "\"env\":{\"PKGEVAL_BUILD_VARIANT\":$(JSON.json(variant))}}"
     url = "https://api.buildkite.com/v2/organizations/$org/pipelines/$pipeline/builds"
     resp = http_request("POST", url;
