@@ -79,9 +79,12 @@ resource "aws_iam_role_policy" "build_request" {
         Resource = aws_ssm_parameter.buildkite_token[0].arn
       },
       {
-        Sid      = "DeduplicateRequests"
-        Effect   = "Allow"
-        Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Sid    = "DeduplicateRequests"
+        Effect = "Allow"
+        Action = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem",
+          # a claim whose Buildkite trigger failed is released (deleted) so the
+          # next asker retries instead of no-oping on a poisoned record
+        "dynamodb:DeleteItem"]
         Resource = aws_dynamodb_table.builds[0].arn
       },
       {
@@ -146,10 +149,11 @@ resource "aws_lambda_function" "build_request" {
   }
 }
 
-# AWS_IAM: unauthenticated callers get 403 outright. Authorization is then
-# two-sided -- the identity policy below grants workers the action, and the
-# resource policy here names the only principals allowed to use it, so a stray
-# grant elsewhere in the account cannot reach this function.
+# AWS_IAM: unauthenticated callers get 403 outright. Within the account,
+# authorization comes from identity policies (only the worker roles hold
+# lambda:InvokeFunctionUrl on this function); the resource policy below is an
+# additional grant for those same roles, NOT a filter — same-account callers
+# with their own identity grant (i.e. admins) can always invoke.
 resource "aws_lambda_function_url" "build_request" {
   count              = local.build_request_enabled
   function_name      = aws_lambda_function.build_request[0].function_name

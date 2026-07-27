@@ -124,6 +124,14 @@ function claim_build(ctx::LiteCtx, table::String, key::String, requester::String
     end
 end
 
+"Release a claim whose trigger failed, so the next asker retries the trigger."
+function release_build_claim(ctx::LiteCtx, table::String, key::String)
+    payload = "{\"TableName\":$(JSON.json(table))," *
+              "\"Key\":{\"build_key\":{\"S\":$(JSON.json(key))}}}"
+    ddb(ctx, "DeleteItem", payload)
+    return nothing
+end
+
 "Ask Buildkite to build one commit. The token's reach is bounded by the machine user's team access."
 function trigger_build(token::String, org::String, pipeline::String,
                        sha::String, variant::String)
@@ -175,9 +183,23 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
         return json_response(200, "{\"status\":\"already-requested\"}")
     end
 
-    trigger_build(ssm_parameter(ctx, ENV["BUILDKITE_TOKEN_PARAM"]::String),
-                  ENV["BUILDKITE_ORG"]::String, ENV["BUILDKITE_PIPELINE"]::String,
-                  commit, variant)
+    # The claim is taken *before* the trigger (that is what makes it a dedup),
+    # so a failed trigger must release it — otherwise one bad Buildkite call
+    # poisons the key and every later ask no-ops as "already-requested"
+    # forever. Seen live on the very first request.
+    try
+        trigger_build(ssm_parameter(ctx, ENV["BUILDKITE_TOKEN_PARAM"]::String),
+                      ENV["BUILDKITE_ORG"]::String, ENV["BUILDKITE_PIPELINE"]::String,
+                      commit, variant)
+    catch
+        try
+            release_build_claim(ctx, table, key)
+        catch release_err
+            println(Core.stderr, "failed to release build claim for " * key * ": " *
+                                 error_message(release_err))
+        end
+        rethrow()
+    end
     return json_response(202, "{\"status\":\"requested\"}")
 end
 

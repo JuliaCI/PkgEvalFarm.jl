@@ -599,6 +599,27 @@ try
         close(server)
     end
 
+    @testset "build-request claim/release" begin
+        # BuildRequest's dedup: claimed once, poisoned claims releasable
+        Dynamodb.create_table([Dict("AttributeName" => "build_key", "AttributeType" => "S")],
+                              [Dict("AttributeName" => "build_key", "KeyType" => "HASH")],
+                              "pkgeval-builds", Dict("BillingMode" => "PAY_PER_REQUEST");
+                              aws_config=aws)
+        m = Module()
+        Base.include(m, joinpath(@__DIR__, "..", "buildreq", "src", "BuildRequest.jl"))
+        BuildRequest = getfield(m, :BuildRequest)
+        FL = BuildRequest.FarmLite
+        lctx = FL.LiteCtx(; region="us-east-1",
+                          creds=FL.AwsCreds("testing", "testing", nothing),
+                          queue_url="unused", runs_table="unused", jobs_table="unused",
+                          bucket="unused", endpoint="http://127.0.0.1:$port")
+        key = "abc123/linux"
+        @test BuildRequest.claim_build(lctx, "pkgeval-builds", key, "test")
+        @test !BuildRequest.claim_build(lctx, "pkgeval-builds", key, "test")  # deduped
+        BuildRequest.release_build_claim(lctx, "pkgeval-builds", key)
+        @test BuildRequest.claim_build(lctx, "pkgeval-builds", key, "test")  # retryable
+    end
+
     @testset "fleet drain (scale-in protection)" begin
         # a two-instance ASG in moto, with this "worker" playing the newest one
         Auto_Scaling.create_launch_configuration("pkgeval-lc",
