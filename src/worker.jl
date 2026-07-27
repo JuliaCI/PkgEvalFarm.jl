@@ -231,6 +231,7 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
     now = time()
     if now - fleet.last_check >= 60
         fleet.last_check = now
+        heartbeat_generation(ctx)
         try
             backlog = visible_backlog(ctx)
             rank, n = fleet_rank(ctx, fleet)
@@ -259,6 +260,27 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
         @warn "failed to update scale-in protection" err
     end
     return fleet.draining
+end
+
+"""
+Keep the fleet-generation record (see cloud-init) marked live: while any
+worker heartbeats it, newly launched instances join this generation's ref
+instead of starting a new one. Best effort — a missed beat only risks a
+too-early generation rollover, never breakage.
+"""
+function heartbeat_generation(ctx::FarmCtx)
+    try
+        Dynamodb.update_item(ddb_item(Dict("run_id" => "_fleet-generation")),
+            ctx.cfg.runs_table,
+            Dict("ConditionExpression" => "attribute_exists(#r)",
+                 "UpdateExpression" => "SET heartbeat_at = :now",
+                 "ExpressionAttributeNames" => Dict("#r" => "ref"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(":now" => isodate())));
+            aws_config=ctx.aws)
+    catch err
+        is_conditional_failure(err) || @warn "generation heartbeat failed" err
+    end
+    return nothing
 end
 
 "An instance of seniority `rank` (0 = oldest) drains iff the backlog is below `rank` × slots."

@@ -776,6 +776,29 @@ try
         end
     end
 
+    @testset "fleet generation heartbeat" begin
+        # no record => the heartbeat must not create one (cloud-init owns creation)
+        PEF.heartbeat_generation(ctx)
+        resp = Dynamodb.get_item(PEF.ddb_item(Dict("run_id" => "_fleet-generation")),
+                                 "pkgeval-runs"; aws_config=aws)
+        @test !haskey(resp, "Item")
+
+        # with a record, the beat refreshes the timestamp
+        Dynamodb.put_item(PEF.ddb_item(Dict("run_id" => "_fleet-generation",
+                                            "ref" => "abc", "heartbeat_at" => "old")),
+                          "pkgeval-runs"; aws_config=aws)
+        PEF.heartbeat_generation(ctx)
+        resp = Dynamodb.get_item(PEF.ddb_item(Dict("run_id" => "_fleet-generation")),
+                                 "pkgeval-runs"; aws_config=aws)
+        beat = PEF.ddb_parse(resp["Item"])["heartbeat_at"]
+        @test beat != "old" && occursin("T", beat)
+
+        # the sentinel must be invisible to the donor/report scans
+        @test all(t -> t[2] != "_fleet-generation", PEF.completed_runs(ctx))
+        Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => "_fleet-generation")),
+                             "pkgeval-runs"; aws_config=aws)
+    end
+
     @testset "broker STS against moto" begin
         with_env(Dict("AWS_ACCESS_KEY_ID" => "testing", "AWS_SECRET_ACCESS_KEY" => "testing",
                       "FARM_REGION" => "us-east-1", "STS_ENDPOINT" => endpoint)) do

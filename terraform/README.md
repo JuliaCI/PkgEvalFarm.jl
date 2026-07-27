@@ -96,6 +96,18 @@ volumes, via launch-template tag specs and ASG-propagated tags) overrides
 the two pools in Cost Explorer — optionally as Cost Categories, with an AWS
 Budget alert on the workers pool.
 
+**Fleet generations**: every instance of one scale-out runs identical code.
+The first instance of a generation samples the last CI-green sha (the deploy
+job writes it to SSM `/pkgeval/worker-ref` only after all bundles *and* that
+commit's sysimage are published) and records it in the runs table under the
+`_fleet-generation` sentinel with a conditional write; later instances —
+including mid-run spot replacements — join the recorded ref. Workers heartbeat
+the record while alive, so a generation ends only when the fleet scales to
+zero: deploys take effect at the next scale-from-zero, never mid-run, and code
+skew within a fleet is impossible by construction. Protocol changes should
+still stay one-version compatible (messages/queues/schemas), since separate
+farm components (Lambdas, enrolled workers) deploy independently.
+
 **Gradual scale-down**: instances launch with scale-in protection and each
 worker manages its own — dropping it once drained, restoring it on the next
 claim — so the idle policy fires on empty *queues* alone and only ever reaps

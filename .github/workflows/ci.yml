@@ -227,6 +227,14 @@ jobs:
             echo "::notice::published $key"
           done
 
+      - name: Publish the worker deploy ref
+        # the sha workers should run: written only after every bundle and the
+        # sysimage for this commit are published, so a fleet generation that
+        # samples it always gets CI-green code with its sysimage in place
+        run: |
+          aws ssm put-parameter --name /pkgeval/worker-ref --type String \
+            --value "${{ github.sha }}" --overwrite
+
       - name: Smoke-test the broker
         # /info needs no credentials and exercises init end to end, which is
         # exactly what the CPU-target class of bug breaks

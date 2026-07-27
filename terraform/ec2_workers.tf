@@ -103,6 +103,12 @@ resource "aws_iam_role_policy" "ec2_worker_fleet" {
         Resource = "*"
       },
       {
+        # the CI-green sha a new fleet generation starts from
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/pkgeval/worker-ref"
+      },
+      {
         Effect   = "Allow"
         Action   = "sqs:GetQueueAttributes"
         Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]

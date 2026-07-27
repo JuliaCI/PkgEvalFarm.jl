@@ -61,6 +61,39 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.
 sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
 sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
 
+# --- fleet generation --------------------------------------------------------
+# Every instance of one scale-out runs identical code: the first instance of a
+# generation samples the CI-green deploy ref and records it (conditional write
+# settles boot races); later instances — including spot replacements mid-run —
+# join the recorded generation. Workers heartbeat the record while alive, so
+# "stale" means "the fleet scaled to zero"; deploys take effect at the next
+# scale-from-zero, never mid-run. Best effort throughout: any failure leaves
+# the clone at the branch head, which is the pre-generation behavior.
+GEN_KEY='{"run_id":{"S":"_fleet-generation"}}'
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+STALE=$(date -u -d '-10 minutes' +%Y-%m-%dT%H:%M:%SZ)
+
+gen_ref() {
+    aws dynamodb get-item --region ${region} --table-name ${runs_table}         --key "$GEN_KEY" --output text         --query "[item.ref.S, item.heartbeat_at.S] | join(' ', @)" 2>/dev/null || true
+}
+
+GEN=$(gen_ref)
+REF=$${GEN%% *}
+BEAT=$${GEN##* }
+if [ -z "$REF" ] || [ "$BEAT" \< "$STALE" ]; then
+    # no live generation: start one from the last CI-green sha
+    CANDIDATE=$(aws ssm get-parameter --region ${region} --name /pkgeval/worker-ref                 --query Parameter.Value --output text 2>/dev/null || true)
+    [ -z "$CANDIDATE" ] && CANDIDATE=$(sudo -u worker git -C /home/worker/PkgEvalFarm.jl rev-parse HEAD)
+    aws dynamodb update-item --region ${region} --table-name ${runs_table}         --key "$GEN_KEY"         --condition-expression "attribute_not_exists(#r) OR heartbeat_at < :stale"         --update-expression "SET #r = :sha, heartbeat_at = :now"         --expression-attribute-names '{"#r":"ref"}'         --expression-attribute-values "{\":sha\":{\"S\":\"$CANDIDATE\"},\":now\":{\"S\":\"$NOW\"},\":stale\":{\"S\":\"$STALE\"}}"         2>/dev/null || true   # lost the race: the winner's ref is authoritative
+    GEN=$(gen_ref)
+    REF=$(cut -f1 <<<"$GEN")
+    [ "$REF" = "None" ] && REF=""
+fi
+if [ -n "$REF" ]; then
+    echo "fleet generation ref: $REF"
+    sudo -u worker git -C /home/worker/PkgEvalFarm.jl fetch -q origin "$REF"         && sudo -u worker git -C /home/worker/PkgEvalFarm.jl checkout -q "$REF"         || echo "could not check out $REF; staying on the clone head" >&2
+fi
+
 # --- worker sysimage ---------------------------------------------------------
 # CI publishes a sysimage per (commit, Julia version) holding the worker and its
 # dependencies; loading it turns ~80s of precompilation on every launch into a

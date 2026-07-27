@@ -111,6 +111,12 @@ resource "aws_iam_role_policy" "deploy" {
         Resource = "${aws_s3_bucket.lambda.arn}/*"
       },
       {
+        Sid      = "PublishDeployRef"
+        Effect   = "Allow"
+        Action   = "ssm:PutParameter"
+        Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/pkgeval/worker-ref"
+      },
+      {
         Sid    = "PublishFunctionCode"
         Effect = "Allow"
         Action = [
