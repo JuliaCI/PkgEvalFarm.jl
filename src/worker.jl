@@ -361,7 +361,16 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                   duration=Float64(r.duration),
                   log=r.log === missing ? nothing : String(r.log))
     catch err
-        if claimed.attempts >= 3
+        if err isa PkgEval.MissingStagedBuild
+            # not a job failure: the Julia under test needs building. Ask CI
+            # (deduplicated) and come back when the queue redelivers; the
+            # queue's maxReceiveCount bounds how long a build may take before
+            # the job lands in the DLQ, so this never loops forever.
+            @info "job needs a Julia build that is not staged" job.package sha=err.sha[1:10] err.variant
+            request_julia_build(ctx, err)
+            release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+            return
+        elseif claimed.attempts >= 3
             # persistent infrastructure failure: record it so the run can finish
             @error "job errored repeatedly; giving up" job.package exception=(err, catch_backtrace())
             JobResult(; status="error", reason="worker_exception",

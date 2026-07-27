@@ -107,6 +107,8 @@ resource "aws_iam_role_policy" "debug" {
         Action = [
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceStatus",
+          "ec2:GetConsoleOutput",
+          "logs:DescribeLogGroups",
           "autoscaling:Describe*",
           "cloudwatch:DescribeAlarms",
           "cloudwatch:GetMetricData",
@@ -115,10 +117,11 @@ resource "aws_iam_role_policy" "debug" {
         Resource = "*"
       },
       {
-        Sid      = "InspectQueue"
-        Effect   = "Allow"
-        Action   = "sqs:GetQueueAttributes"
-        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_dlq.arn]
+        Sid    = "InspectQueue"
+        Effect = "Allow"
+        Action = "sqs:GetQueueAttributes"
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+        aws_sqs_queue.jobs_dlq.arn]
       },
       {
         Sid    = "ReadFarmState"
@@ -129,7 +132,8 @@ resource "aws_iam_role_policy" "debug" {
           "dynamodb:Scan",
           "dynamodb:DescribeTable",
         ]
-        Resource = [aws_dynamodb_table.runs.arn, aws_dynamodb_table.jobs.arn]
+        Resource = concat([aws_dynamodb_table.runs.arn, aws_dynamodb_table.jobs.arn],
+        aws_dynamodb_table.builds[*].arn)
       },
       {
         Sid      = "ReadResults"

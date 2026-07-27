@@ -19,9 +19,16 @@ SYSCTL
 sysctl --system
 
 apt-get update -q
-# awscli: cloud-init downloads the worker sysimage from a private bucket with
-# the instance profile's credentials, before any Julia AWS tooling exists
-DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl awscli
+DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl unzip
+
+# AWS CLI v2 via the official installer: cloud-init downloads the worker
+# sysimage from a private bucket with the instance profile's credentials,
+# before any Julia AWS tooling exists. (Ubuntu 24.04 removed the `awscli`
+# apt package from its archive entirely — installing it fails.)
+curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
 
 useradd --create-home --shell /bin/bash worker
 
