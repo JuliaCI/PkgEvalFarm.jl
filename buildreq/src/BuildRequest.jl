@@ -284,6 +284,14 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
     claim === nothing && return json_response(200, "{\"status\":\"already-requested\"}")
     c = something(claim)::Item
     url = str(c, "build_url", "")
+    if isempty(url)
+        # claims without a recorded build identity (a trigger-response parse
+        # failure, or predating identity recording) still deserve a link:
+        # Buildkite's builds page filters by commit
+        url = "https://buildkite.com/" * (ENV["BUILDKITE_ORG"]::String) * "/" *
+              (ENV["BUILDKITE_PIPELINE"]::String) * "/builds?commit=" *
+              String(first(split(key, '/')))
+    end
     str(c, "status", "") == "failed" && return failed_response(url)
     asked = parse_isodate(str(c, "requested_at", ""))
     expired = asked !== nothing &&

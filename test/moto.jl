@@ -426,8 +426,18 @@ try
                               JSON.parse(String(req.body))["body"])
                 TestHTTP.Response(200, "{}")
             end)
-        gh_port = rand(30001:40000)
-        server = TestHTTP.serve!(router, "127.0.0.1", gh_port)
+        gh_port, server = let p = 0, srv = nothing
+            for attempt in 1:10   # random ports collide occasionally; retry
+                p = rand(30001:40000)
+                try
+                    srv = TestHTTP.serve!(router, "127.0.0.1", p)
+                    break
+                catch err
+                    attempt == 10 && rethrow()
+                end
+            end
+            p, srv
+        end
         gh_base[] = "http://127.0.0.1:$gh_port"
         SQS.purge_queue(queue_url; aws_config=aws)  # drop strays from earlier testsets
         gh = PEF.FarmLite.GitHubCtx("bot-token", gh_base[])
@@ -796,8 +806,18 @@ try
         BkHTTP.register!(bk_router, "GET", "/v2/organizations/testorg/pipelines/testpipe/builds/42",
             req -> BkHTTP.Response(200, JSON.json(Dict(
                 "number" => 42, "state" => bk_state[], "web_url" => "http://bk/42"))))
-        bk_port = rand(40001:50000)
-        bk_server = BkHTTP.serve!(bk_router, "127.0.0.1", bk_port)
+        bk_port, bk_server = let p = 0, srv = nothing
+            for attempt in 1:10   # random ports collide occasionally; retry
+                p = rand(40001:50000)
+                try
+                    srv = BkHTTP.serve!(bk_router, "127.0.0.1", p)
+                    break
+                catch err
+                    attempt == 10 && rethrow()
+                end
+            end
+            p, srv
+        end
         SSM.put_parameter("/pkgeval/buildkite-token", "bk-test-token",
                           Dict("Type" => "SecureString", "Overwrite" => true); aws_config=aws)
         setat(k, t) = Dynamodb.update_item(  # backdate a claim
@@ -848,6 +868,16 @@ try
                 setat(key2, Dates.now(UTC) - Dates.Hour(4))
                 resp = BuildRequest.handle_event(ask, lctx)
                 @test occursin("build-failed", resp)
+
+                # a claim without a recorded build identity still answers with
+                # a link: the builds page filtered by commit
+                sha3 = "ffffffffffffffffffffffffffffffffffffffff"
+                @test BuildRequest.claim_build(lctx, "pkgeval-builds", "$sha3/linuxassert", "test")
+                setat("$sha3/linuxassert", Dates.now(UTC) - Dates.Hour(4))
+                resp = BuildRequest.handle_event(
+                    "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$sha3\",\"variant\":\"linuxassert\"}", lctx)
+                @test occursin("build-failed", resp)
+                @test occursin("buildkite.com/testorg/testpipe/builds?commit=$sha3", resp)
             end
         finally
             close(bk_server)
