@@ -131,10 +131,16 @@ variable "ec2_worker_instance_types" {
     "m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge",
     "m5d.8xlarge", "m5n.8xlarge", "m5dn.8xlarge", "m5ad.8xlarge",
     "m6id.8xlarge", "m6in.8xlarge", "m6idn.8xlarge",
-    "r6a.8xlarge", "r5.8xlarge", "r6i.8xlarge",
+    "r6a.8xlarge", "r5.8xlarge", "r6i.8xlarge", "r5a.8xlarge",
     "m6a.4xlarge", "m6i.4xlarge", "m5.4xlarge", "m7a.4xlarge",
-    "m6a.16xlarge", "m7a.16xlarge",
-    "m6a.24xlarge", "m7a.24xlarge", "m5a.24xlarge",
+    "m6a.12xlarge", "m7a.12xlarge", "m5ad.12xlarge", "r6a.12xlarge",
+    "m6a.16xlarge", "m7a.16xlarge", "m5a.16xlarge", "m5dn.16xlarge", "r6a.16xlarge",
+    "m6a.24xlarge", "m7a.24xlarge", "m5a.24xlarge", "m5ad.24xlarge", "m5dn.24xlarge", "r6a.24xlarge",
+    "m6a.32xlarge", "m7a.32xlarge",
+    "m6a.48xlarge", "m7a.48xlarge",
+    # deliberately absent: m4/r4 (older cores make the sticker discount a
+    # mirage per unit of work), .metal (boot quirks, no price edge), and the
+    # pricier r5d/r5n/r5dn sizes — the ASG caps overrides at 40, so triage
   ]
 }
 
