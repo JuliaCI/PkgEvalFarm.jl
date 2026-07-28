@@ -108,6 +108,7 @@ resource "aws_iam_role_policy" "debug" {
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceStatus",
           "ec2:DescribeSpotPriceHistory",
+          "ec2:GetSpotPlacementScores",
           "ec2:GetConsoleOutput",
           "logs:DescribeLogGroups",
           "autoscaling:Describe*",
