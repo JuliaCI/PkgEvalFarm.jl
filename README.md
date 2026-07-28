@@ -158,7 +158,11 @@ surfaces as `MissingStagedBuild` during expansion; the worker asks the
 build-request Lambda (SigV4, its own credentials) to have the
 `julia-build-request` Buildkite pipeline build that exact commit into the
 request bucket, and releases the expand message for retry. The Lambda holds
-the (pipeline-scoped) Buildkite token in SSM and deduplicates requests.
+the (pipeline-scoped) Buildkite token in SSM and deduplicates requests — and
+the workers' periodic re-asks double as its polling clock: each repeat ask
+checks the triggered build's state, and a build Buildkite reports as failed
+comes back as `build-failed`, which the worker turns into a run failure (at
+expansion) or an error result (for a job) instead of waiting forever.
 
 **Straggler avoidance**: long jobs are routed to a separate slow queue that
 workers drain first, so they start while plenty of short work remains to

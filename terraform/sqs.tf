@@ -16,11 +16,14 @@ resource "aws_sqs_queue" "jobs" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
-    # must cover a job's worth of worker crashes AND an expand message cycling
-    # every BUILD_RETRY_DELAY (10 min) while CI builds a requested Julia
-    # (~30-40 min): package jobs give up on themselves after 3 attempts anyway,
-    # so the extra headroom only serves the build-wait
-    maxReceiveCount = 8
+    # must cover a job's worth of worker crashes AND a message cycling every
+    # BUILD_RETRY_DELAY (10 min) while CI builds a requested Julia. Build
+    # *failures* are detected by the build-request Lambda polling Buildkite
+    # (and surfaced as run/job failures within ~one retry), so the DLQ is no
+    # longer the failure detector — this budget only needs to outlast slow
+    # successful builds: 18 x 10 min = 3 h, matching the Lambda's build-age
+    # backstop. Package jobs give up on themselves after 3 attempts anyway.
+    maxReceiveCount = 18
   })
 }
 
@@ -36,6 +39,6 @@ resource "aws_sqs_queue" "jobs_slow" {
 
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
-    maxReceiveCount     = 8 # see above; expand messages ride this queue
+    maxReceiveCount     = 18 # see above; expand messages ride this queue
   })
 }

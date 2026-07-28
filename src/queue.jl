@@ -421,6 +421,31 @@ heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
     SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, extend;
                                   aws_config=ctx.aws)
 
+"""
+Terminally fail a run from the worker side (e.g. its Julia build failed) with
+a human-readable reason. The bot's poll notices `failed` without `reported`
+and notifies the submitter. Conditional on the run still being in flight, so
+a concurrent completion or another failure path wins quietly.
+"""
+function fail_run(ctx::FarmCtx, run_id::AbstractString, why::AbstractString)
+    try
+        Dynamodb.update_item(
+            ddb_item(Dict("run_id" => run_id)),
+            ctx.cfg.runs_table,
+            Dict("ConditionExpression" => "#s IN (:expanding, :active)",
+                 "UpdateExpression" => "SET #s = :failed, finished_at = :now, failure_reason = :why",
+                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":expanding" => "expanding", ":active" => "active",
+                     ":failed" => "failed", ":now" => isodate(), ":why" => String(why))));
+            aws_config=ctx.aws)
+        @info "run failed" run_id why
+    catch err
+        is_conditional_failure(err) || rethrow()
+    end
+    return nothing
+end
+
 "Give up on a claimed job without recording a result; it will be redelivered."
 function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
     try

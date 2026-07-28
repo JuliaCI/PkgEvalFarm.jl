@@ -276,6 +276,15 @@ sha, variant `linux` or `linuxassert`; the org and pipeline come from its own
 environment, never the caller) and deduplicates on `<sha>/<variant>` so a
 commit is built once however many workers ask.
 
+Repeat asks double as failure detection: while the artifact is missing,
+workers re-ask every ~10 minutes, and each ask polls the triggered build's
+state. A failed/canceled build flips the claim to `failed` and answers
+`build-failed` (with the build URL), which workers surface as a run failure or
+job error instead of waiting for an artifact that will never come. Claims
+without an artifact after 3 h fail on age alone; failed claims may be
+re-triggered by a fresh ask after 24 h, so a transient Buildkite failure does
+not poison the sha forever (delete the claim item to retry sooner).
+
 The token belongs to a Buildkite **machine user** whose team access covers the
 build-request pipeline and nothing else — scope names are organization-wide, so
 team membership is the real boundary. It needs `write_builds` (to create the

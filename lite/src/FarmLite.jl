@@ -294,6 +294,28 @@ int(item::Item, key::String, default::Int) =
     haskey(item, key) && item[key].N !== nothing ? parse(Int, something(item[key].N)) : default
 opt_str(item::Item, key::String) = haskey(item, key) ? item[key].S : nothing
 
+"""
+Parse the fixed-layout UTC timestamps this codebase writes
+("2026-07-28T15:30:00Z"), or `nothing` on any mismatch. Hand-rolled because
+`DateTime(str, dateformat)`'s error path dispatches dynamically, which the
+`juliac --trim` verifier rejects.
+"""
+function parse_isodate(s::String)
+    (ncodeunits(s) == 20 && isascii(s) &&
+     s[5] == '-' && s[8] == '-' && s[11] == 'T' &&
+     s[14] == ':' && s[17] == ':' && s[20] == 'Z') || return nothing
+    y = tryparse(Int, s[1:4]);   mo = tryparse(Int, s[6:7])
+    d = tryparse(Int, s[9:10]);  h = tryparse(Int, s[12:13])
+    mi = tryparse(Int, s[15:16]); se = tryparse(Int, s[18:19])
+    (y === nothing || mo === nothing || d === nothing ||
+     h === nothing || mi === nothing || se === nothing) && return nothing
+    (1 <= something(mo) <= 12 &&
+     1 <= something(d) <= Dates.daysinmonth(something(y), something(mo)) &&
+     something(h) <= 23 && something(mi) <= 59 && something(se) <= 59) || return nothing
+    return DateTime(something(y), something(mo), something(d),
+                    something(h), something(mi), something(se))
+end
+
 # lazy materializers for attribute values ("Attr" is recursive through L and M);
 # the explicit return types break the recursive inference cycle, which would
 # otherwise widen to Any and fail the trim verifier

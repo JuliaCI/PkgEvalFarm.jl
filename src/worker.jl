@@ -354,14 +354,18 @@ best-trodden auth path there is. (The original SigV4-signed Function URL
 design was abandoned after assumed-role sessions were consistently 403'd by
 the URL auth layer despite valid identity- and resource-policy allows — the
 same signed requests from an IAM user worked. Undiagnosable from outside.)
-The Lambda deduplicates, so re-requesting on every retry is free. Returns
-whether a request was made (or already pending).
+The Lambda deduplicates, so re-requesting on every retry is free — and repeat
+asks double as its polling clock: it checks the triggered build's state and
+answers `build-failed` when CI gave up. Returns `(:pending, nothing)` while a
+build is requested/underway, `(:failed, url)` when it failed (the caller
+should stop waiting and surface the failure), or `(:error, nothing)` when the
+ask itself could not be made (treated as pending: retry).
 """
 function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
     fn = ctx.cfg.build_request_function
     if isempty(fn)
         @error "no build-request broker configured; cannot obtain a build" miss.repo miss.sha
-        return false
+        return (:error, nothing)
     end
     try
         # AWS.jl's RestJSON path JSON-encodes the args dict as the request
@@ -371,18 +375,28 @@ function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
         resp = Lambda.invoke(fn, Dict{String,Any}("repo" => miss.repo, "sha" => miss.sha,
                                                   "variant" => miss.variant); aws_config=ctx.aws)
         payload = resp isa AbstractDict ? JSON.json(resp) : String(copy(resp))
-        # the handler reports its own outcome as {"statusCode": ...}; an invoke
-        # that reaches the function but is refused is still a failure here
-        ok = occursin(r"\"statusCode\":2\d\d", payload)
-        if ok
-            @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant response=first(payload, 200)
+        # the handler reports its own outcome as {"statusCode": ..., "body": json}
+        outer = try JSON.parse(payload) catch; nothing end
+        code = outer isa AbstractDict ? get(outer, "statusCode", 0) : 0
+        body = outer isa AbstractDict ? get(outer, "body", "") : ""
+        inner = body isa AbstractString && !isempty(body) ?
+                (try JSON.parse(body) catch; nothing end) : nothing
+        status = inner isa AbstractDict ? get(inner, "status", "") : ""
+        url = inner isa AbstractDict ? get(inner, "url", nothing) : nothing
+        if status == "build-failed"
+            @error "CI reports the build failed" miss.sha url
+            return (:failed, url isa AbstractString ? String(url) : nothing)
+        elseif code isa Integer && 200 <= code < 300
+            @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant status
+            return (:pending, nothing)
         else
+            # an invoke that reaches the function but is refused is a failure
             @error "build request refused" miss.sha response=first(payload, 300)
+            return (:error, nothing)
         end
-        return ok
     catch err
         @error "build request failed" miss.sha exception=(err, catch_backtrace())
-        return false
+        return (:error, nothing)
     end
 end
 
@@ -406,17 +420,28 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
             packages = sort!([n for n in names if !endswith(n, "_jll")])
         end
         njobs = expand_run(ctx, claimed.run_id, packages)
-        SQS.delete_message(ctx.cfg.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+        # NB: claimed.queue_url, not cfg.queue_url — expand messages ride the
+        # slow queue and receipt handles are queue-specific
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
         @info "expanded run" claimed.run_id njobs
     catch err
         if err isa PkgEval.MissingStagedBuild
             # determining package compatibility needs the Julia under test; ask
-            # CI to build it and retry once the queue redelivers this message.
-            # The Lambda dedups, so the periodic re-request while the build runs
-            # is harmless — and refreshes the ask if a build failed.
+            # CI to build it and retry once the queue redelivers this message —
+            # unless CI reports the build *failed*, in which case waiting is
+            # pointless: fail the run with the reason (the bot notices and
+            # tells the submitter) and retire the message.
             @info "expansion needs a Julia build that is not staged" claimed.run_id sha=err.sha[1:10] err.variant
-            request_julia_build(ctx, err)
-            release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+            status, bkurl = request_julia_build(ctx, err)
+            if status === :failed
+                why = "the Julia build for $(err.repo)@$(err.sha[1:10]) ($(err.variant)) failed" *
+                      (bkurl === nothing ? "" : ": $(something(bkurl))")
+                @error "julia build failed; failing the run" claimed.run_id why
+                fail_run(ctx, claimed.run_id, why)
+                SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+            else
+                release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+            end
         else
             @error "failed to expand run; releasing for retry" claimed.run_id exception=(err, catch_backtrace())
             release_job(ctx, claimed)
@@ -485,13 +510,21 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     catch err
         if err isa PkgEval.MissingStagedBuild
             # not a job failure: the Julia under test needs building. Ask CI
-            # (deduplicated) and come back when the queue redelivers; the
-            # queue's maxReceiveCount bounds how long a build may take before
-            # the job lands in the DLQ, so this never loops forever.
+            # (deduplicated) and come back when the queue redelivers. A build
+            # CI reports as *failed* becomes an error result instead — the run
+            # completes normally, with the failure in the report. The queue's
+            # maxReceiveCount still bounds total build waiting as a backstop.
             @info "job needs a Julia build that is not staged" job.package sha=err.sha[1:10] err.variant
-            request_julia_build(ctx, err)
-            release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
-            return
+            status, bkurl = request_julia_build(ctx, err)
+            if status === :failed
+                @error "julia build failed; recording job error" job.package sha=err.sha[1:10]
+                JobResult(; status="error", reason="julia_build_failed",
+                          log="the Julia build for $(err.repo)@$(err.sha) ($(err.variant)) failed" *
+                              (bkurl === nothing ? "" : "\n$(something(bkurl))"))
+            else
+                release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+                return
+            end
         elseif claimed.attempts >= 3
             # persistent infrastructure failure: record it so the run can finish
             @error "job errored repeatedly; giving up" job.package exception=(err, catch_backtrace())

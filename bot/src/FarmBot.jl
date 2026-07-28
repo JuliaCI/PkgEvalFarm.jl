@@ -23,7 +23,7 @@ include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
 using .FarmLite: Attr, Item, attr, str, int, opt_str, json_item, ddb, sqs_send_message,
                  s3_put, is_conditional_failure, GitHubCtx, github_request, urlencode,
-                 error_message, lambda_loop, ctx_from_env, ssm_parameter,
+                 error_message, lambda_loop, ctx_from_env, ssm_parameter, parse_isodate,
                  LazyVal, parse_json, json_string, json_bool, json_int,
                  json_string_vector, jsontype, isnullval, json_expected
 import .FarmLite: json_make
@@ -845,13 +845,17 @@ end
 
 "Mark a run failed (from any non-terminal state) and tell its submitter."
 function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::String)
+    # `reported` is claimed in the same write: this path posts the notification
+    # itself, and check_failed_runs must not report the run a second time
     payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
               "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
               "\"ConditionExpression\":\"#s IN (:expanding, :active)\"," *
-              "\"UpdateExpression\":\"SET #s = :failed, finished_at = :now\"," *
+              "\"UpdateExpression\":\"SET #s = :failed, finished_at = :now, " *
+              "reported = :t, failure_reason = :why\"," *
               "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
               "\"ExpressionAttributeValues\":{\":expanding\":{\"S\":\"expanding\"}," *
               "\":active\":{\"S\":\"active\"},\":failed\":{\"S\":\"failed\"}," *
+              "\":t\":{\"BOOL\":true},\":why\":{\"S\":$(JSON.json(why))}," *
               "\":now\":{\"S\":$(JSON.json(isodate()))}}}"
     try
         ddb(ctx, "UpdateItem", payload)
@@ -920,29 +924,56 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     @info "posted report" run_id
 end
 
+"""
+Report runs a *worker* failed (`status = "failed"` without `reported`): the
+worker can only write the reason into the table (e.g. "its Julia build
+failed"), so the notification is posted from here. DLQ-driven failures set
+`reported` inside mark_run_failed and never reach this scan.
+"""
+function check_failed_runs(ctx::LiteCtx, gh::GitHubCtx)
+    start_key = ""
+    while true
+        payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                  "\"FilterExpression\":\"#s = :failed AND attribute_not_exists(reported)\"," *
+                  "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+                  "\"ExpressionAttributeValues\":{\":failed\":{\"S\":\"failed\"}}" *
+                  (isempty(start_key) ? "" : ",\"ExclusiveStartKey\":$start_key") * "}"
+        resp = parse_json(ddb(ctx, "Scan", payload), ItemsResp)
+        for run in something(resp.Items, Item[])
+            report_failed_run(ctx, gh, run)
+        end
+        resp.LastEvaluatedKey === nothing && break
+        start_key = json_item(something(resp.LastEvaluatedKey))
+    end
+end
+
+function report_failed_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
+    run_id = str(run, "run_id")
+
+    # claim the reporting so concurrent invocations don't double-post
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+              "\"ConditionExpression\":\"attribute_not_exists(reported)\"," *
+              "\"UpdateExpression\":\"SET reported = :t\"," *
+              "\"ExpressionAttributeValues\":{\":t\":{\"BOOL\":true}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        err isa ErrorException && is_conditional_failure(err) && return
+        rethrow()
+    end
+
+    context = parse_json(str(run, "context", "{}"), RunContext)
+    (context.repo === nothing || context.issue === nothing) && return
+    why = str(run, "failure_reason", "unspecified failure")
+    mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
+    deliver_final(gh, something(context.repo), something(context.issue), run,
+                  mention * "run `" * run_id * "` **failed** — " * why * ".")
+    @info "reported failed run" run_id
+end
+
 
 ## in-flight runs -> hourly status edits of the submission comment
-
-"""
-Parse this module's own fixed-layout `isodate` output ("2026-07-28T15:30:00Z"),
-or `nothing` on any mismatch. Hand-rolled because `DateTime(str, dateformat)`'s
-error path dispatches dynamically, which the `--trim` verifier rejects.
-"""
-function parse_isodate(s::String)
-    (ncodeunits(s) == 20 && isascii(s) &&
-     s[5] == '-' && s[8] == '-' && s[11] == 'T' &&
-     s[14] == ':' && s[17] == ':' && s[20] == 'Z') || return nothing
-    y = tryparse(Int, s[1:4]);   mo = tryparse(Int, s[6:7])
-    d = tryparse(Int, s[9:10]);  h = tryparse(Int, s[12:13])
-    mi = tryparse(Int, s[15:16]); se = tryparse(Int, s[18:19])
-    (y === nothing || mo === nothing || d === nothing ||
-     h === nothing || mi === nothing || se === nothing) && return nothing
-    (1 <= something(mo) <= 12 &&
-     1 <= something(d) <= Dates.daysinmonth(something(y), something(mo)) &&
-     something(h) <= 23 && something(mi) <= 59 && something(se) <= 59) || return nothing
-    return DateTime(something(y), something(mo), something(d),
-                    something(h), something(mi), something(se))
-end
 
 """
     eta_from_progress(prev_at, prev_completed, completed, total, now)
@@ -1387,8 +1418,9 @@ function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
     name = bot_name()
     poll_mentions(ctx, gh, name)
     check_finished_runs(ctx, gh)
-    # after check_finished_runs: a run that just finished is reported above and
-    # excluded from the status scan, instead of racing it
+    check_failed_runs(ctx, gh)
+    # after the checks above: a run that just finished or failed is reported
+    # there and excluded from the status scan, instead of racing it
     update_status_comments(ctx, gh)
     return nothing
 end

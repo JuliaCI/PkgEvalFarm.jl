@@ -20,6 +20,7 @@ using AWS: @service
 @service Dynamodb
 @service SQS
 @service S3
+@service SSM
 
 # AWS config pointing every service at the moto endpoint
 struct MotoConfig <: AWS.AbstractAWSConfig
@@ -604,6 +605,25 @@ try
             notifications[] = "[]"
             @test JSON.parse(PEF.FarmBot.handle_event("{}", lite, gh))["ok"] == true
             @test length(posted) == 2 && length(edited) == n_edited6  # all runs done
+
+            # 8. a worker-failed run (e.g. its Julia build failed) is reported
+            #    with the recorded reason on the next poll
+            failed_id = PEF.create_run(ctx,
+                PEF.RunSpec(configs[1:1], ["Example"], Dict{String,Any}(
+                    "repo" => "JuliaLang/julia", "issue" => 12345, "requester" => "keno"));
+                submitter="keno via @pkgeval")
+            PEF.fail_run(ctx, failed_id,
+                "the Julia build for JuliaLang/julia@deadbeefde (linuxassert) failed: http://bk/7")
+            PEF.FarmBot.handle_invocation(lite, gh)
+            @test occursin("@keno: run `$failed_id` **failed** — the Julia build", posted[end])
+            @test occursin("http://bk/7", posted[end])
+            n8p, n8e = length(posted), length(edited)
+            PEF.FarmBot.handle_invocation(lite, gh)  # reported exactly once
+            @test length(posted) == n8p && length(edited) == n8e
+            # retire the failed run's stray expand message
+            while (c = PEF.claim_job(ctx; wait=1)) !== nothing
+                SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
+            end
         finally
             close(server)
         end
@@ -658,7 +678,23 @@ try
         # path is a Lambda.invoke, exercised live; moto cannot run our binary)
         miss = PkgEval.MissingStagedBuild("JuliaLang/julia",
             "1234567890abcdef1234567890abcdef12345678", "linuxassert")
-        @test !PEF.request_julia_build(ctx, miss)
+        @test PEF.request_julia_build(ctx, miss) == (:error, nothing)
+    end
+
+    @testset "worker fail_run" begin
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Example"], Dict{String,Any}());
+                                submitter="tester")
+        PEF.fail_run(ctx, run_id, "the Julia build failed: http://bk/9")
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "failed"
+        @test run["failure_reason"] == "the Julia build failed: http://bk/9"
+        # terminal: a later failure path racing this one loses quietly
+        PEF.fail_run(ctx, run_id, "another reason")
+        @test PEF.get_run(ctx, run_id)["failure_reason"] == "the Julia build failed: http://bk/9"
+        # retire the run's stray expand message so later testsets don't claim it
+        while (c = PEF.claim_job(ctx; wait=1)) !== nothing
+            SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
+        end
     end
 
     @testset "build-request claim/release" begin
@@ -688,6 +724,73 @@ try
         resp = BuildRequest.handle_event(
             "{\"repo\":\"Someone/else\",\"sha\":\"1234567890abcdef1234567890abcdef12345678\"}", lctx)
         @test occursin("403", resp)
+
+        # --- Buildkite state polling: failed builds become build-failed answers ---
+        import HTTP as BkHTTP
+        bk_state = Ref("running")
+        bk_router = BkHTTP.Router()
+        BkHTTP.register!(bk_router, "POST", "/v2/organizations/testorg/pipelines/testpipe/builds",
+            req -> BkHTTP.Response(201, JSON.json(Dict(
+                "number" => 42, "state" => "scheduled", "web_url" => "http://bk/42"))))
+        BkHTTP.register!(bk_router, "GET", "/v2/organizations/testorg/pipelines/testpipe/builds/42",
+            req -> BkHTTP.Response(200, JSON.json(Dict(
+                "number" => 42, "state" => bk_state[], "web_url" => "http://bk/42"))))
+        bk_port = rand(40001:50000)
+        bk_server = BkHTTP.serve!(bk_router, "127.0.0.1", bk_port)
+        SSM.put_parameter("/pkgeval/buildkite-token", "bk-test-token",
+                          Dict("Type" => "SecureString", "Overwrite" => true); aws_config=aws)
+        setat(k, t) = Dynamodb.update_item(  # backdate a claim
+            Dict("build_key" => Dict("S" => k)), "pkgeval-builds",
+            Dict("UpdateExpression" => "SET requested_at = :t",
+                 "ExpressionAttributeValues" => Dict(":t" => Dict("S" => BuildRequest.isodate(t))));
+            aws_config=aws)
+        sha2 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        key2 = "$sha2/linuxassert"
+        ask = "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$sha2\",\"variant\":\"linuxassert\"}"
+        try
+            with_env(Dict("PKGEVAL_BUILDS_TABLE" => "pkgeval-builds",
+                          "BUILDKITE_API_BASE" => "http://127.0.0.1:$bk_port",
+                          "BUILDKITE_ORG" => "testorg", "BUILDKITE_PIPELINE" => "testpipe",
+                          "BUILDKITE_TOKEN_PARAM" => "/pkgeval/buildkite-token")) do
+                # fresh ask: claims, triggers, records the build identity
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("\"statusCode\":202", resp) && occursin("requested", resp)
+                claim = BuildRequest.get_claim(lctx, "pkgeval-builds", key2)
+                @test FL.int(something(claim), "build_number", -1) == 42
+                @test FL.str(something(claim), "build_url", "") == "http://bk/42"
+
+                # build still running: plain dedup answer
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("already-requested", resp)
+
+                # Buildkite reports failure: claim flips, answer carries the URL
+                bk_state[] = "failed"
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("build-failed", resp) && occursin("http://bk/42", resp)
+                claim = BuildRequest.get_claim(lctx, "pkgeval-builds", key2)
+                @test FL.str(something(claim), "status", "") == "failed"
+
+                # failure is sticky: answered from the claim, no re-poll
+                bk_state[] = "running"
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("build-failed", resp)
+
+                # ...until FAILED_RETRY_AGE passes, then an ask re-triggers
+                setat(key2, Dates.now(UTC) - Dates.Hour(25))
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("\"statusCode\":202", resp) && occursin("requested", resp)
+                claim = BuildRequest.get_claim(lctx, "pkgeval-builds", key2)
+                @test FL.str(something(claim), "status", "") == "requested"
+
+                # age backstop: no artifact after MAX_BUILD_AGE means failed,
+                # whatever Buildkite says about the build
+                setat(key2, Dates.now(UTC) - Dates.Hour(4))
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("build-failed", resp)
+            end
+        finally
+            close(bk_server)
+        end
     end
 
     @testset "fleet drain (scale-in protection)" begin
