@@ -1010,6 +1010,16 @@ function configs_summary(configs_json::String)
     return join(("$(something(c.name, "?")): `$(something(c.julia, "?"))`" for c in configs), ", ")
 end
 
+"Humanize the span between two instants (\"3h 20m\", \"45m\", \"2d 4h\")."
+function remaining_str(from::DateTime, to::DateTime)
+    mins = max(0, Dates.value(to - from) ÷ 60_000)
+    d, r = divrem(mins, 1440)
+    h, m = divrem(r, 60)
+    d > 0 && return "$(d)d $(h)h"
+    h > 0 && return "$(h)h $(m)m"
+    return "$(m)m"
+end
+
 """
 Compose the in-progress body for the submission comment. Pure so tests can pin
 the exact rendering; `eta === nothing` means "don't print one". Deliberately
@@ -1025,7 +1035,8 @@ function status_comment_body(run_id::String, config_desc::String, status::String
         "expanding — building Julia and enumerating packages."
     elseif total > 0
         eta_note = eta === nothing ? "" :
-            " Estimated completion: $(Dates.format(something(eta), stampfmt))."
+            " Estimated completion: $(Dates.format(something(eta), stampfmt)) " *
+            "(~$(remaining_str(asof, something(eta))) left)."
         "$completed/$total jobs completed.$eta_note"
     else
         "starting up."

@@ -672,7 +672,11 @@ try
                                       "active", 80, 200, now, eta)
         @test occursin("run `run-1` (primary: `a`, against: `b`)", body)
         @test occursin("80/200 jobs completed", body)
-        @test occursin("Estimated completion: 2026-07-28 14:00 UTC", body)
+        @test occursin("Estimated completion: 2026-07-28 14:00 UTC (~2h 0m left)", body)
+        @test FB.remaining_str(now, now + Dates.Minute(45)) == "45m"
+        @test FB.remaining_str(now, now + Dates.Minute(200)) == "3h 20m"
+        @test FB.remaining_str(now, now + Dates.Hour(52)) == "2d 4h"
+        @test FB.remaining_str(now, now - Dates.Hour(1)) == "0m"  # never negative
         body = FB.status_comment_body("run-1", "", "expanding", 0, 0, now, nothing)
         @test occursin("expanding — building Julia", body)
         @test occursin("as of 2026-07-28 12:00 UTC", body)
