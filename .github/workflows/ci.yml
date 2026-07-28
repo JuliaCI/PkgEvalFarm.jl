@@ -22,9 +22,7 @@ env:
   AWS_DEPLOY_ROLE: arn:aws:iam::873569884612:role/pkgeval-deploy
   LAMBDA_BUCKET: pkgeval-lambda
   NAME_PREFIX: pkgeval
-  # empty skips the broker smoke test; set to https://pkgeval.julialang.org
-  # once the broker DNS records are live (terraform/broker_domain.tf)
-  BROKER_URL: ''
+  BROKER_URL: https://pkgeval.julialang.org
 
 jobs:
   test:
