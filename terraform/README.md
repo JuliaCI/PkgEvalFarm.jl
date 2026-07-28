@@ -58,7 +58,7 @@ overrides are weighted by vCPU count, so the fleet may mix instance sizes and
 the spot allocator compares pools by price *per slot*.
 
 ```sh
-tofu apply -var ec2_worker_max=128  # enable, with a hard slot ceiling
+tofu apply -var ec2_worker_max=384  # enable, with a hard slot ceiling
 tofu apply -var ec2_worker_max=0    # tear down (default)
 ```
 
@@ -74,7 +74,7 @@ not to overshoot:
 - **in**: only to the floor, and only after the queue has been completely
   idle — nothing visible *or in flight* — for `ec2_worker_idle_minutes`
   (default 15), so the long tail of slow jobs is never cut short.
-- `ec2_worker_max` is validated to ≤ 128 slots for now as a cost guardrail;
+- `ec2_worker_max` is validated to ≤ 384 slots for now as a cost guardrail;
   raise the cap in `variables.tf` deliberately when a bigger fleet is intended.
   Set `ec2_worker_min = ec2_worker_max` to pin fixed capacity.
 
@@ -186,7 +186,7 @@ itself would still be a welcome belt-and-braces improvement.
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"pkgeval"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
-| `ec2_worker_max` | no | `0` | EC2 worker ceiling in job slots = vCPUs (0 = disabled; validated ≤ 128 for now). |
+| `ec2_worker_max` | no | `0` | EC2 worker ceiling in job slots = vCPUs (0 = disabled; validated ≤ 384 for now). |
 | `ec2_worker_min` | no | `0` | EC2 worker floor in slots (= max to pin capacity). |
 | `ec2_worker_backlog_target` | no | `12.5` | Visible jobs per slot (vCPU) the scaler aims for. |
 | `ec2_worker_idle_minutes` | no | `15` | Full queue idle time before scaling to the floor. |

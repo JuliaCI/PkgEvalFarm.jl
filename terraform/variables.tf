@@ -88,15 +88,15 @@ variable "bot_schedule" {
 }
 
 variable "ec2_worker_max" {
-  description = "Capacity ceiling for EC2 workers, in job slots = vCPUs (0 disables everything EC2-worker related; 128 ≈ four 8xlarge, or one 24xlarge + one 8xlarge). Scaling within [min, max] is queue-driven."
+  description = "Capacity ceiling for EC2 workers, in job slots = vCPUs (0 disables everything EC2-worker related; 384 ≈ twelve 8xlarge, or four 24xlarge). Scaling within [min, max] is queue-driven."
   type        = number
   default     = 0
 
   # deliberate guardrail while the farm is young: raise this limit here when
   # you actually mean to run a bigger fleet
   validation {
-    condition     = var.ec2_worker_max <= 128
-    error_message = "ec2_worker_max is capped at 128 slots for now (worst case ≈ $2-5/h spot); raise the cap in variables.tf deliberately if you need more."
+    condition     = var.ec2_worker_max <= 384
+    error_message = "ec2_worker_max is capped at 384 slots for now (worst case ≈ $6-15/h spot); raise the cap in variables.tf deliberately if you need more."
   }
 }
 

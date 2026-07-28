@@ -2,6 +2,13 @@
 # cloud-init for a self-enrolling PkgEval test worker (Ubuntu 24.04).
 set -eux
 
+# A failed bootstrap must not leave a silent zombie: without this, `set -e`
+# just stops the script and the instance sits idle forever — running, healthy
+# as far as EC2 knows, never claiming work, billing all the while. Shutting
+# down flips the ASG health check, which replaces the instance (scale-in
+# protection does not apply to unhealthy-instance replacement).
+trap 'echo "PkgEval worker bootstrap FAILED at line $LINENO" > /dev/console; shutdown -h now' ERR
+
 # FIRST, before any third-party code runs (installers, Pkg build scripts):
 # IMDS is reachable by root only. Everything below that runs as non-root —
 # including the eventual sandboxed package code — goes through the
@@ -283,7 +290,7 @@ ExecStartPre=/bin/rm -f /run/pkgeval/drain
 ExecStart=/home/worker/PkgEvalFarm.jl/bin/farm worker
 # stop sequence: request the drain, give the worker up to 60s to fast-release
 # and exit cleanly; only then does systemd escalate to SIGTERM/SIGKILL
-ExecStop=/bin/sh -c 'touch /run/pkgeval/drain; for i in $(seq 60); do kill -0 $MAINPID 2>/dev/null || exit 0; sleep 1; done'
+ExecStop=/bin/sh -c 'touch /run/pkgeval/drain; for i in \$\$(seq 60); do kill -0 \$MAINPID 2>/dev/null || exit 0; sleep 1; done'
 TimeoutStopSec=90
 Restart=always
 RestartSec=30
