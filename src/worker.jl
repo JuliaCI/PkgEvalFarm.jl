@@ -548,6 +548,8 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                   reason=r.reason === missing ? nothing : String(r.reason),
                   version=r.version === missing ? nothing : string(r.version),
                   duration=Float64(r.duration),
+                  # haskey: tolerate a PkgEval pinned before peak_rss existed
+                  peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
                   log=r.log === missing ? nothing : String(r.log))
     catch err
         if err isa PkgEval.MissingStagedBuild

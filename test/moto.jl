@@ -133,7 +133,7 @@ try
             result = PEF.JobResult(; status,
                 reason=status == "fail" ? "test_failures" :
                        status == "crash" ? "segfault" : nothing,
-                version="1.2.3", duration=42.0,
+                version="1.2.3", duration=42.0, peak_rss=1_234_567_890,
                 log="log of $(claimed.job.package) on $(claimed.job.config)")
             PEF.record_result(ctx, claimed, result)
         end
@@ -141,6 +141,7 @@ try
         PEF.SLOT_HOURLY_RATE[] = nothing
         jobs = PEF.run_jobs(ctx, RUN_ID)
         @test all(j -> isapprox(j["cost"], 42.0 / 3600 * 0.36; rtol=1e-6), jobs)
+        @test all(j -> j["peak_rss"] == 1_234_567_890, jobs)
 
         run = PEF.get_run(ctx, RUN_ID)
         @test run["completed_jobs"] == 6

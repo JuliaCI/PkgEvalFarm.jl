@@ -497,7 +497,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, finished_at = :now, log_key = :log_key, " *
-                                       "cost = :cost",
+                                       "cost = :cost, peak_rss = :peak_rss",
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
@@ -512,6 +512,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                      # SLOT_HOURLY_RATE); the report sums these per run
                      ":cost" => SLOT_HOURLY_RATE[] === nothing ? nothing :
                                 result.duration / 3600 * something(SLOT_HOURLY_RATE[]),
+                     ":peak_rss" => result.peak_rss,
                      ":log_key" => result.log === nothing ? nothing : key)));
             aws_config=ctx.aws)
     end

@@ -200,6 +200,9 @@ Base.@kwdef struct JobResult
     reason::Union{String,Nothing} = nothing
     version::Union{String,Nothing} = nothing
     duration::Float64 = 0.0
+    # peak cgroup memory of the sandbox in bytes (page cache included), for
+    # memory-aware scheduling backtests; nothing when the metric was unavailable
+    peak_rss::Union{Int,Nothing} = nothing
     log::Union{String,Nothing} = nothing  # uploaded to S3, not stored in DynamoDB
 end
 
