@@ -9,6 +9,20 @@ terraform {
   }
 }
 
+# CloudFront only accepts ACM certificates issued in us-east-1, wherever the
+# rest of the stack runs — this alias exists solely for the broker-domain cert.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+
+  default_tags {
+    tags = {
+      Project   = "pkgeval"
+      Component = "control-plane"
+    }
+  }
+}
+
 provider "aws" {
   region = var.region
 

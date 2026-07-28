@@ -166,7 +166,8 @@ itself would still be a welcome belt-and-braces improvement.
 | ---- | -------- | ------- | ----------- |
 | `name_prefix` | no | `"pkgeval"` | Prefix for naming all resources. |
 | `region` | no | `"us-east-2"` | AWS region to deploy into. |
-| `bucket_name` | **yes** | — | S3 bucket for PkgEval results. |
+| `broker_domain` | no | `"pkgeval.julialang.org"` | CloudFront-fronted CNAME for the broker; `""` disables. |
+| `bucket_name` | no | `"pkgeval"` | S3 bucket for PkgEval results (and, suffixed `-lambda`, deploy bundles). |
 | `github_org` | **yes** | — | GitHub organization whose teams gate access. |
 | `worker_team` | no | `"pkgeval-workers"` | Team slug allowed to run workers. |
 | `submitter_team` | no | `"pkgeval-submitters"` | Team slug allowed to submit runs. |
@@ -182,10 +183,10 @@ itself would still be a welcome belt-and-braces improvement.
 | `ec2_worker_min` | no | `0` | EC2 worker floor (= max to pin capacity). |
 | `ec2_worker_backlog_target` | no | `400` | Visible jobs per worker the scaler aims for. |
 | `ec2_worker_idle_minutes` | no | `15` | Full queue idle time before scaling to the floor. |
-| `ec2_worker_instance_types` | no | m6a/m6i/m5a/m7a `8xlarge` | Spot pool candidates, in preference order. |
+| `ec2_worker_instance_types` | no | six 32-vCPU `8xlarge` M types | Spot pools for price-capacity-optimized allocation. |
 | `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
 | `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
-| `ec2_worker_farm_repo` / `_ref` | no | staging repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |
+| `ec2_worker_farm_repo` / `_ref` | no | JuliaCI repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |
 | `ec2_worker_julia_channel` | no | `"1.12"` | juliaup channel installed on EC2 workers. |
 
 ## Deploying
@@ -209,8 +210,12 @@ itself would still be a welcome belt-and-braces improvement.
    tofu apply -var bucket_name=<bucket> -var github_org=<org> -var github_client_id=<client-id>
    ```
 
-3. Note the `broker_function_url` output and hand it to worker operators and
-   submitters — that URL is all they need.
+3. Create the two DNS records from the `broker_dns_records` output in the
+   broker domain's zone (julialang.org lives at Namecheap, outside terraform;
+   see broker_domain.tf for the two-step bring-up — the ACM validation record
+   is needed *during* the first apply). Once the name resolves, workers and
+   submitters need no configuration at all; the raw `broker_function_url`
+   output keeps working as a fallback.
 
 Re-run steps 1–2 whenever the broker code changes; the `source_code_hash`
 picks up the new zip automatically.

@@ -15,9 +15,11 @@ config_dir() = joinpath(get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config
                         "PkgEvalFarm")
 token_path() = joinpath(config_dir(), "github-token.json")
 
-broker_url() = get(ENV, "PKGEVAL_FARM_BROKER") do
-    error("no broker configured; pass --broker or set PKGEVAL_FARM_BROKER")
-end
+# stable CNAME for the broker Lambda (terraform/broker_domain.tf); --broker or
+# PKGEVAL_FARM_BROKER override for staging deployments
+const DEFAULT_BROKER = "https://pkgeval.julialang.org"
+
+broker_url() = get(ENV, "PKGEVAL_FARM_BROKER", DEFAULT_BROKER)
 
 "Query the broker for its public configuration (OAuth client id, org/team names)."
 function broker_info(broker::AbstractString)

@@ -58,7 +58,7 @@ On any Linux x86_64/aarch64 machine that meets PkgEval's requirements (cgroup v2
 unprivileged user namespaces):
 
 ```sh
-julia -e 'using Pkg; Pkg.Apps.add(url="https://github.com/KenoAIStaging/PkgEvalFarm.jl")'
+julia -e 'using Pkg; Pkg.Apps.add(url="https://github.com/JuliaCI/PkgEvalFarm.jl")'
 farm login              # GitHub device flow; requires membership in the workers team
 farm worker             # pulls jobs until stopped; --ninstances to bound parallelism
 ```
@@ -67,9 +67,10 @@ farm worker             # pulls jobs until stopped; --ninstances to bound parall
 lands in `~/.julia/bin`. From a checkout, `bin/farm <cmd>` (or
 `julia --project -m PkgEvalFarm <cmd>`) is equivalent.
 
-The only configuration a worker needs is the broker URL (`--broker` or
-`PKGEVAL_FARM_BROKER`); everything else (queue URL, table names, bucket, region) is
-handed out by the broker after authentication.
+A worker needs no configuration at all: the broker lives at its built-in default
+`https://pkgeval.julialang.org` (`--broker` or `PKGEVAL_FARM_BROKER` override it,
+e.g. for a staging deployment), and everything else (queue URL, table names,
+bucket, region) is handed out by the broker after authentication.
 
 ## Submitting a run
 
@@ -116,8 +117,10 @@ cd terraform
 tofu init && tofu apply                              # or terraform
 ```
 
-The `broker_function_url` output is the only thing workers and the bot need
-(`PKGEVAL_FARM_BROKER`). See `terraform/README.md` for all variables.
+The `broker_dns_records` output lists the DNS records that point
+`pkgeval.julialang.org` at the broker (the zone is hosted outside AWS); with
+those in place, workers need no configuration at all. See `terraform/README.md`
+for all variables.
 
 ## Running the bot
 

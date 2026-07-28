@@ -10,6 +10,12 @@ variable "region" {
   default     = "us-east-2"
 }
 
+variable "broker_domain" {
+  description = "Custom domain fronting the broker via CloudFront (see broker_domain.tf). Empty string disables; DNS records for the zone are emitted as the broker_dns_records output."
+  type        = string
+  default     = "pkgeval.julialang.org"
+}
+
 variable "bucket_name" {
   description = "Name of the S3 bucket that stores PkgEval results (reports, logs, artifacts). Also prefixes the Lambda deploy bucket (\"<name>-lambda\")."
   type        = string
@@ -133,7 +139,7 @@ variable "ec2_worker_disk_gb" {
 variable "ec2_worker_farm_repo" {
   description = "Git URL the EC2 workers clone PkgEvalFarm.jl from."
   type        = string
-  default     = "https://github.com/KenoAIStaging/PkgEvalFarm.jl"
+  default     = "https://github.com/JuliaCI/PkgEvalFarm.jl"
 }
 
 variable "ec2_worker_farm_ref" {
@@ -165,18 +171,24 @@ variable "github_oidc_provider_arn" {
 variable "github_deploy_subjects" {
   description = "GitHub OIDC `sub` claims allowed to publish Lambda bundles. The exact format is org-dependent — dump a real token before changing it (README), since a mismatch denies with no explanation."
   type        = list(string)
-  # This org mints the immutable subject variant, which embeds the numeric
-  # owner and repo ids *and* the branch — so this one standard claim pins
-  # everything the GitHub-specific keys below would, and `sub` is supported
-  # unconditionally. Value observed in a real token (see README claim dump).
-  default = ["repo:KenoAIStaging@216627359/PkgEvalFarm.jl@1311559445:ref:refs/heads/master"]
+  # Whether JuliaCI mints the immutable subject variant (embedding numeric
+  # owner/repo ids) or the default one is org configuration we cannot read, so
+  # both candidates are allowed — they are OR'd, each pins repo *and* branch,
+  # and repository_id below pins the repo regardless of the sub format. Once a
+  # real token has been dumped (README), prune to the observed value.
+  default = [
+    "repo:JuliaCI@9957604/PkgEvalFarm.jl@1311559445:ref:refs/heads/master",
+    "repo:JuliaCI/PkgEvalFarm.jl:ref:refs/heads/master",
+  ]
 }
 
 variable "github_repository_id" {
   description = "Numeric repository id, pinned via the repository_id claim (immutable across renames). null omits."
   type        = string
-  default     = "1311559445" # KenoAIStaging/PkgEvalFarm.jl
-  nullable    = true
+  # numeric ids survive repository transfers, so this held across the move
+  # from the KenoAIStaging staging org
+  default  = "1311559445" # JuliaCI/PkgEvalFarm.jl
+  nullable = true
 }
 
 variable "github_repository_owner_id" {
@@ -196,9 +208,8 @@ variable "github_deploy_ref" {
 variable "github_deploy_workflow_ref" {
   description = "Workflow file allowed to deploy (OWNER/REPO/.github/workflows/FILE@REF), matched against `job_workflow_ref`. null omits."
   type        = string
-  # value observed verbatim in a dumped token; works alongside `sub`, which
-  # IAM requires for GitHub (see cicd.tf)
-  default  = "KenoAIStaging/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
+  # works alongside `sub`, which IAM requires for GitHub (see cicd.tf)
+  default  = "JuliaCI/PkgEvalFarm.jl/.github/workflows/ci.yml@refs/heads/master"
   nullable = true
 }
 
