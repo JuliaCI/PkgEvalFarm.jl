@@ -234,7 +234,7 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::Abstr
 end
 
 "Create the DynamoDB job items (25 per BatchWriteItem), idempotently."
-function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef})
+function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef}; est=Returns(nothing))
     for batch in Iterators.partition(jobs, 25)
         requests = [Dict("PutRequest" => Dict("Item" => ddb_item(Dict(
                         "run_id" => job.run_id,
@@ -243,6 +243,10 @@ function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef})
                         "package" => job.package,
                         "status" => "pending",
                         "attempts" => 0,
+                        # the scheduler's duration estimate, stored so the
+                        # bot's ETA can weigh remaining work by expected cost
+                        # instead of assuming all jobs are equal
+                        (est(job) === nothing ? () : ("est" => est(job),))...,
                     )))) for job in batch]
         aws_retry() do
             resp = Dynamodb.batch_write_item(Dict(ctx.cfg.jobs_table => requests);
@@ -290,7 +294,7 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     # don't rewrite (= reset) job items once the run went active — after that point a
     # redelivered expand message only needs to make sure the messages went out
     if run["status"] == "expanding"
-        write_jobs(ctx, fresh)
+        write_jobs(ctx, fresh; est=job_est)
         isempty(reused) || write_reused_jobs(ctx, run_id, donor_id, reused, reused_results)
     end
     try

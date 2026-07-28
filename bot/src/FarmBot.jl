@@ -978,25 +978,57 @@ end
 ## in-flight runs -> hourly status edits of the submission comment
 
 """
-    eta_from_progress(prev_at, prev_completed, completed, total, now)
+    eta_from_work(prev_at, prev_work, work_done, remaining, now)
 
-Delta-based ETA: extrapolate from the jobs completed since the previous status
-tick (each tick snapshots its time and count, so the next one has a baseline).
-Returns `nothing` when there is no baseline yet or no forward progress — better
-no ETA than a bogus one. Self-correcting: each hour re-derives the rate from
-the latest window, so early windows polluted by expansion tail-time fade out.
+Delta-based ETA in *work-seconds*, not job counts: `work_done` is the summed
+actual duration of finished jobs, `remaining` the summed duration estimates of
+unfinished ones. The window rate `Δwork_done/Δt` measures how many slot-seconds
+the fleet actually completes per wall-second, so expensive packages running
+early (the slow queue drains first) skew neither side — they add work to the
+window exactly as they subtract it from `remaining`. Returns `nothing` when
+there is no baseline tick yet or no forward progress — better no ETA than a
+bogus one. Self-correcting: each tick re-derives the rate from the latest
+window, so fleet scale-ups and spot losses fold in within an hour.
 """
-function eta_from_progress(prev_at::String, prev_completed::Int,
-                           completed::Int, total::Int, now::DateTime)
-    prev_completed < 0 && return nothing
-    completed > prev_completed || return nothing
-    total > completed || return nothing
+function eta_from_work(prev_at::String, prev_work::Float64,
+                       work_done::Float64, remaining::Float64, now::DateTime)
+    prev_work < 0 && return nothing
+    remaining > 0 || return nothing
+    work_done > prev_work || return nothing
     prev = parse_isodate(prev_at)
     prev === nothing && return nothing
     elapsed_s = Dates.value(now - something(prev)) / 1000
     elapsed_s > 0 || return nothing
-    rate = (completed - prev_completed) / elapsed_s
-    return now + Dates.Second(round(Int, (total - completed) / rate))
+    rate = (work_done - prev_work) / elapsed_s
+    return now + Dates.Second(round(Int, remaining / rate))
+end
+
+"""
+Sum a run's finished work (actual durations) and remaining work (stored
+duration estimates). Jobs without a stored estimate — runs expanded before
+estimates were recorded — fall back to the mean actual duration of finished
+jobs, or drop the ETA entirely when nothing has finished to average.
+Returns `(work_done, remaining)`, with `remaining = -1.0` meaning unknown.
+"""
+function run_work(jobs::Vector{Item})
+    work_done = 0.0
+    ndone = 0
+    for j in jobs
+        if str(j, "status", "") in TERMINAL_STATUSES
+            work_done += flt(j, "duration", 0.0)
+            ndone += 1
+        end
+    end
+    fallback = ndone > 0 ? work_done / ndone : -1.0
+    remaining = 0.0
+    for j in jobs
+        str(j, "status", "") in TERMINAL_STATUSES && continue
+        e = flt(j, "est", -1.0)
+        e < 0 && (e = fallback)
+        e < 0 && return (work_done, -1.0)
+        remaining += e
+    end
+    return (work_done, remaining)
 end
 
 "One-line human summary of a run's configurations (\"primary: `...`, against: `...`\")."
@@ -1055,8 +1087,10 @@ throttle and concurrency claim in one: it only succeeds when the previous edit
 is old enough and the run is still in flight, so overlapping invocations (and
 the 60s interactive loop) collapse to at most one edit per hour, and a run
 that just flipped done keeps its final report instead of getting a stale
-"active" body written over it. The claim also snapshots
-`status_completed_jobs`, the next tick's ETA baseline.
+"active" body written over it. Once claimed, the run's jobs are summed into
+work done / work remaining (the jobs query is gated behind the claim on
+purpose), and `status_work_done` is snapshotted as the next tick's ETA
+baseline.
 """
 function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
                                min_interval::Dates.Minute=Dates.Minute(55))
@@ -1073,23 +1107,34 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
               "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
               "\"ConditionExpression\":\"#s IN (:expanding, :active) AND " *
               "(attribute_not_exists(status_commented_at) OR status_commented_at < :cutoff)\"," *
-              "\"UpdateExpression\":\"SET status_commented_at = :now, status_completed_jobs = :done\"," *
+              "\"UpdateExpression\":\"SET status_commented_at = :now\"," *
               "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
               "\"ExpressionAttributeValues\":{" *
               "\":expanding\":{\"S\":\"expanding\"},\":active\":{\"S\":\"active\"}," *
               "\":cutoff\":{\"S\":$(JSON.json(isodate(now - min_interval)))}," *
-              "\":now\":{\"S\":$(JSON.json(isodate(now)))}," *
-              "\":done\":{\"N\":\"$completed\"}}}"
+              "\":now\":{\"S\":$(JSON.json(isodate(now)))}}}"
     try
         ddb(ctx, "UpdateItem", payload)
     catch err
         err isa ErrorException && is_conditional_failure(err) && return nothing
         rethrow()
     end
-    eta = status == "active" ?
-        eta_from_progress(str(run, "status_commented_at", ""),
-                          int(run, "status_completed_jobs", -1),
-                          completed, total, now) : nothing
+    eta = nothing
+    if status == "active"
+        work_done, remaining = run_work(run_jobs(ctx, run_id))
+        if remaining >= 0
+            eta = eta_from_work(str(run, "status_commented_at", ""),
+                                flt(run, "status_work_done", -1.0),
+                                work_done, remaining, now)
+        end
+        # whole seconds: string(::Float64) can go scientific, which DynamoDB's
+        # number grammar does not accept
+        snapshot = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                   "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+                   "\"UpdateExpression\":\"SET status_work_done = :w\"," *
+                   "\"ExpressionAttributeValues\":{\":w\":{\"N\":\"$(round(Int, work_done))\"}}}"
+        ddb(ctx, "UpdateItem", snapshot)
+    end
     body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
                                status, completed, total, now, eta)
     update_comment(gh, something(context.repo), comment_id, body)

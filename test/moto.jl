@@ -107,6 +107,8 @@ try
         jobs = PEF.run_jobs(ctx, run_id)
         @test length(jobs) == 6
         @test all(j -> j["status"] == "pending", jobs)
+        # the scheduler's duration estimate rides along for the bot's ETA
+        @test all(j -> j["est"] == PEF.DEFAULT_DURATION_ESTIMATE, jobs)
     end
 
     @testset "claim/heartbeat/complete lifecycle" begin
@@ -659,14 +661,27 @@ try
     @testset "status comment bodies and ETA" begin
         FB = PEF.FarmBot
         now = DateTime(2026, 7, 28, 12, 0, 0)
-        # no baseline, no progress, done, or garbage timestamp -> no ETA
-        @test FB.eta_from_progress("", -1, 10, 100, now) === nothing
-        @test FB.eta_from_progress("2026-07-28T11:00:00Z", 10, 10, 100, now) === nothing
-        @test FB.eta_from_progress("2026-07-28T11:00:00Z", 5, 100, 100, now) === nothing
-        @test FB.eta_from_progress("garbage", 5, 10, 100, now) === nothing
-        # 60 jobs in the last hour, 120 remaining -> two hours out
-        eta = FB.eta_from_progress("2026-07-28T11:00:00Z", 20, 80, 200, now)
+        # no baseline, no progress, nothing left, or garbage timestamp -> no ETA
+        @test FB.eta_from_work("", -1.0, 10.0, 100.0, now) === nothing
+        @test FB.eta_from_work("2026-07-28T11:00:00Z", 10.0, 10.0, 100.0, now) === nothing
+        @test FB.eta_from_work("2026-07-28T11:00:00Z", 5.0, 100.0, 0.0, now) === nothing
+        @test FB.eta_from_work("garbage", 5.0, 10.0, 100.0, now) === nothing
+        # 3600 work-seconds done in the last hour (one busy slot), 7200
+        # estimated remaining -> two hours out
+        eta = FB.eta_from_work("2026-07-28T11:00:00Z", 0.0, 3600.0, 7200.0, now)
         @test eta == DateTime(2026, 7, 28, 14, 0, 0)
+
+        # run_work: actual durations for the finished, estimates for the rest,
+        # mean-of-finished fallback for jobs without a stored estimate
+        mk(st; dur=nothing, est=nothing) = PEF.FarmLite.Item(
+            "status" => PEF.FarmLite.attr(st),
+            (dur === nothing ? () : ("duration" => PEF.FarmLite.attr(dur),))...,
+            (est === nothing ? () : ("est" => PEF.FarmLite.attr(est),))...)
+        jobs = [mk("test"; dur=100.0, est=50.0), mk("fail"; dur=300.0),
+                mk("pending"; est=500.0), mk("running")]
+        @test FB.run_work(jobs) == (400.0, 700.0)   # 500 est + 200 fallback
+        @test FB.run_work([mk("pending"; est=500.0), mk("pending")]) == (0.0, -1.0)
+        @test FB.run_work([mk("test"; dur=60.0), mk("pending"; est=30.0)]) == (60.0, 30.0)
 
         body = FB.status_comment_body("run-1", "primary: `a`, against: `b`",
                                       "active", 80, 200, now, eta)
