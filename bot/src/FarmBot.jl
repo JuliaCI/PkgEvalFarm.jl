@@ -1629,10 +1629,16 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         handle_dead_messages(ctx, gh, event.dead_bodies)
         return "{\"ok\":true}"
     elseif !isempty(event.new_images)
-        # runs that just flipped to done (event source mapping filters on status)
+        # runs that just reached a terminal state (the event source mapping
+        # filters on status). Runs failed via mark_run_failed carry `reported`
+        # already, so report_failed_run's claim quietly skips them here.
         for run in event.new_images
-            str(run, "status", "") == "done" || continue
-            report_finished_run(ctx, gh, run)
+            status = str(run, "status", "")
+            if status == "done"
+                report_finished_run(ctx, gh, run)
+            elseif status == "failed"
+                report_failed_run(ctx, gh, run)
+            end
         end
         return "{\"ok\":true}"
     elseif event.method !== nothing

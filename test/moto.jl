@@ -620,7 +620,25 @@ try
             n8p, n8e = length(posted), length(edited)
             PEF.FarmBot.handle_invocation(lite, gh)  # reported exactly once
             @test length(posted) == n8p && length(edited) == n8e
-            # retire the failed run's stray expand message
+
+            # ...and via the stream path: a run flipping to failed reports
+            # immediately, without waiting for the next poll
+            failed2 = PEF.create_run(ctx,
+                PEF.RunSpec(configs[1:1], ["Example"], Dict{String,Any}(
+                    "repo" => "JuliaLang/julia", "issue" => 12345, "requester" => "keno"));
+                submitter="keno via @pkgeval")
+            PEF.fail_run(ctx, failed2, "its Julia build failed: http://bk/8")
+            run_item2 = PEF.FarmBot.get_run(lite, String(failed2))
+            stream2 = JSON.json(Dict("Records" => [Dict(
+                "eventName" => "MODIFY",
+                "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item2))))]))
+            @test JSON.parse(PEF.FarmBot.handle_event(stream2, lite, gh))["ok"] == true
+            @test occursin("@keno: run `$failed2` **failed** — its Julia build failed", posted[end])
+            n8p2 = length(posted)
+            @test JSON.parse(PEF.FarmBot.handle_event(stream2, lite, gh))["ok"] == true  # no double
+            @test length(posted) == n8p2
+
+            # retire the failed runs' stray expand messages
             while (c = PEF.claim_job(ctx; wait=1)) !== nothing
                 SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
             end

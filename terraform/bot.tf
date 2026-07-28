@@ -195,12 +195,14 @@ resource "aws_lambda_event_source_mapping" "bot_runs_stream" {
   starting_position = "LATEST"
   batch_size        = 10
 
-  # only invoke for runs reaching "done"; per-job counter updates are filtered
-  # out for free at the event-source level
+  # only invoke for runs reaching a terminal state; per-job counter updates
+  # are filtered out for free at the event-source level. "failed" makes
+  # worker-side failures (e.g. a Julia build that CI gave up on) report
+  # immediately instead of waiting for the next scheduled poll.
   filter_criteria {
     filter {
       pattern = jsonencode({
-        dynamodb = { NewImage = { status = { S = ["done"] } } }
+        dynamodb = { NewImage = { status = { S = ["done", "failed"] } } }
       })
     }
   }
