@@ -122,7 +122,17 @@ variable "ec2_worker_instance_types" {
   description = "Instance types the spot fleet may use; sizes may be mixed freely (the ASG weights each by its vCPUs, and the scheduler is size-aware). 4 GB/vCPU recommended (heavy package tests) and x86 only (the sysimage and result comparability assume it). More entries = deeper spot pools; the allocator picks by price-per-slot among well-capacitized pools, so cheap large sizes are used exactly when they are actually cheaper."
   type        = list(string)
   default = [
+    # every variant family (d/n/dn/ad, id/in) is a *separate* spot pool with
+    # identical compute — free depth against regional capacity crunches
+    # (observed live: UnfulfillableCapacity across the narrower list while a
+    # 24k-job backlog waited). r-types trade a higher price for 8 GB/vCPU and
+    # yet more pools; 4xlarge sizes let the allocator scrounge partial
+    # capacity when no full 8xlarge pool has room.
     "m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge",
+    "m5d.8xlarge", "m5n.8xlarge", "m5dn.8xlarge", "m5ad.8xlarge",
+    "m6id.8xlarge", "m6in.8xlarge", "m6idn.8xlarge",
+    "r6a.8xlarge", "r5.8xlarge", "r6i.8xlarge",
+    "m6a.4xlarge", "m6i.4xlarge", "m5.4xlarge", "m7a.4xlarge",
     "m6a.16xlarge", "m7a.16xlarge",
     "m6a.24xlarge", "m7a.24xlarge", "m5a.24xlarge",
   ]
