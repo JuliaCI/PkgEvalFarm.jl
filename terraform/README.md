@@ -220,8 +220,14 @@ would look in the new region, find nothing, and plan a full re-create while
 orphaning the still-running old stack. `tofu destroy` with the *old* region
 first, then change the variable and apply fresh. Rename the buckets in the
 same move (S3's global namespace releases deleted names only after an
-unbounded delay), and re-create the SSM secret parameters in the new region —
-SecureStrings are set out of band and are not carried by terraform.
+unbounded delay), and carry the out-of-band SSM secrets over — they are not
+in terraform. `bin/farm-secrets` does that (backup *before* the destroy,
+restore *after* the apply — the placeholders must exist first):
+
+```sh
+bin/farm-secrets backup --region <old> -o secrets.json   # before destroy
+bin/farm-secrets restore --region <new> -i secrets.json  # after apply
+```
 
 ## Build portability note
 
