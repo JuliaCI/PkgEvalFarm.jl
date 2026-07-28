@@ -405,7 +405,14 @@ try
         TestHTTP.register!(router, "POST", "/repos/JuliaLang/julia/issues/12345/comments",
             req -> begin
                 push!(posted, JSON.parse(String(req.body))["body"])
-                TestHTTP.Response(201, "{}")
+                TestHTTP.Response(201, JSON.json(Dict("id" => 700000 + length(posted))))
+            end)
+        edited = Pair{String,String}[]  # comment id => body, from PATCH edits
+        TestHTTP.register!(router, "PATCH", "/repos/JuliaLang/julia/issues/comments/*",
+            req -> begin
+                push!(edited, String(split(req.target, '/')[end]) =>
+                              JSON.parse(String(req.body))["body"])
+                TestHTTP.Response(200, "{}")
             end)
         gh_port = rand(30001:40000)
         server = TestHTTP.serve!(router, "127.0.0.1", gh_port)
@@ -442,6 +449,12 @@ try
             # the config json round-trips into a PkgEval Configuration
             config = PEF.config_from_dict(run["configs"][1])
             @test config.buildflags == ["LLVM_ASSERTIONS=1", "FORCE_ASSERTIONS=1"]
+            # the submission comment id is recorded, and the same invocation
+            # already edits an in-place status body over the ack text
+            @test run["comment_id"] == 700001
+            @test !isempty(edited) && edited[end].first == "700001"
+            @test occursin("**Status**", edited[end].second)
+            @test occursin("expanding", edited[end].second)
 
             # 2. a worker picks it up, expands and completes it
             notifications[] = "[]"
@@ -458,16 +471,18 @@ try
             end
             @test PEF.get_run(ctx, run_id)["status"] == "done"
 
-            # 3. next poll posts the report
+            # 3. next poll edits the report into the submission comment
             PEF.FarmBot.handle_invocation(lite, gh)
-            @test length(posted) == 2
-            @test occursin("@keno: run `$run_id` finished", posted[2])
-            @test occursin("no new package failures", posted[2])
-            @test occursin("report.md", posted[2])
+            @test length(posted) == 1  # no new comment: the report arrives by edit
+            @test edited[end].first == "700001"
+            @test occursin("@keno: run `$run_id` finished", edited[end].second)
+            @test occursin("no new package failures", edited[end].second)
+            @test occursin("report.md", edited[end].second)
 
-            # 4. and does not double-post
+            # 4. and does not double-report
+            n_edited = length(edited)
             PEF.FarmBot.handle_invocation(lite, gh)
-            @test length(posted) == 2
+            @test length(posted) == 1 && length(edited) == n_edited
 
             # 5. webhook path: an issue_comment delivery submits a run with a
             #    single GitHub call (no notifications involved)
@@ -491,14 +506,14 @@ try
                 # bad signature is rejected without side effects
                 resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign("evil")), lite, gh))
                 @test resp["statusCode"] == 401
-                @test length(posted) == 2
+                @test length(posted) == 1
 
                 resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign(payload)), lite, gh))
                 @test resp["statusCode"] == 200
             end
-            @test length(posted) == 3
-            @test occursin("has been submitted as run", posted[3])
-            webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
+            @test length(posted) == 2
+            @test occursin("has been submitted as run", posted[2])
+            webhook_run_id = match(r"run `([^`]+)`", posted[2]).captures[1]
             @test webhook_run_id == "gh-555111"  # deterministic, comment-derived
 
             # 5a. duplicate deliveries collapse into the one run: a webhook
@@ -516,7 +531,10 @@ try
                     "latest_comment_url" => "$(gh_base[])/repos/JuliaLang/julia/issues/comments/2"))])
             PEF.FarmBot.handle_invocation(lite, gh)
             notifications[] = "[]"
-            @test length(posted) == 3      # no extra ack comments
+            @test length(posted) == 2      # no extra ack comments
+            # ... but that poll did edit a status body onto the webhook run's comment
+            @test edited[end].first == "700002"
+            @test occursin("`gh-555111`", edited[end].second)
             run = PEF.get_run(ctx, "gh-555111")
             @test run["status"] == "expanding"  # still exactly one run, untouched
 
@@ -527,8 +545,8 @@ try
                     webhook_event(intruder, sign(intruder)), lite, gh))
                 @test resp["statusCode"] == 200
             end
-            @test length(posted) == 4
-            @test occursin("only members of the KenoAIStaging/pkgeval-submitters team", posted[4])
+            @test length(posted) == 3
+            @test occursin("only members of the KenoAIStaging/pkgeval-submitters team", posted[3])
             posted_refusal = pop!(posted)  # keep later indices stable
 
             # both authorization modes, checked directly
@@ -560,20 +578,66 @@ try
                 "eventName" => "MODIFY",
                 "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item))))]))
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
-            @test length(posted) == 4
-            @test occursin("@keno: run `$webhook_run_id` finished", posted[4])
+            @test length(posted) == 2  # the report is an edit, not a new comment
+            @test edited[end].first == "700002"
+            @test occursin("@keno: run `$webhook_run_id` finished", edited[end].second)
 
-            # duplicate stream delivery does not double-post
+            # duplicate stream delivery does not double-report
+            n_edited6 = length(edited)
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
-            @test length(posted) == 4
+            @test length(posted) == 2 && length(edited) == n_edited6
 
             # 7. an unrecognized event falls back to the scheduled poll
             notifications[] = "[]"
             @test JSON.parse(PEF.FarmBot.handle_event("{}", lite, gh))["ok"] == true
-            @test length(posted) == 4
+            @test length(posted) == 2 && length(edited) == n_edited6  # all runs done
         finally
             close(server)
         end
+    end
+
+    @testset "status comment bodies and ETA" begin
+        FB = PEF.FarmBot
+        now = DateTime(2026, 7, 28, 12, 0, 0)
+        # no baseline, no progress, done, or garbage timestamp -> no ETA
+        @test FB.eta_from_progress("", -1, 10, 100, now) === nothing
+        @test FB.eta_from_progress("2026-07-28T11:00:00Z", 10, 10, 100, now) === nothing
+        @test FB.eta_from_progress("2026-07-28T11:00:00Z", 5, 100, 100, now) === nothing
+        @test FB.eta_from_progress("garbage", 5, 10, 100, now) === nothing
+        # 60 jobs in the last hour, 120 remaining -> two hours out
+        eta = FB.eta_from_progress("2026-07-28T11:00:00Z", 20, 80, 200, now)
+        @test eta == DateTime(2026, 7, 28, 14, 0, 0)
+
+        body = FB.status_comment_body("run-1", "primary: `a`, against: `b`",
+                                      "active", 80, 200, now, eta)
+        @test occursin("run `run-1` (primary: `a`, against: `b`)", body)
+        @test occursin("80/200 jobs completed", body)
+        @test occursin("Estimated completion: 2026-07-28 14:00 UTC", body)
+        body = FB.status_comment_body("run-1", "", "expanding", 0, 0, now, nothing)
+        @test occursin("expanding — building Julia", body)
+        @test occursin("as of 2026-07-28 12:00 UTC", body)
+        @test !occursin("Estimated", body)
+        # active but no ETA yet: progress without a prediction
+        body = FB.status_comment_body("run-1", "", "active", 5, 200, now, nothing)
+        @test occursin("5/200 jobs completed.", body)
+        @test !occursin("Estimated", body)
+
+        @test FB.configs_summary("[{\"name\":\"primary\",\"julia\":\"x#1\"},{\"name\":\"against\",\"julia\":\"#1.12\"}]") ==
+              "primary: `x#1`, against: `#1.12`"
+        @test FB.configs_summary("garbage") == ""
+
+        # the hand-rolled isodate parser (trim-safe replacement for DateTime(str, df))
+        @test FB.parse_isodate("2026-07-28T15:30:00Z") == DateTime(2026, 7, 28, 15, 30, 0)
+        @test FB.parse_isodate(FB.isodate(DateTime(2024, 2, 29, 23, 59, 59))) ==
+              DateTime(2024, 2, 29, 23, 59, 59)
+        @test FB.parse_isodate("2026-02-29T00:00:00Z") === nothing  # not a leap year
+        @test FB.parse_isodate("2026-07-28 15:30:00Z") === nothing
+        @test FB.parse_isodate("") === nothing
+
+        # the int accessor's default variant (added for comment_id)
+        item = PEF.FarmLite.Item("n" => PEF.FarmLite.attr(7))
+        @test PEF.FarmLite.int(item, "n", 0) == 7
+        @test PEF.FarmLite.int(item, "missing", 42) == 42
     end
 
     @testset "build request on missing staged Julia" begin

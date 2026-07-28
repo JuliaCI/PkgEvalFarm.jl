@@ -135,7 +135,10 @@ The `@pkgeval` bot is a second juliac-compiled Lambda with three triggers:
    hourly) as a fallback for missed webhook/stream deliveries — and as the sole
    mechanism when no webhook can be registered (a webhook needs admin on the target
    repo/org; polling needs no permissions there at all, which is why the original
-   Nanosoldier polled).
+   Nanosoldier polled). The poll also refreshes each in-flight run's submission
+   comment in place with progress and an ETA, so a run occupies exactly one
+   comment: the ack, the hourly status edits, and finally the report all land in
+   it (the requester is still notified — GitHub pings on mentions an edit adds).
 
 It is created by the same terraform when `github_bot_token` is set (register the
 `bot_webhook_url` output as an `issue_comment` webhook, content type JSON, with the

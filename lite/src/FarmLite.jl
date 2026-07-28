@@ -290,6 +290,8 @@ str(item::Item, key::String) = something(item[key].S)::String
 str(item::Item, key::String, default::String) =
     haskey(item, key) && item[key].S !== nothing ? something(item[key].S) : default
 int(item::Item, key::String) = parse(Int, something(item[key].N)::String)
+int(item::Item, key::String, default::Int) =
+    haskey(item, key) && item[key].N !== nothing ? parse(Int, something(item[key].N)) : default
 opt_str(item::Item, key::String) = haskey(item, key) ? item[key].S : nothing
 
 # lazy materializers for attribute values ("Attr" is recursive through L and M);

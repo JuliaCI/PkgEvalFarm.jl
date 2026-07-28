@@ -1,9 +1,11 @@
 """
 The @pkgeval bot: turns GitHub PR comments (`@pkgeval runtests(...)`) into
-farm runs and posts the report back when a run finishes.
+farm runs, keeps its submission comment updated with hourly progress + ETA,
+and edits the final report into that same comment when the run finishes.
 
 Deployed as a juliac-compiled Lambda invoked on an EventBridge schedule; each
-invocation performs one poll (mentions + finished runs). It carries the submitter IAM
+invocation performs one poll (mentions + finished runs + progress edits). It
+carries the submitter IAM
 policy on its execution role, so unlike human submitters it needs neither the broker
 nor GitHub team membership — only its GitHub account token, read from the SSM
 parameter named by `BOT_TOKEN_PARAM` (or, outside Lambda, from `BOT_GITHUB_TOKEN`).
@@ -354,7 +356,7 @@ end
 
 ## run submission (mirrors PkgEvalFarm.create_run: one PutItem + one expand message)
 
-isodate() = Dates.format(Dates.now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS\Z")
+isodate(t::DateTime=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 
 function new_run_id()
     suffix = join(rand("0123456789abcdef", 6))
@@ -464,10 +466,18 @@ function poll_mentions(ctx::LiteCtx, gh::GitHubCtx, name::String)
     end
 end
 
+"Post a new issue comment; returns its id (`nothing` if the response lacked one)."
 function post_comment(gh::GitHubCtx, repo::String, number::Int, body::String)
     resp = github_request(gh, "POST", "/repos/$repo/issues/$number/comments";
                           body="{\"body\":$(JSON.json(body))}")
     resp.status == 201 || error("failed to post comment (HTTP $(resp.status))")
+    return parse_json(resp.body, GhComment).id
+end
+
+function update_comment(gh::GitHubCtx, repo::String, comment_id::Int, body::String)
+    resp = github_request(gh, "PATCH", "/repos/$repo/issues/comments/$comment_id";
+                          body="{\"body\":$(JSON.json(body))}")
+    resp.status == 200 || error("failed to update comment (HTTP $(resp.status))")
     return nothing
 end
 
@@ -614,10 +624,29 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
         @info "command already processed; skipping duplicate delivery" run_id repo number
         return
     end
-    post_comment(gh, repo, number, """
+    comment_id = post_comment(gh, repo, number, """
         Your package evaluation job has been submitted as run `$run_id` \
-        (primary: `$primary`, against: `$against`). I will reply here once it finishes.""")
+        (primary: `$primary`, against: `$against`). I will keep this comment \
+        updated with progress, and post the report here when it finishes.""")
+    if comment_id !== nothing
+        try
+            record_comment_id(ctx, run_id, something(comment_id))
+        catch err
+            # non-fatal: the run just gets old-style separate comments
+            @error "failed to record comment id" run_id msg=error_message(err)
+        end
+    end
     @info "submitted run" run_id repo number
+end
+
+"Remember the submission comment's id so progress and final updates can edit it."
+function record_comment_id(ctx::LiteCtx, run_id::String, comment_id::Int)
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+              "\"UpdateExpression\":\"SET comment_id = :c\"," *
+              "\"ExpressionAttributeValues\":{\":c\":{\"N\":\"$comment_id\"}}}"
+    ddb(ctx, "UpdateItem", payload)
+    return nothing
 end
 
 
@@ -823,8 +852,29 @@ function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::Strin
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
-    post_comment(gh, something(context.repo), something(context.issue),
-                 mention * "run `" * run_id * "` **failed** — " * why * ".")
+    deliver_final(gh, something(context.repo), something(context.issue), run,
+                  mention * "run `" * run_id * "` **failed** — " * why * ".")
+    return nothing
+end
+
+"""
+Deliver a run's final message: edit the submission comment when one was
+recorded (keeps PR threads quiet), falling back to a fresh comment otherwise.
+The requester still gets notified either way — GitHub sends mention
+notifications for @-mentions an edit *adds*, and the in-progress bodies
+deliberately contain no mention.
+"""
+function deliver_final(gh::GitHubCtx, repo::String, issue::Int, run::Item, body::String)
+    comment_id = int(run, "comment_id", 0)
+    if comment_id > 0
+        try
+            update_comment(gh, repo, comment_id, body)
+            return nothing
+        catch err
+            @error "editing submission comment failed; posting a new one" comment_id msg=error_message(err)
+        end
+    end
+    post_comment(gh, repo, issue, body)
     return nothing
 end
 
@@ -850,11 +900,168 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
-    post_comment(gh, something(context.repo), something(context.issue), """
+    deliver_final(gh, something(context.repo), something(context.issue), run, """
         $(mention)run `$run_id` finished — **$(report.summary)**
 
         Full report: $(report_url(ctx, run_id))""")
     @info "posted report" run_id
+end
+
+
+## in-flight runs -> hourly status edits of the submission comment
+
+"""
+Parse this module's own fixed-layout `isodate` output ("2026-07-28T15:30:00Z"),
+or `nothing` on any mismatch. Hand-rolled because `DateTime(str, dateformat)`'s
+error path dispatches dynamically, which the `--trim` verifier rejects.
+"""
+function parse_isodate(s::String)
+    (ncodeunits(s) == 20 && isascii(s) &&
+     s[5] == '-' && s[8] == '-' && s[11] == 'T' &&
+     s[14] == ':' && s[17] == ':' && s[20] == 'Z') || return nothing
+    y = tryparse(Int, s[1:4]);   mo = tryparse(Int, s[6:7])
+    d = tryparse(Int, s[9:10]);  h = tryparse(Int, s[12:13])
+    mi = tryparse(Int, s[15:16]); se = tryparse(Int, s[18:19])
+    (y === nothing || mo === nothing || d === nothing ||
+     h === nothing || mi === nothing || se === nothing) && return nothing
+    (1 <= something(mo) <= 12 &&
+     1 <= something(d) <= Dates.daysinmonth(something(y), something(mo)) &&
+     something(h) <= 23 && something(mi) <= 59 && something(se) <= 59) || return nothing
+    return DateTime(something(y), something(mo), something(d),
+                    something(h), something(mi), something(se))
+end
+
+"""
+    eta_from_progress(prev_at, prev_completed, completed, total, now)
+
+Delta-based ETA: extrapolate from the jobs completed since the previous status
+tick (each tick snapshots its time and count, so the next one has a baseline).
+Returns `nothing` when there is no baseline yet or no forward progress — better
+no ETA than a bogus one. Self-correcting: each hour re-derives the rate from
+the latest window, so early windows polluted by expansion tail-time fade out.
+"""
+function eta_from_progress(prev_at::String, prev_completed::Int,
+                           completed::Int, total::Int, now::DateTime)
+    prev_completed < 0 && return nothing
+    completed > prev_completed || return nothing
+    total > completed || return nothing
+    prev = parse_isodate(prev_at)
+    prev === nothing && return nothing
+    elapsed_s = Dates.value(now - something(prev)) / 1000
+    elapsed_s > 0 || return nothing
+    rate = (completed - prev_completed) / elapsed_s
+    return now + Dates.Second(round(Int, (total - completed) / rate))
+end
+
+"One-line human summary of a run's configurations (\"primary: `...`, against: `...`\")."
+function configs_summary(configs_json::String)
+    configs = try
+        parse_json(configs_json, Vector{ConfigInfo})
+    catch
+        ConfigInfo[]
+    end
+    isempty(configs) && return ""
+    return join(("$(something(c.name, "?")): `$(something(c.julia, "?"))`" for c in configs), ", ")
+end
+
+"""
+Compose the in-progress body for the submission comment. Pure so tests can pin
+the exact rendering; `eta === nothing` means "don't print one". Deliberately
+mention-free: GitHub notifies on mentions an edit adds, and only the final
+message should ping the requester.
+"""
+function status_comment_body(run_id::String, config_desc::String, status::String,
+                             completed::Int, total::Int, asof::DateTime,
+                             eta::Union{Nothing,DateTime})
+    desc = isempty(config_desc) ? "" : " ($config_desc)"
+    stampfmt = dateformat"yyyy-mm-dd HH:MM \U\T\C"
+    line = if status == "expanding"
+        "expanding — building Julia and enumerating packages."
+    elseif total > 0
+        eta_note = eta === nothing ? "" :
+            " Estimated completion: $(Dates.format(something(eta), stampfmt))."
+        "$completed/$total jobs completed.$eta_note"
+    else
+        "starting up."
+    end
+    return """
+        Your package evaluation job has been submitted as run `$run_id`$desc.
+
+        **Status** as of $(Dates.format(asof, stampfmt)): $line
+
+        I will keep updating this comment (about once an hour) and post the report here when the run finishes."""
+end
+
+"""
+One run's hourly progress edit. The conditional `status_commented_at` write is
+throttle and concurrency claim in one: it only succeeds when the previous edit
+is old enough and the run is still in flight, so overlapping invocations (and
+the 60s interactive loop) collapse to at most one edit per hour, and a run
+that just flipped done keeps its final report instead of getting a stale
+"active" body written over it. The claim also snapshots
+`status_completed_jobs`, the next tick's ETA baseline.
+"""
+function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
+                               min_interval::Dates.Minute=Dates.Minute(55))
+    comment_id = int(run, "comment_id", 0)
+    comment_id > 0 || return nothing
+    context = parse_json(str(run, "context", "{}"), RunContext)
+    (context.repo === nothing || context.issue === nothing) && return nothing
+    run_id = str(run, "run_id")
+    status = str(run, "status", "")
+    completed = int(run, "completed_jobs", 0)
+    total = int(run, "total_jobs", 0)
+    now = Dates.now(UTC)
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+              "\"ConditionExpression\":\"#s IN (:expanding, :active) AND " *
+              "(attribute_not_exists(status_commented_at) OR status_commented_at < :cutoff)\"," *
+              "\"UpdateExpression\":\"SET status_commented_at = :now, status_completed_jobs = :done\"," *
+              "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+              "\"ExpressionAttributeValues\":{" *
+              "\":expanding\":{\"S\":\"expanding\"},\":active\":{\"S\":\"active\"}," *
+              "\":cutoff\":{\"S\":$(JSON.json(isodate(now - min_interval)))}," *
+              "\":now\":{\"S\":$(JSON.json(isodate(now)))}," *
+              "\":done\":{\"N\":\"$completed\"}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        err isa ErrorException && is_conditional_failure(err) && return nothing
+        rethrow()
+    end
+    eta = status == "active" ?
+        eta_from_progress(str(run, "status_commented_at", ""),
+                          int(run, "status_completed_jobs", -1),
+                          completed, total, now) : nothing
+    body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
+                               status, completed, total, now, eta)
+    update_comment(gh, something(context.repo), comment_id, body)
+    @info "updated status comment" run_id status completed total
+    return nothing
+end
+
+"Edit the submission comment of every in-flight run that recorded one."
+function update_status_comments(ctx::LiteCtx, gh::GitHubCtx)
+    start_key = ""
+    while true
+        payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                  "\"FilterExpression\":\"#s IN (:expanding, :active) AND attribute_exists(comment_id)\"," *
+                  "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+                  "\"ExpressionAttributeValues\":{\":expanding\":{\"S\":\"expanding\"}," *
+                  "\":active\":{\"S\":\"active\"}}" *
+                  (isempty(start_key) ? "" : ",\"ExclusiveStartKey\":$start_key") * "}"
+        resp = parse_json(ddb(ctx, "Scan", payload), ItemsResp)
+        for run in something(resp.Items, Item[])
+            try
+                update_status_comment(ctx, gh, run)
+            catch err
+                @error "failed to update status comment" run_id=str(run, "run_id", "?") msg=error_message(err)
+            end
+        end
+        resp.LastEvaluatedKey === nothing && break
+        start_key = json_item(something(resp.LastEvaluatedKey))
+    end
+    return nothing
 end
 
 
@@ -1162,11 +1369,14 @@ end
 
 ## entry points
 
-"One poll iteration: handle new commands, report finished runs."
+"One poll iteration: handle new commands, report finished runs, edit progress."
 function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
     name = bot_name()
     poll_mentions(ctx, gh, name)
     check_finished_runs(ctx, gh)
+    # after check_finished_runs: a run that just finished is reported above and
+    # excluded from the status scan, instead of racing it
+    update_status_comments(ctx, gh)
     return nothing
 end
 
