@@ -131,7 +131,10 @@ resource "aws_iam_role_policy" "debug" {
         Sid      = "RedriveJobs"
         Effect   = "Allow"
         Action   = "sqs:SendMessage"
-        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
+        # the DLQ is included so the dead-letter consumer path can be exercised
+        # directly (inject a synthetic dead message, watch the bot fail the run)
+        # without driving eight failed receives through the live queues
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn, aws_sqs_queue.jobs_dlq.arn]
       },
       {
         Sid    = "ReadFarmState"
