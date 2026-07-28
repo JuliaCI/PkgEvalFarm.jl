@@ -514,6 +514,19 @@ function json_make(::Type{TeamMembership}, x::LazyVal)
     return TeamMembership(state[]), pos::Int
 end
 
+"The submitter gate: (org, team), where an empty team means plain org membership. A `SUBMITTER_TEAM` of \"ORG/TEAM\" carries its own org (matching the broker's spec format)."
+function submitter_requirement()
+    org = get(ENV, "GITHUB_ORG", "")
+    team = get(ENV, "SUBMITTER_TEAM", "")
+    isempty(org) && error("bot misconfigured: GITHUB_ORG not set")
+    i = findfirst('/', team)
+    if i !== nothing
+        org = team[1:prevind(team, i)]
+        team = team[nextind(team, i):end]
+    end
+    return (org, team)
+end
+
 """
 Whether `login` may submit evaluation jobs. With `SUBMITTER_TEAM` set, that means
 active membership in that team (the same gate the broker applies to human
@@ -524,9 +537,7 @@ bot deliberately does not replicate). The author's identity is attested by GitHu
 is what stops arbitrary passers-by from running their code on workers.
 """
 function authorized_submitter(gh::GitHubCtx, login::String)
-    org = get(ENV, "GITHUB_ORG", "")
-    team = get(ENV, "SUBMITTER_TEAM", "")
-    isempty(org) && error("bot misconfigured: GITHUB_ORG not set")
+    org, team = submitter_requirement()
     if isempty(team)
         # org-membership mode; the bot's account must itself be an org member
         resp = github_request(gh, "GET", "/orgs/$org/members/$login")
@@ -538,8 +549,7 @@ function authorized_submitter(gh::GitHubCtx, login::String)
 end
 
 authz_description() = begin
-    org = get(ENV, "GITHUB_ORG", "")
-    team = get(ENV, "SUBMITTER_TEAM", "")
+    org, team = submitter_requirement()
     isempty(team) ? "members of the $org organization" : "members of the $org/$team team"
 end
 

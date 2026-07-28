@@ -28,13 +28,13 @@ variable "github_org" {
 }
 
 variable "worker_team" {
-  description = "GitHub team slug whose members may enroll machines as PkgEval workers."
+  description = "Who may enroll machines as PkgEval workers: a team slug in github_org, \"ORG/TEAM\" for a team in another org, or \"\" for any github_org member."
   type        = string
   default     = "pkgeval-workers"
 }
 
 variable "submitter_team" {
-  description = "GitHub team slug whose members may submit PkgEval runs."
+  description = "Who may submit PkgEval runs: a team slug in github_org, \"ORG/TEAM\" for a team in another org, or \"\" for any github_org member."
   type        = string
   default     = "pkgeval-submitters"
 }

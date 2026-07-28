@@ -113,6 +113,26 @@ end
     end
 end
 
+@testset "role requirements" begin
+    with_env(TEST_ENV) do
+        @test FarmBroker.role_requirement("worker") == ("JuliaCI", "pkgeval-workers")
+        @test FarmBroker.role_requirement("root") === nothing
+    end
+    # the roles need not gate on the same org: "ORG/TEAM" carries its own org,
+    # and "" means plain membership of GITHUB_ORG (no team)
+    with_env(merge(TEST_ENV, Dict("GITHUB_ORG" => "JuliaLang",
+                                  "SUBMITTER_TEAM" => "",
+                                  "WORKER_TEAM" => "JuliaCI/pkgeval-workers"))) do
+        @test FarmBroker.role_requirement("submitter") == ("JuliaLang", nothing)
+        @test FarmBroker.role_requirement("worker") == ("JuliaCI", "pkgeval-workers")
+    end
+
+    membership(s) = FarmBroker.parse_json(s, FarmBroker.OrgMembership).state
+    @test membership("{\"state\":\"active\",\"role\":\"member\"}") == "active"
+    @test membership("{\"state\":\"pending\"}") == "pending"
+    @test membership("{}") === nothing
+end
+
 @testset "STS XML response parsing" begin
     # emulators answer XML even when asked for JSON; exercise that fallback directly
     xml = """

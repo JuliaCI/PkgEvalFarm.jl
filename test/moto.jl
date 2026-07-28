@@ -342,6 +342,20 @@ try
         @test PEF.get_run(ctx, run_id)["status"] == "done"
     end
 
+    @testset "submitter requirement parsing" begin
+        # "TEAM" gates on a GITHUB_ORG team; "ORG/TEAM" carries its own org
+        # (matching the broker's spec format); "" is plain org membership
+        withenv("GITHUB_ORG" => "JuliaLang", "SUBMITTER_TEAM" => "pkgeval-submitters") do
+            @test PEF.FarmBot.submitter_requirement() == ("JuliaLang", "pkgeval-submitters")
+        end
+        withenv("GITHUB_ORG" => "JuliaLang", "SUBMITTER_TEAM" => "JuliaCI/pkgeval-workers") do
+            @test PEF.FarmBot.submitter_requirement() == ("JuliaCI", "pkgeval-workers")
+        end
+        withenv("GITHUB_ORG" => "JuliaLang", "SUBMITTER_TEAM" => "") do
+            @test PEF.FarmBot.submitter_requirement() == ("JuliaLang", "")
+        end
+    end
+
     @testset "bot end-to-end (stub GitHub)" begin
         import HTTP as TestHTTP
 

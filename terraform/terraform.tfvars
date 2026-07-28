@@ -1,6 +1,14 @@
 # Deployment-specific values (nothing here is secret; the bot's GitHub token
 # and webhook secret live in SSM parameters, set out of band — see bot.tf).
-github_org = "KenoAIStaging"
+#
+# Access policy: any JuliaLang org member may submit runs and @pkgeval commands
+# (submitter_team = "" means plain github_org membership, the classic
+# Nanosoldier policy); enrolling workers is gated on the JuliaCI/pkgeval-workers
+# team. The @pkgeval bot account must be a member of both orgs — it checks
+# JuliaLang membership on behalf of command authors.
+github_org     = "JuliaLang"
+submitter_team = ""
+worker_team    = "JuliaCI/pkgeval-workers"
 
 # this account already has a GitHub Actions OIDC provider (AWS allows only one
 # per issuer URL), so reference it instead of creating a second one

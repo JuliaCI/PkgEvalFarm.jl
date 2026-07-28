@@ -8,10 +8,12 @@ user token for short-lived, least-privilege AWS credentials:
     POST /creds  {"role": "worker"|"submitter"}, Authorization: Bearer <github token>
                  -> STS credentials + farm resource locations
 
-Authorization is GitHub team membership (checked with the caller's own token, so the
-broker itself holds no GitHub secrets): the teams are configured via `GITHUB_ORG`,
-`WORKER_TEAM` and `SUBMITTER_TEAM`, and map to the IAM roles `WORKER_ROLE_ARN` /
-`SUBMITTER_ROLE_ARN`.
+Authorization is GitHub membership (checked with the caller's own token, so the
+broker itself holds no GitHub secrets), configured via `GITHUB_ORG`, `WORKER_TEAM`
+and `SUBMITTER_TEAM` and mapping to the IAM roles `WORKER_ROLE_ARN` /
+`SUBMITTER_ROLE_ARN`. A team spec is `"TEAM"` (a team in `GITHUB_ORG`),
+`"ORG/TEAM"` (a team in another org — the roles need not gate on the same org),
+or `""` (plain membership of `GITHUB_ORG`, no team required).
 
 Deliberately stdlib-only (+ JSON.jl): HTTP via `Downloads`, SigV4 via `SHA`, and the
 single STS call is hand-signed rather than pulling a full AWS SDK into the binary.
@@ -63,6 +65,26 @@ role_team(role::String) = role == "worker" ? env("WORKER_TEAM") :
                           role == "submitter" ? env("SUBMITTER_TEAM") :
                           nothing
 role_arn(role::String) = role == "worker" ? env("WORKER_ROLE_ARN") : env("SUBMITTER_ROLE_ARN")
+
+"""
+    role_requirement(role) -> (org, team) | nothing
+
+Resolve a role's team spec into the org whose membership is checked and the
+team within it (`nothing` = plain org membership). Specs: `"TEAM"` names a team
+in `GITHUB_ORG`, `"ORG/TEAM"` a team elsewhere, `""` any `GITHUB_ORG` member.
+"""
+function role_requirement(role::String)
+    spec = role_team(role)
+    spec === nothing && return nothing
+    org = env("GITHUB_ORG")
+    team = spec::String
+    i = findfirst('/', team)
+    if i !== nothing
+        org = team[1:prevind(team, i)]
+        team = team[nextind(team, i):end]
+    end
+    return (org, isempty(team) ? nothing : team)
+end
 
 "Farm resource locations, returned alongside credentials (JSON object keys = field names)."
 struct FarmConfig
@@ -208,6 +230,31 @@ function json_make(::Type{Vector{GitHubTeam}}, x::LazyVal)
 end
 
 "Whether the token's user is a member of `org`'s team `team_slug` (needs read:org)."
+struct OrgMembership
+    state::Union{Nothing,String}
+end
+
+function json_make(::Type{OrgMembership}, x::LazyVal)
+    state = Ref{Union{Nothing,String}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "state"
+            s, p = json_string(v); state[] = s; return p
+        end
+        return nothing
+    end
+    return OrgMembership(state[]), pos::Int
+end
+
+# the caller's own token may always read the caller's own membership; "pending"
+# (invited but not accepted) deliberately does not count
+function org_member(token, org::String)
+    resp = github_get("/user/memberships/orgs/$org", token)
+    resp.status == 200 || return false
+    state = parse_json(resp.body, OrgMembership).state
+    return state !== nothing && something(state) == "active"
+end
+
 function team_member(token, org::String, team_slug::String)
     for page in 1:10
         resp = github_get("/user/teams?per_page=100&page=$page", token)
@@ -584,16 +631,23 @@ function handle_creds(event)
     catch
         return error_response(400, "request body must be {\"role\": \"worker\"|\"submitter\"}")
     end
-    team = role_team(role)
-    team === nothing && return error_response(400, "unknown role: $role")
+    requirement = role_requirement(role)
+    requirement === nothing && return error_response(400, "unknown role: $role")
+    org, team = something(requirement)
 
     user = github_user(token)
     user === nothing && return error_response(401, "invalid GitHub token")
-    org = env("GITHUB_ORG")
-    team_member(token, org, team) ||
-        return error_response(403,
-            "@$user is not a member of $org/$team; membership in that team " *
-            "(with the token granted read:org) is required for the '$role' role")
+    if team === nothing
+        org_member(token, org) ||
+            return error_response(403,
+                "@$user is not a member of the $org organization; membership " *
+                "(with the token granted read:org) is required for the '$role' role")
+    else
+        team_member(token, org, something(team)) ||
+            return error_response(403,
+                "@$user is not a member of $org/$(something(team)); membership in that " *
+                "team (with the token granted read:org) is required for the '$role' role")
+    end
 
     duration = parse(Int, get(ENV, "CRED_DURATION", "3600"))
     credentials = assume_role(role_arn(role), user; duration)
