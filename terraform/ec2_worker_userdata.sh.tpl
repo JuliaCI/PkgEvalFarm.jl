@@ -60,10 +60,13 @@ systemctl daemon-reload
 loginctl enable-linger worker
 WORKER_UID=$(id -u worker)
 
-# instance identity for fleet-drain coordination, fetched as root (IMDS is
-# firewalled to root; the worker only ever needs the resulting string)
+# instance identity for fleet-drain coordination and cost attribution,
+# fetched as root (IMDS is firewalled to root; the worker only ever needs the
+# resulting strings)
 IMDS_TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-type)
+INSTANCE_AZ=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 
 sudo -u worker -H bash -c 'curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel ${julia_channel}'
 sudo -u worker -H git clone --branch ${farm_ref} ${farm_repo} /home/worker/PkgEvalFarm.jl
@@ -276,6 +279,9 @@ Environment=PKGEVAL_BUILD_REQUEST_FUNCTION=${build_request_function}
 Environment=PKGEVAL_DRAIN_FILE=/run/pkgeval/drain
 Environment=PKGEVAL_ASG_NAME=${asg_name}
 Environment=PKGEVAL_INSTANCE_ID=$INSTANCE_ID
+# type + AZ let the worker look up its own spot price for per-job cost attribution
+Environment=PKGEVAL_INSTANCE_TYPE=$INSTANCE_TYPE
+Environment=PKGEVAL_AZ=$INSTANCE_AZ
 Environment=PKGEVAL_RUNS_TABLE=${runs_table}
 Environment=PKGEVAL_JOBS_TABLE=${jobs_table}
 Environment=PKGEVAL_BUCKET=${bucket}

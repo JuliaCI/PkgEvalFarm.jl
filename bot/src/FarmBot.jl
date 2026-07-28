@@ -21,7 +21,7 @@ using JSON
 
 include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
-using .FarmLite: Attr, Item, attr, str, int, opt_str, json_item, ddb, sqs_send_message,
+using .FarmLite: Attr, Item, attr, str, int, flt, opt_str, json_item, ddb, sqs_send_message,
                  s3_put, is_conditional_failure, GitHubCtx, github_request, urlencode,
                  error_message, lambda_loop, ctx_from_env, ssm_parameter, parse_isodate,
                  LazyVal, parse_json, json_string, json_bool, json_int,
@@ -917,10 +917,12 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
+    costline = report.cost > 0 ?
+        "\nEstimated compute cost: " * dollars(report.cost) * " (EC2 spot)" : ""
     deliver_final(gh, something(context.repo), something(context.issue), run, """
         $(mention)run `$run_id` finished — **$(report.summary)**
 
-        Full report: $(report_url(ctx, run_id))""")
+        Full report: $(report_url(ctx, run_id))$(costline)""")
     @info "posted report" run_id
 end
 
@@ -1275,6 +1277,13 @@ function describe_job(ctx::LiteCtx, job::Item)
            " — ", log)
 end
 
+"Format a dollar amount to whole cents; hand-rolled so --trim needs no Printf (or lpad)."
+function dollars(x::Float64)
+    cents = round(Int, x * 100)
+    frac = cents % 100
+    return "\$" * string(cents ÷ 100) * (frac < 10 ? ".0" : ".") * string(frac)
+end
+
 """
     generate_report(ctx, run_id) -> (; summary, markdown)
 
@@ -1308,6 +1317,13 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         println(io, "- ", count(j -> opt_str(j, "reused_from") !== nothing, jobs),
                 " baseline results reused from run ", join(map(d -> "`$d`", donors), ", "),
                 " (pass `fresh_baseline = true` to re-evaluate)")
+    total_cost = 0.0
+    for j in jobs
+        total_cost += flt(j, "cost", 0.0)
+    end
+    total_cost > 0 &&
+        println(io, "- estimated compute cost: ", dollars(total_cost),
+                " (EC2 spot, job time only; reused baselines cost nothing)")
     println(io)
 
     config_names = String[something(c.name, "?") for c in configs]
@@ -1372,7 +1388,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            content_type="text/markdown; charset=utf-8")
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
-    return (; summary, markdown, url=report_url(ctx, run_id))
+    return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost)
 end
 
 # machine-readable dump of the run + job records (attribute values unwrapped)

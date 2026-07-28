@@ -16,6 +16,7 @@ using AWS: @service
 @service STS
 @service Auto_Scaling
 @service Lambda
+@service EC2
 
 import PkgEval
 

@@ -292,6 +292,9 @@ str(item::Item, key::String, default::String) =
 int(item::Item, key::String) = parse(Int, something(item[key].N)::String)
 int(item::Item, key::String, default::Int) =
     haskey(item, key) && item[key].N !== nothing ? parse(Int, something(item[key].N)) : default
+flt(item::Item, key::String, default::Float64) =
+    haskey(item, key) && item[key].N !== nothing ?
+        something(tryparse(Float64, something(item[key].N)), default) : default
 opt_str(item::Item, key::String) = haskey(item, key) ? item[key].S : nothing
 
 """

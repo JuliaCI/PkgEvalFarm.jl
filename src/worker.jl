@@ -29,6 +29,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # build surfaces as MissingStagedBuild and is requested from CI instead
     PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
+    init_slot_rate!(ctx, ninstances)
 
     draining = Ref(false)
     run_cache = Dict{String,Dict{String,Any}}()    # run_id -> parsed run item
@@ -162,6 +163,47 @@ end
 #
 # Everything here is best effort: any API failure leaves the worker claiming
 # and protected, which is exactly the pre-feature behavior.
+
+## per-job cost attribution
+#
+# The worker prices its own slot-hours once at startup: its instance type and
+# AZ (baked into the unit environment at bootstrap) name one spot pool, whose
+# current price divided by this instance's slot count is what a slot-hour
+# actually costs. record_result then attributes duration * rate to each job,
+# and the report sums those into a run-level estimate. Job time only: idle,
+# bootstrap and interruption rework are not billed to any job (a few percent).
+
+"\$/slot-hour of this worker, or `nothing` when unpriced (non-EC2 workers)."
+const SLOT_HOURLY_RATE = Ref{Union{Nothing,Float64}}(nothing)
+
+function init_slot_rate!(ctx::FarmCtx, slots::Int)
+    override = get(ENV, "PKGEVAL_SLOT_HOURLY", "")
+    if !isempty(override)
+        rate = tryparse(Float64, override)
+        rate === nothing ? (@warn "unparsable PKGEVAL_SLOT_HOURLY" override) :
+                           (SLOT_HOURLY_RATE[] = rate)
+        return nothing
+    end
+    instance_type = get(ENV, "PKGEVAL_INSTANCE_TYPE", "")
+    az = get(ENV, "PKGEVAL_AZ", "")
+    (isempty(instance_type) || isempty(az) || slots <= 0) && return nothing
+    try
+        resp = EC2.describe_spot_price_history(Dict(
+            "InstanceType" => [instance_type],
+            "AvailabilityZone" => az,
+            "ProductDescription" => ["Linux/UNIX"],
+            "MaxResults" => 1); aws_config=ctx.aws)
+        items = resp["spotPriceHistorySet"]["item"]
+        item = items isa AbstractVector ? first(items) : items
+        price = parse(Float64, item["spotPrice"])
+        SLOT_HOURLY_RATE[] = price / slots
+        @info "slot pricing enabled" instance_type az price rate=SLOT_HOURLY_RATE[]
+    catch err
+        # best effort: an unpriced worker just records cost-less results
+        @warn "could not price this instance's slot-hours" instance_type az err
+    end
+    return nothing
+end
 
 Base.@kwdef mutable struct FleetDrain
     asg::String

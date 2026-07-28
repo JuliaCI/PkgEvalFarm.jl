@@ -100,8 +100,10 @@ resource "aws_iam_role_policy" "ec2_worker_fleet" {
         Resource = "arn:aws:autoscaling:${var.region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name_prefix}-ec2-worker"
       },
       {
+        # DescribeSpotPriceHistory: the worker prices its own slot-hours for
+        # per-job cost attribution (neither action supports resource scoping)
         Effect   = "Allow"
-        Action   = "autoscaling:DescribeAutoScalingGroups"
+        Action   = ["autoscaling:DescribeAutoScalingGroups", "ec2:DescribeSpotPriceHistory"]
         Resource = "*"
       },
       {

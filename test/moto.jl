@@ -110,6 +110,7 @@ try
     end
 
     @testset "claim/heartbeat/complete lifecycle" begin
+        PEF.SLOT_HOURLY_RATE[] = 0.36   # price the fabricated results: 42 s -> $0.0042
         seen = Set{Tuple{String,String}}()
         for i in 1:6
             claimed = PEF.claim_job(ctx; wait=1)
@@ -135,6 +136,9 @@ try
             PEF.record_result(ctx, claimed, result)
         end
         @test length(seen) == 6
+        PEF.SLOT_HOURLY_RATE[] = nothing
+        jobs = PEF.run_jobs(ctx, RUN_ID)
+        @test all(j -> isapprox(j["cost"], 42.0 / 3600 * 0.36; rtol=1e-6), jobs)
 
         run = PEF.get_run(ctx, RUN_ID)
         @test run["completed_jobs"] == 6
@@ -182,6 +186,11 @@ try
         @test occursin("Packages that failed on both", report.markdown)  # Crayons
         @test occursin("package has test failures", report.markdown)  # stored reason_message
         @test occursin("possible new issues: 1 package", report.summary)
+        # 6 jobs x 42 s at $0.36/slot-h -> $0.0252, rendered to cents
+        @test occursin("estimated compute cost: \$0.03", report.markdown)
+        @test isapprox(report.cost, 6 * 42.0 / 3600 * 0.36; rtol=1e-6)
+        @test PEF.FarmBot.dollars(12.3) == "\$12.30"
+        @test PEF.FarmBot.dollars(0.0252) == "\$0.03"
 
         # uploaded artifacts
         fetch_raw(key) = String(copy(S3.get_object(cfg.bucket, key,
@@ -697,6 +706,21 @@ try
         miss = PkgEval.MissingStagedBuild("JuliaLang/julia",
             "1234567890abcdef1234567890abcdef12345678", "linuxassert")
         @test PEF.request_julia_build(ctx, miss) == (:error, nothing)
+    end
+
+    @testset "slot pricing" begin
+        @test PEF.SLOT_HOURLY_RATE[] === nothing   # non-EC2: unpriced
+        withenv("PKGEVAL_SLOT_HOURLY" => "0.5") do
+            PEF.init_slot_rate!(ctx, 32)
+        end
+        @test PEF.SLOT_HOURLY_RATE[] == 0.5
+        PEF.SLOT_HOURLY_RATE[] = nothing
+        PEF.init_slot_rate!(ctx, 32)   # no env, no instance identity: stays unpriced
+        @test PEF.SLOT_HOURLY_RATE[] === nothing
+
+        item = PEF.FarmLite.Item("x" => PEF.FarmLite.attr(1.25))
+        @test PEF.FarmLite.flt(item, "x", 0.0) == 1.25
+        @test PEF.FarmLite.flt(item, "missing", 7.0) == 7.0
     end
 
     @testset "worker fail_run" begin
