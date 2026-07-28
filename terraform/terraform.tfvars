@@ -17,8 +17,9 @@ github_oidc_provider_arn = "arn:aws:iam::873569884612:oidc-provider/token.action
 # EC2 worker fleet. These live here rather than on the command line: a value
 # passed with -var reverts to its default on the next apply, which would tear
 # the auto-scaling group down. min=0 keeps scale-to-zero, so the ceiling costs
-# nothing while the queue is empty.
-ec2_worker_max     = 4
+# nothing while the queue is empty. Capacity is in job slots (= vCPUs), not
+# instances: 128 is the old four-8xlarge fleet, however the allocator slices it.
+ec2_worker_max     = 128
 ec2_worker_min     = 0
 ec2_worker_disk_gb = 400
 

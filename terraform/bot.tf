@@ -138,17 +138,17 @@ resource "aws_lambda_function" "bot" {
       BOT_NAME             = var.bot_name
       # commands are only executed for authorized authors (the bot's token
       # needs read:org to check); empty team = any org member
-      GITHUB_ORG         = var.github_org
-      SUBMITTER_TEAM     = var.bot_submitter_team == null ? var.submitter_team : var.bot_submitter_team
+      GITHUB_ORG             = var.github_org
+      SUBMITTER_TEAM         = var.bot_submitter_team == null ? var.submitter_team : var.bot_submitter_team
       PKGEVAL_QUEUE_URL      = aws_sqs_queue.jobs.url
       PKGEVAL_SLOW_QUEUE_URL = aws_sqs_queue.jobs_slow.url
-      PKGEVAL_RUNS_TABLE = aws_dynamodb_table.runs.name
-      PKGEVAL_JOBS_TABLE = aws_dynamodb_table.jobs.name
-      PKGEVAL_BUCKET     = aws_s3_bucket.results.bucket
+      PKGEVAL_RUNS_TABLE     = aws_dynamodb_table.runs.name
+      PKGEVAL_JOBS_TABLE     = aws_dynamodb_table.jobs.name
+      PKGEVAL_BUCKET         = aws_s3_bucket.results.bucket
       # lets the DLQ consumer recognize (and recycle) messages that are only
       # waiting on a pending CI build; empty when build requests are disabled
       PKGEVAL_BUILDS_TABLE = local.build_request_enabled == 1 ? aws_dynamodb_table.builds[0].name : ""
-      FARM_REGION        = var.region
+      FARM_REGION          = var.region
     }
   }
 }

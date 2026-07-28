@@ -88,28 +88,28 @@ variable "bot_schedule" {
 }
 
 variable "ec2_worker_max" {
-  description = "Capacity ceiling for EC2 workers (0 disables everything EC2-worker related). Scaling within [min, max] is queue-driven."
+  description = "Capacity ceiling for EC2 workers, in job slots = vCPUs (0 disables everything EC2-worker related; 128 ≈ four 8xlarge, or one 24xlarge + one 8xlarge). Scaling within [min, max] is queue-driven."
   type        = number
   default     = 0
 
   # deliberate guardrail while the farm is young: raise this limit here when
   # you actually mean to run a bigger fleet
   validation {
-    condition     = var.ec2_worker_max <= 4
-    error_message = "ec2_worker_max is capped at 4 for now (worst case ≈ $2.5/h spot); raise the cap in variables.tf deliberately if you need more."
+    condition     = var.ec2_worker_max <= 128
+    error_message = "ec2_worker_max is capped at 128 slots for now (worst case ≈ $2-5/h spot); raise the cap in variables.tf deliberately if you need more."
   }
 }
 
 variable "ec2_worker_min" {
-  description = "Capacity floor for EC2 workers. Set equal to ec2_worker_max to pin fixed capacity."
+  description = "Capacity floor for EC2 workers, in job slots. Set equal to ec2_worker_max to pin fixed capacity."
   type        = number
   default     = 0
 }
 
 variable "ec2_worker_backlog_target" {
-  description = "Target visible queue backlog per in-service worker; lower = more aggressive scale-out. 400 clears a full backlog share in roughly half an hour on a 32-vCPU worker."
+  description = "Target visible queue backlog per in-service job slot (vCPU); lower = more aggressive scale-out. 12.5 clears a full backlog share in roughly half an hour."
   type        = number
-  default     = 400
+  default     = 12.5
 }
 
 variable "ec2_worker_idle_minutes" {
@@ -119,9 +119,13 @@ variable "ec2_worker_idle_minutes" {
 }
 
 variable "ec2_worker_instance_types" {
-  description = "Instance types the spot fleet may use. 4 GB/vCPU recommended (heavy package tests); one machine amortizes Julia builds and caches across all its job slots, so prefer fewer, larger instances. Keep the list uniform in size (32 vCPU): the scheduler's slot math (PKGEVAL_FLEET_SLOTS, backlog-per-instance target) assumes identical instances. More entries = deeper spot pools for price-capacity-optimized to choose from; x86 only (the sysimage and result comparability assume it)."
+  description = "Instance types the spot fleet may use; sizes may be mixed freely (the ASG weights each by its vCPUs, and the scheduler is size-aware). 4 GB/vCPU recommended (heavy package tests) and x86 only (the sysimage and result comparability assume it). More entries = deeper spot pools; the allocator picks by price-per-slot among well-capacitized pools, so cheap large sizes are used exactly when they are actually cheaper."
   type        = list(string)
-  default     = ["m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge"]
+  default = [
+    "m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge",
+    "m6a.16xlarge", "m7a.16xlarge",
+    "m6a.24xlarge", "m7a.24xlarge", "m5a.24xlarge",
+  ]
 }
 
 variable "ec2_worker_on_demand_percent" {

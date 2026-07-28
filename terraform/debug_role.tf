@@ -128,9 +128,9 @@ resource "aws_iam_role_policy" "debug" {
         # The one deliberate write: re-driving a job by enqueueing a duplicate
         # message (claim_job drops duplicates for completed jobs, so this is
         # safe by construction). Debugging stuck deliveries needs it.
-        Sid      = "RedriveJobs"
-        Effect   = "Allow"
-        Action   = "sqs:SendMessage"
+        Sid    = "RedriveJobs"
+        Effect = "Allow"
+        Action = "sqs:SendMessage"
         # the DLQ is included so the dead-letter consumer path can be exercised
         # directly (inject a synthetic dead message, watch the bot fail the run)
         # without driving eight failed receives through the live queues

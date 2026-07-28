@@ -53,16 +53,20 @@ There is no per-machine registration and no long-lived secrets:
 The config can run self-enrolling EC2 workers as a spot-first auto-scaling
 group **that scales itself off the job queue**:
 
+Capacity is denominated in **job slots** (= vCPUs): the mixed-instances
+overrides are weighted by vCPU count, so the fleet may mix instance sizes and
+the spot allocator compares pools by price *per slot*.
+
 ```sh
-tofu apply -var ec2_worker_max=4    # enable, with a hard capacity ceiling
+tofu apply -var ec2_worker_max=128  # enable, with a hard slot ceiling
 tofu apply -var ec2_worker_max=0    # tear down (default)
 ```
 
 Scaling within `[ec2_worker_min, ec2_worker_max]` is automatic and designed
 not to overshoot:
 
-- **out**: proportional to the visible backlog per in-service worker
-  (`ec2_worker_backlog_target`, default 400 jobs), scale-out *only*, so a
+- **out**: proportional to the visible backlog per in-service slot
+  (`ec2_worker_backlog_target`, default 12.5 jobs/vCPU), scale-out *only*, so a
   draining queue never churns busy workers; a 15-minute instance warmup stops
   the scaler from over-ordering while machines boot. From zero, a kickstart
   policy starts exactly one worker when the queue turns non-empty — that
@@ -70,16 +74,18 @@ not to overshoot:
 - **in**: only to the floor, and only after the queue has been completely
   idle — nothing visible *or in flight* — for `ec2_worker_idle_minutes`
   (default 15), so the long tail of slow jobs is never cut short.
-- `ec2_worker_max` is validated to ≤ 4 for now as a cost guardrail; raise the
-  cap in `variables.tf` deliberately when a bigger fleet is intended. Set
-  `ec2_worker_min = ec2_worker_max` to pin fixed capacity.
+- `ec2_worker_max` is validated to ≤ 128 slots for now as a cost guardrail;
+  raise the cap in `variables.tf` deliberately when a bigger fleet is intended.
+  Set `ec2_worker_min = ec2_worker_max` to pin fixed capacity.
 
 All-spot by default (`ec2_worker_on_demand_percent = 0`): spot interruption is
 harmless — the killed worker's jobs stop being heartbeated and SQS redelivers
 them — and the ASG replaces interrupted instances automatically
-(`price-capacity-optimized` across `ec2_worker_instance_types`, default
-m6a/m6i/m5a/m7a 8xlarge: 32 vCPU with 4 GB/vCPU headroom for heavy package
-tests; larger instances amortize the per-machine Julia build and caches).
+(`price-capacity-optimized` across `ec2_worker_instance_types`, default M
+types from 8xlarge to 24xlarge, all 4 GB/vCPU for heavy package tests; with
+vCPU weights the allocator lands on a large size exactly when it is cheaper
+per slot, and larger instances also amortize the per-machine Julia build and
+caches better).
 
 Being inside AWS they skip GitHub enrollment entirely — an instance profile
 carries the same worker policy the broker would vend, and cloud-init installs
@@ -113,8 +119,9 @@ worker manages its own — dropping it once drained, restoring it on the next
 claim — so the idle policy fires on empty *queues* alone and only ever reaps
 machines with nothing running. Near the end of a run, when the visible backlog
 falls below the fleet's spare capacity, the newest instances additionally stop
-claiming (seniority rank r drains iff backlog < r × slots; the oldest, with the
-warmest caches, never does), consolidating the tail onto fewer machines. All
+claiming (an instance drains iff backlog < the summed slots of instances ranked
+ahead of it — size-aware, and the oldest, with the warmest caches, never
+drains), consolidating the tail onto fewer machines. All
 best-effort: any API failure leaves an instance busy-and-protected, which is
 the pre-feature behavior.
 
@@ -179,11 +186,11 @@ itself would still be a welcome belt-and-braces improvement.
 | `github_webhook_secret` | no | `""` | Secret for GitHub webhook verification; empty disables the webhook endpoint. |
 | `bot_name` | no | `"pkgeval"` | GitHub handle the bot answers to. |
 | `bot_schedule` | no | `"rate(1 hour)"` | EventBridge schedule for fallback bot polls. |
-| `ec2_worker_max` | no | `0` | EC2 worker ceiling (0 = disabled; validated ≤ 4 for now). |
-| `ec2_worker_min` | no | `0` | EC2 worker floor (= max to pin capacity). |
-| `ec2_worker_backlog_target` | no | `400` | Visible jobs per worker the scaler aims for. |
+| `ec2_worker_max` | no | `0` | EC2 worker ceiling in job slots = vCPUs (0 = disabled; validated ≤ 128 for now). |
+| `ec2_worker_min` | no | `0` | EC2 worker floor in slots (= max to pin capacity). |
+| `ec2_worker_backlog_target` | no | `12.5` | Visible jobs per slot (vCPU) the scaler aims for. |
 | `ec2_worker_idle_minutes` | no | `15` | Full queue idle time before scaling to the floor. |
-| `ec2_worker_instance_types` | no | six 32-vCPU `8xlarge` M types | Spot pools for price-capacity-optimized allocation. |
+| `ec2_worker_instance_types` | no | eleven M types, 8–24xlarge | Spot pools; sizes mix freely (vCPU-weighted, allocator picks by price/slot). |
 | `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
 | `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
 | `ec2_worker_farm_repo` / `_ref` | no | JuliaCI repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |

@@ -156,9 +156,9 @@ end
 #  2. Consolidation: when the visible backlog is smaller than the fleet's spare
 #     capacity, the *newest* instances stop claiming so the remaining work
 #     concentrates on the oldest (warmest-cached) machines. Decentralized and
-#     deterministic: an instance with seniority rank r (0 = oldest, by launch
-#     time) drains iff backlog < r × its slot count — rank n-1 drains first,
-#     rank 0 never does.
+#     deterministic: an instance drains iff backlog < the summed slot count of
+#     the instances ranked ahead of it (0 = most senior, which never drains).
+#     Size-aware, so the fleet may freely mix instance sizes.
 #
 # Everything here is best effort: any API failure leaves the worker claiming
 # and protected, which is exactly the pre-feature behavior.
@@ -193,13 +193,39 @@ function visible_backlog(ctx::FarmCtx)
 end
 
 """
-Seniority rank of `instance_id` (0 = oldest launch) among the ASG's in-service
-instances, from a DescribeAutoScalingGroups + DescribeInstances-free source:
-the ASG member list itself carries no launch time, so rank falls back to
-instance-id order for equal standing — deterministic is what matters, not
-which tiebreak. Returns `(rank, ninstances)`.
+Job-slot capacity of an instance type (its vCPU count): `Nxlarge` sizes are 4N
+vCPUs, `xlarge` is 4, `large` is 2. Unrecognized formats fall back to `own`
+(assume peers are shaped like us), which keeps the drain math sane rather than
+exact on exotic fleets.
 """
-function fleet_rank(ctx::FarmCtx, fleet::FleetDrain)
+function instance_slots(type::AbstractString, own::Int)
+    m = match(r"\.(\d+)xlarge$", type)
+    m !== nothing && return 4 * parse(Int, something(m.captures[1]))
+    endswith(type, ".xlarge") && return 4
+    endswith(type, ".large") && return 2
+    return own
+end
+
+# The ASG reports each member's WeightedCapacity when the group weights its
+# overrides (terraform weights by vCPUs); the type-derived size is the fallback
+function member_slots(member, own::Int)
+    weight = get(member, "WeightedCapacity", nothing)
+    if weight !== nothing
+        parsed = tryparse(Int, String(weight))
+        parsed !== nothing && return parsed
+    end
+    return instance_slots(String(get(member, "InstanceType", "")), own)
+end
+
+"""
+This instance's standing among the ASG's in-service instances: returns
+`(slots_ahead, ninstances)`, where `slots_ahead` sums the job slots of the
+members ranked ahead of it. The member list carries no launch time, so
+instance-id order is the seniority tiebreak — deterministic is what matters,
+not which tiebreak. An instance absent from the list (not yet in service)
+counts as most senior, i.e. it never drains.
+"""
+function fleet_standing(ctx::FarmCtx, fleet::FleetDrain)
     resp = Auto_Scaling.describe_auto_scaling_groups(
         Dict{String,Any}("AutoScalingGroupNames" => [fleet.asg]); aws_config=ctx.aws)
     group = resp["DescribeAutoScalingGroupsResult"]["AutoScalingGroups"]["member"]
@@ -208,12 +234,47 @@ function fleet_rank(ctx::FarmCtx, fleet::FleetDrain)
     (members === nothing || !haskey(members, "member")) && return (0, 1)
     members = members["member"]
     members isa AbstractVector || (members = [members])
-    # instance-id order as the seniority tiebreak: the ASG member list carries
-    # no launch time, and deterministic is what matters, not which tiebreak
-    ids = sort!([String(m["InstanceId"]) for m in members
-                 if m["LifecycleState"] == "InService"])
-    rank = something(findfirst(==(fleet.instance_id), ids), 1) - 1
-    return (rank, length(ids))
+    standing = sort!([(String(m["InstanceId"]), member_slots(m, fleet.slots))
+                      for m in members if m["LifecycleState"] == "InService"])
+    mine = findfirst(t -> t[1] == fleet.instance_id, standing)
+    mine === nothing && return (0, length(standing))
+    return (sum(Int[s for (_, s) in standing[1:mine-1]]; init=0), length(standing))
+end
+
+"""
+Total job slots the fleet is scaled to, for the fast/slow duration cutoff
+(see `duration_cutoff`). The `PKGEVAL_FLEET_SLOTS` override wins; otherwise
+ask the ASG — its desired capacity is denominated in slots (instance weights
+are vCPUs), bounded below by what is already in service since the kickstart
+policy asks for a nominal capacity of 1. Non-fleet deployments (no ASG) and
+API failures fall back to the static default; misestimates only shift jobs
+between the fast and slow queues, they never break anything.
+"""
+function live_fleet_slots(ctx::FarmCtx)
+    override = get(ENV, "PKGEVAL_FLEET_SLOTS", "")
+    isempty(override) || return parse(Int, override)
+    asg = get(ENV, "PKGEVAL_ASG_NAME", "")
+    isempty(asg) && return DEFAULT_FLEET_SLOTS
+    try
+        resp = Auto_Scaling.describe_auto_scaling_groups(
+            Dict{String,Any}("AutoScalingGroupNames" => [asg]); aws_config=ctx.aws)
+        group = resp["DescribeAutoScalingGroupsResult"]["AutoScalingGroups"]["member"]
+        group isa AbstractVector && (group = first(group))
+        desired = something(tryparse(Int, String(get(group, "DesiredCapacity", "0"))), 0)
+        inservice = 0
+        members = get(group, "Instances", nothing)
+        if members !== nothing && haskey(members, "member")
+            ms = members["member"]
+            ms isa AbstractVector || (ms = [ms])
+            inservice = sum(Int[member_slots(m, DEFAULT_FLEET_SLOTS ÷ 4) for m in ms
+                                if m["LifecycleState"] == "InService"]; init=0)
+        end
+        slots = max(desired, inservice)
+        slots > 0 && return slots
+    catch err
+        @warn "could not size the fleet from the ASG; using the default" err
+    end
+    return DEFAULT_FLEET_SLOTS
 end
 
 set_protection(ctx::FarmCtx, fleet::FleetDrain, protected::Bool) =
@@ -234,11 +295,11 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
         heartbeat_generation(ctx)
         try
             backlog = visible_backlog(ctx)
-            rank, n = fleet_rank(ctx, fleet)
-            should_drain = drain_decision(backlog, rank, fleet.slots)
+            slots_ahead, n = fleet_standing(ctx, fleet)
+            should_drain = drain_decision(backlog, slots_ahead)
             if should_drain != fleet.draining
                 @info(should_drain ? "draining: backlog below spare capacity" :
-                                     "resuming claims", backlog, rank, n)
+                                     "resuming claims", backlog, slots_ahead, n)
                 fleet.draining = should_drain
             end
         catch err
@@ -283,8 +344,8 @@ function heartbeat_generation(ctx::FarmCtx)
     return nothing
 end
 
-"An instance of seniority `rank` (0 = oldest) drains iff the backlog is below `rank` × slots."
-drain_decision(backlog::Int, rank::Int, slots::Int) = backlog < rank * slots
+"An instance drains iff the backlog is below the summed slots of instances ranked ahead of it (so the most senior, with 0 ahead, never drains)."
+drain_decision(backlog::Int, slots_ahead::Int) = backlog < slots_ahead
 
 """
 Ask the build-request broker to have CI build a missing Julia, via the plain

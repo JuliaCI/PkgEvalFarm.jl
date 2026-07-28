@@ -1,9 +1,11 @@
 # Optional EC2 worker capacity (testing and burst), as a spot-first auto-scaling
-# group that scales itself off the job queue. Enable by setting the capacity
-# ceiling (`-var ec2_worker_max=16`); scaling within [ec2_worker_min, max] is
-# then automatic:
+# group that scales itself off the job queue. Capacity is denominated in job
+# slots (= vCPUs; the mixed-instances overrides are weighted accordingly), so
+# the fleet may mix instance sizes and the spot allocator picks pools by price
+# per slot. Enable by setting the slot ceiling (`ec2_worker_max = 128`);
+# scaling within [ec2_worker_min, max] is then automatic:
 #
-#   - scale-out is proportional to the queue backlog per in-service instance
+#   - scale-out is proportional to the queue backlog per in-service slot
 #     (target tracking, scale-out ONLY — draining backlog never churns busy
 #     workers) and cannot exceed ec2_worker_max. A long instance-warmup stops
 #     the ASG from over-ordering while instances are still booting.
@@ -162,6 +164,12 @@ locals {
   ]
 }
 
+# vCPU counts, for weighting the mixed-instances overrides by job slots
+data "aws_ec2_instance_type" "worker" {
+  for_each      = local.ec2_workers == 0 ? toset([]) : toset(var.ec2_worker_instance_types)
+  instance_type = each.value
+}
+
 resource "aws_security_group" "ec2_worker" {
   count       = local.ec2_workers
   name        = "${var.name_prefix}-ec2-worker"
@@ -223,14 +231,14 @@ resource "aws_launch_template" "ec2_worker" {
     queue_url      = aws_sqs_queue.jobs.url
     slow_queue_url = aws_sqs_queue.jobs_slow.url
     # by name, not reference: the launch template cannot depend on the ASG
-    asg_name          = "${var.name_prefix}-ec2-worker"
+    asg_name               = "${var.name_prefix}-ec2-worker"
     build_request_function = local.build_request_enabled == 1 ? aws_lambda_function.build_request[0].function_name : ""
-    runs_table    = aws_dynamodb_table.runs.name
-    jobs_table    = aws_dynamodb_table.jobs.name
-    bucket        = aws_s3_bucket.results.bucket
-    farm_repo     = var.ec2_worker_farm_repo
-    farm_ref      = var.ec2_worker_farm_ref
-    julia_channel = var.ec2_worker_julia_channel
+    runs_table             = aws_dynamodb_table.runs.name
+    jobs_table             = aws_dynamodb_table.jobs.name
+    bucket                 = aws_s3_bucket.results.bucket
+    farm_repo              = var.ec2_worker_farm_repo
+    farm_ref               = var.ec2_worker_farm_ref
+    julia_channel          = var.ec2_worker_julia_channel
     # private; workers read it with their instance profile (see the
     # read-sysimage policy above)
     sysimage_bucket = aws_s3_bucket.lambda.bucket
@@ -256,8 +264,8 @@ resource "aws_launch_template" "ec2_worker" {
 }
 
 resource "aws_autoscaling_group" "ec2_worker" {
-  count               = local.ec2_workers
-  name                = "${var.name_prefix}-ec2-worker"
+  count = local.ec2_workers
+  name  = "${var.name_prefix}-ec2-worker"
 
   # belt-and-braces with the launch template's tag_specifications: ASG-launched
   # capacity (including spot replacements) always carries the cost tags
@@ -271,6 +279,9 @@ resource "aws_autoscaling_group" "ec2_worker" {
     value               = "workers"
     propagate_at_launch = true
   }
+  # capacity is denominated in job slots (= vCPUs), not instances: every
+  # override below carries its vCPU count as its weight, so the group may mix
+  # sizes and the allocator compares pools by price *per slot*
   min_size            = var.ec2_worker_min
   max_size            = var.ec2_worker_max
   desired_capacity    = var.ec2_worker_min
@@ -280,8 +291,9 @@ resource "aws_autoscaling_group" "ec2_worker" {
   # rate; a long warmup prevents the scaler from over-ordering in the meantime
   default_instance_warmup = 900
 
-  # the scale-out policy divides queue backlog by this metric
-  enabled_metrics = ["GroupInServiceInstances"]
+  # the scale-out policy divides queue backlog by in-service capacity (weighted
+  # = slots); the kickstart alarm watches the plain instance count
+  enabled_metrics = ["GroupInServiceInstances", "GroupInServiceCapacity"]
 
   # Gradual scale-down: instances launch protected from scale-in and the worker
   # removes its own protection once it has drained (and re-protects when it
@@ -305,6 +317,10 @@ resource "aws_autoscaling_group" "ec2_worker" {
         for_each = var.ec2_worker_instance_types
         content {
           instance_type = override.value
+          # weight = vCPUs: capacity units become job slots, and the spot
+          # allocator normalizes pool prices to price-per-slot, so it picks a
+          # 24xlarge over an 8xlarge exactly when it is cheaper per vCPU
+          weighted_capacity = tostring(data.aws_ec2_instance_type.worker[override.value].default_vcpus)
         }
       }
     }
@@ -319,11 +335,11 @@ resource "aws_autoscaling_group" "ec2_worker" {
 
 ## scaling policies
 
-# 1. proportional scale-out: keep (visible backlog / in-service instances) at the
+# 1. proportional scale-out: keep (visible backlog / in-service slots) at the
 #    target; never scales in (that's policy 3's job, and only when fully idle)
 resource "aws_autoscaling_policy" "ec2_worker_backlog" {
   count                  = local.ec2_workers
-  name                   = "backlog-per-instance"
+  name                   = "backlog-per-slot"
   autoscaling_group_name = aws_autoscaling_group.ec2_worker[0].name
   policy_type            = "TargetTrackingScaling"
 
@@ -363,13 +379,15 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         }
       }
       metrics {
-        id          = "instances"
+        id          = "capacity"
         return_data = false
         metric_stat {
           stat = "Average"
           metric {
-            namespace   = "AWS/AutoScaling"
-            metric_name = "GroupInServiceInstances"
+            namespace = "AWS/AutoScaling"
+            # weighted capacity = job slots (overrides weight by vCPUs), so a
+            # 24xlarge counts three times an 8xlarge here
+            metric_name = "GroupInServiceCapacity"
             dimensions {
               name  = "AutoScalingGroupName"
               value = aws_autoscaling_group.ec2_worker[0].name
@@ -378,12 +396,12 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         }
       }
       metrics {
-        id = "per_instance"
+        id = "per_slot"
         # CloudWatch metric math has no element-wise MAX against a constant, and
-        # dividing by a zero instance count yields no data — guard with IF.
+        # dividing by zero capacity yields no data — guard with IF.
         # (Scaling up from zero is the kickstart policy's job, below.)
-        expression  = "IF(instances > 0, (backlog + backlog_slow) / instances, backlog + backlog_slow)"
-        label       = "queue backlog per in-service worker"
+        expression  = "IF(capacity > 0, (backlog + backlog_slow) / capacity, backlog + backlog_slow)"
+        label       = "queue backlog per in-service job slot"
         return_data = true
       }
     }
@@ -454,7 +472,10 @@ resource "aws_autoscaling_policy" "ec2_worker_kickstart" {
 
   step_adjustment {
     metric_interval_lower_bound = 0
-    scaling_adjustment          = 1
+    # capacity units are slots, and every override weighs at least one
+    # instance's worth: "1 slot" launches exactly one instance of whatever
+    # pool the allocator likes, which is all a kickstart needs
+    scaling_adjustment = 1
   }
 }
 
@@ -470,8 +491,8 @@ resource "aws_cloudwatch_metric_alarm" "ec2_worker_idle" {
   # visible only, deliberately: in-flight jobs are represented by their
   # instances' scale-in protection, so drained machines are reclaimed while
   # stragglers finish elsewhere instead of the fleet waiting on the last job
-  alarm_description   = "Job queues empty (in-flight work is covered by scale-in protection)"
-  alarm_actions       = [aws_autoscaling_policy.ec2_worker_idle[0].arn]
+  alarm_description = "Job queues empty (in-flight work is covered by scale-in protection)"
+  alarm_actions     = [aws_autoscaling_policy.ec2_worker_idle[0].arn]
 
   metric_query {
     id          = "visible"

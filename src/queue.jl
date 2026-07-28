@@ -75,10 +75,12 @@ end
 # nothing while one scheduled late costs the whole tail
 const DEFAULT_DURATION_ESTIMATE = 45.0 * 60
 
-# assumed fleet slot capacity for the cutoff computation (overridable per
-# deployment). Overestimating pushes the cutoff up (more jobs classed slow) —
-# again the conservative direction.
-fleet_slots() = parse(Int, get(ENV, "PKGEVAL_FLEET_SLOTS", "128"))
+# fallback fleet slot capacity for the cutoff computation, used when neither
+# the PKGEVAL_FLEET_SLOTS override nor a live ASG answer is available (see
+# live_fleet_slots in worker.jl). Overestimating pushes the cutoff up (more
+# jobs classed slow) — again the conservative direction.
+const DEFAULT_FLEET_SLOTS = 128
+fleet_slots() = parse(Int, get(ENV, "PKGEVAL_FLEET_SLOTS", string(DEFAULT_FLEET_SLOTS)))
 
 "Completed runs, newest first, as `(created_at, run_id, configs)` tuples."
 function completed_runs(ctx::FarmCtx)
@@ -282,7 +284,7 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     # to the slow queue, which workers drain first
     est = duration_estimates(ctx, [j.package for j in fresh], completed)
     job_est(j) = get(est, j.package, DEFAULT_DURATION_ESTIMATE)
-    cutoff = duration_cutoff([job_est(j) for j in fresh])
+    cutoff = duration_cutoff([job_est(j) for j in fresh]; slots=live_fleet_slots(ctx))
     is_slow(j) = job_est(j) > cutoff
 
     # don't rewrite (= reset) job items once the run went active — after that point a

@@ -636,13 +636,37 @@ try
             only(filter(m -> m["InstanceId"] == id, ms))["ProtectedFromScaleIn"] == "true"
         end
 
-        @test PEF.drain_decision(0, 1, 32)          # newest of two, empty queue
-        @test !PEF.drain_decision(0, 0, 32)         # the oldest never drains
-        @test !PEF.drain_decision(64, 1, 32)        # plenty of work: keep claiming
-        @test PEF.drain_decision(31, 1, 32)
+        @test PEF.drain_decision(0, 32)             # 32 slots ahead, empty queue
+        @test !PEF.drain_decision(0, 0)             # the most senior never drains
+        @test !PEF.drain_decision(64, 32)           # plenty of work: keep claiming
+        @test PEF.drain_decision(31, 32)
+
+        # size-aware slot accounting: type-derived, with the ASG's weighted
+        # capacity taking precedence when reported
+        @test PEF.instance_slots("m6a.8xlarge", 32) == 32
+        @test PEF.instance_slots("m6a.24xlarge", 32) == 96
+        @test PEF.instance_slots("m5a.xlarge", 32) == 4
+        @test PEF.instance_slots("c6a.large", 32) == 2
+        @test PEF.instance_slots("u-6tb1.metal", 32) == 32  # unknown: assume own shape
+        @test PEF.member_slots(Dict("WeightedCapacity" => "96", "InstanceType" => "m6a.8xlarge"), 32) == 96
+        @test PEF.member_slots(Dict("InstanceType" => "m6a.16xlarge"), 32) == 64
+        @test PEF.member_slots(Dict{String,Any}(), 32) == 32
 
         fleet = PEF.FleetDrain(; asg="pkgeval-test-asg", instance_id=last(ids), slots=32)
-        @test PEF.fleet_rank(ctx, fleet) == (1, 2)  # newest by id order
+        # newest of the two m5.large members: one 2-slot instance ranked ahead
+        @test PEF.fleet_standing(ctx, fleet) == (2, 2)
+
+        # fleet sizing for the fast/slow cutoff: env override > ASG (in-service
+        # slots beat the nominal desired capacity) > static default
+        withenv("PKGEVAL_ASG_NAME" => "pkgeval-test-asg", "PKGEVAL_FLEET_SLOTS" => nothing) do
+            @test PEF.live_fleet_slots(ctx) == 4    # two m5.large in service
+        end
+        withenv("PKGEVAL_ASG_NAME" => "pkgeval-test-asg", "PKGEVAL_FLEET_SLOTS" => "999") do
+            @test PEF.live_fleet_slots(ctx) == 999
+        end
+        withenv("PKGEVAL_ASG_NAME" => nothing, "PKGEVAL_FLEET_SLOTS" => nothing) do
+            @test PEF.live_fleet_slots(ctx) == 128
+        end
 
         # empty queues + no running jobs => drain and unprotect
         @test PEF.pause_claiming!(ctx, fleet, 0)
