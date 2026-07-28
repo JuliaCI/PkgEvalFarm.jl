@@ -104,6 +104,12 @@ end
 function resolve_vs(vs::AbstractString, repo::AbstractString)
     startswith(vs, ":") && return "$repo#$(chop(vs; head=1, tail=0))"
     startswith(vs, "@") && return "$repo#$(chop(vs; head=1, tail=0))"
+    # bare "#ref" / version specs: anchor to the repo so pin_commit can resolve
+    # them to a sha. The farm always builds with assertions, and those builds
+    # are keyed by repo+sha — an unanchored "#1.12.6" would dead-end on the
+    # worker (no official assert binaries to download, no sha to request).
+    startswith(vs, "#") && return "$repo$vs"
+    occursin(r"^v?\d+(\.\d+)+$", vs) && return "$repo#$vs"
     return String(vs)
 end
 
@@ -111,20 +117,27 @@ end
 Pin a `repo#ref` spec to the exact commit the ref names right now. Two reasons:
 every worker then evaluates the same Julia even if the branch moves mid-run,
 and baseline reuse (expand_run) only matches immutable specs, so an unpinned
-`#master` baseline could never be reused. Non-repo specs (releases, `nightly`)
-and already-pinned shas pass through; so does anything the API cannot resolve —
-the workers' own resolution is the fallback, as before.
+`#master` baseline could never be reused. Non-repo specs (`nightly`) and
+already-pinned shas pass through; so does anything the API cannot resolve —
+the workers' own resolution is the fallback, as before. Version refs try the
+tag's "v" spelling too, so `vs = "#1.12.6"` pins to the v1.12.6 tag commit.
 """
 function pin_commit(gh::GitHubCtx, spec::String)
     m = match(r"^([^#]+)#(.+)$", spec)
     m === nothing && return spec
-    repo, ref = something(m.captures[1]), something(m.captures[2])
+    repo, ref = String(something(m.captures[1])), String(something(m.captures[2]))
     occursin(r"^[0-9a-f]{40}$", ref) && return spec
-    resp = github_request(gh, "GET", "/repos/$repo/commits/$(urlencode(ref))")
-    resp.status == 200 || return spec
-    sha = parse_json(resp.body, GhCommit).sha
-    sha === nothing && return spec
-    return "$repo#$(something(sha))"
+    # bare version numbers name release tags, which carry a "v" prefix in the
+    # julia repo ("1.12.6" -> tag "v1.12.6"); try both spellings
+    candidates = occursin(r"^\d+(\.\d+)+$", ref) ? [ref, "v" * ref] : [ref]
+    for candidate in candidates
+        resp = github_request(gh, "GET", "/repos/$repo/commits/$(urlencode(candidate))")
+        resp.status == 200 || continue
+        sha = parse_json(resp.body, GhCommit).sha
+        sha === nothing && continue
+        return "$repo#$(something(sha))"
+    end
+    return spec
 end
 
 

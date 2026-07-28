@@ -425,7 +425,20 @@ try
             queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
             bucket=cfg.bucket, endpoint)
 
+        # version-tag pinning: "1.9.9" only resolves under its tag name "v1.9.9"
+        pin_sha = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/commits/v1.9.9",
+            req -> TestHTTP.Response(200, JSON.json(Dict("sha" => pin_sha))))
+
         try
+            @test PEF.FarmBot.resolve_vs(":master", "JuliaLang/julia") == "JuliaLang/julia#master"
+            @test PEF.FarmBot.resolve_vs("#1.12.6", "JuliaLang/julia") == "JuliaLang/julia#1.12.6"
+            @test PEF.FarmBot.resolve_vs("1.12.6", "JuliaLang/julia") == "JuliaLang/julia#1.12.6"
+            @test PEF.FarmBot.resolve_vs("v1.12.6", "JuliaLang/julia") == "JuliaLang/julia#v1.12.6"
+            @test PEF.FarmBot.resolve_vs("other/repo#branch", "JuliaLang/julia") == "other/repo#branch"
+            @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#1.9.9") == "JuliaLang/julia#$pin_sha"
+            @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#nosuchref") == "JuliaLang/julia#nosuchref"
+
             # 1. a mention arrives -> bot submits a run and acks
             notifications[] = JSON.json([Dict(
                 "id" => "42", "reason" => "mention",

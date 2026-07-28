@@ -101,7 +101,10 @@ end
     resolve_vs = PEF.FarmBot.resolve_vs
     @test resolve_vs(":master", "JuliaLang/julia") == "JuliaLang/julia#master"
     @test resolve_vs("@0123abc", "JuliaLang/julia") == "JuliaLang/julia#0123abc"
-    @test resolve_vs("v1.12.0", "JuliaLang/julia") == "v1.12.0"
+    # version specs anchor to the repo: the farm always builds with assertions,
+    # so "official release" download specs would dead-end on the workers
+    @test resolve_vs("v1.12.0", "JuliaLang/julia") == "JuliaLang/julia#v1.12.0"
+    @test resolve_vs("#1.12.6", "JuliaLang/julia") == "JuliaLang/julia#1.12.6"
 end
 
 @testset "webhook signatures" begin
