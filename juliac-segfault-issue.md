@@ -1,83 +1,63 @@
-# Draft issue: juliac --trim binary — GC mark thread segfaults on AWS Lambda
+# juliac --trim: image-resident FileWatching.FDWatchers loses its old→young edge; GC frees the live backing Memory (use-after-free)
 
 **Environment:** juliac binary (`--experimental --trim=safe`, `JULIA_CPU_TARGET=sandybridge`),
-Julia 1.13.0-rc1, AWS Lambda `provided.al2023` (firecracker, 1024 MB), x86_64.
+Julia 1.13.0-rc1, x86_64-linux. First observed as a deterministic production segfault on
+AWS Lambda `provided.al2023`; later reproduced locally with the same binary in ~20 s.
 
-**Crash (every invocation that runs the workload; container cold each time):**
+## Root cause (established via rr reverse execution)
 
-```
-[2] signal 11 (1): Segmentation fault
-in expression starting at none:0
-Allocations: 1318316 (Pool: 1318267; Big: 49); GC: 2
-```
+`FileWatching.FDWatchers::Vector{Union{Nothing,_FDWatcher}}` is serialized into the
+juliac image. At runtime, `Downloads.Curl.socket_callback → FDWatcher → _FDWatcher`
+grows it (`resize!`), storing a **freshly allocated Memory into the old, image-resident
+Vector**. In the trimmed image that old→young edge is not honored — write barrier
+elided, or image objects not correctly part of the remembered-set machinery — so a
+subsequent GC sweeps the still-referenced Memory, whose pool page is promptly recycled.
 
-No backtrace frames at all between the header and the stats line. Workload: lazily
-parsing a ~7.7 MB / 24k-item DynamoDB response (JSON.jl lazy API); ~1.3 M allocations,
-crash consistently around the 2nd collection, ~130 MB RSS. Earlier the same workload
-showed two 300 s hangs (88 MB used) — possibly the same defect as a wedge.
+rr timeline for the corrupted element slot (reverse from the crash):
 
-## Fault characterization: a foreign thread, unmapped address
+1. Crash: `_FDWatcher` (FileWatching.jl:349) loads `FDWatchers.data[fd]`, gets `0xa0`
+   (recycled bytes; the code then faults reading `-0x8(elem)` — the type tag — at
+   address 0x98). Backtrace: `_FDWatcher ← FDWatcher ← socket_callback
+   (Downloads/Curl/Multi.jl:183) ← curl mev_sh_entry_update / mev_assess /
+   multi_run_dirty ← curl_multi_socket_action ← do_multi ← timer_callback closure`.
+2. Watchpoint + reverse-continue: the slot's bytes were last written by
+   **`ijl_alloc_string(len=21)` → `jl_gc_alloc_` → `jl_set_typeof`** stamping a *new
+   string object* (from an unrelated `joinpath`) into the reused page — i.e. the
+   Vector's backing Memory had been freed by GC and its page reallocated.
+3. The Vector object itself (image data segment address) survives with a stale `ref`;
+   only the runtime-allocated Memory was collected.
 
-Cold-start diagnostics deployed into the production function report:
+Two crash flavors of the same defect, both captured:
 
-```
-total_memory=1249447936 physical_memory=1249447936 cpu_threads=2 nthreads=1 ngcthreads=1
-```
+- **Mutator flavor** (local, above): post-GC read of the recycled memory
+  (`SEGV_MAPERR`, addr 0x98).
+- **Marker flavor** (production Lambda, every affected invocation): GC crashes *during*
+  collection in `gc_try_claim_and_push` (`mov 0x100(%r12)` with garbage base 0x640,
+  fault address 0x740) — the marker following the dangling edge itself.
 
-- Memory is read *correctly*: ~1.19 GB = the microVM's RAM (function 1024 MB + overhead),
-  total == physical, no cgroup layer. GC heuristics see the true limit.
-- The crash header's `[2]` is the **pid** (`jl_critical_error` prints `[%d]` = getpid;
-  the runtime process is pid 2 in the microVM) — not a thread id.
-- The **zero-frame backtrace is the fingerprint**: `jl_critical_error` prints frames
-  (even bare `ip:` lines) only for threads with a Julia task context. A fault on a
-  *foreign* thread (libuv threadpool worker, curl resolver — no ptls, ct == NULL)
-  yields exactly the observed header-only output.
-- `(1)` is `si_code = SEGV_MAPERR` — an unmapped address, not the `SEGV_ACCERR` that
-  safepoint / write-barrier faults on mprotected pages produce.
-- ⇒ a foreign thread dereferenced an unmapped address ~931 ms into a cold start, while
-  DNS resolution / TLS handshakes are in flight. Lambda's io_uring block pushes extra
-  work onto exactly these libuv threadpool threads relative to non-Lambda environments.
-- A chained MAPERR-only SIGSEGV reporter is now deployed in the bundle (logs tid,
-  thread comm, fault address, RIP, glibc backtrace, then forwards to Julia's handler);
-  the next production crash yields the faulting ip and thread identity.
+## Reproduction
 
-## Extensive non-reproduction outside Lambda (same binary recipe, same data)
+- Production binary (a Lambda bot: ~35 HTTPS requests + a 7.7 MB lazy JSON parse per
+  invocation): deterministic crash on Lambda; locally the same binary crashes in ~20 s
+  when its requests are connection-refused (rapid retries = many socket_callbacks
+  interleaved with allocation-driven GCs).
+- Minimal reproducer (**verified**): a trimmed binary looping { one HTTP request to a
+  refused port via Downloads; `GC.gc()` } segfaults on the *first* iteration —
+  "Allocations: 707 ... GC: 1", crash in the Downloads timer-callback task. ~20 lines.
+- rr trace of the production binary available: crash, watchpoint, and reverse
+  execution exactly as described.
 
-All clean, 5 full parses per run:
+Red herring warning for future readers: this resisted an extensive
+environment-elimination campaign (AL2023 chroot, QEMU microvm with a firecracker CI
+kernel and a real 1 GB limit, rr chaos mode, SIGSTOP CPU throttling, io_uring disabled,
+2-CPU pinning — all clean) because the trigger is purely allocation/GC timing relative
+to socket_callback activity, which varied with the binary and workload, not the
+environment.
 
-| variation | runs |
-|---|---|
-| default (Debian glibc, 811 GB visible) | many |
-| `JULIA_HEAP_SIZE_HINT` 30–150 M (verified honored: full-sweep count doubles) | several |
-| `taskset -c 0,1` (2 CPUs, as Lambda) | 10 |
-| rr `--chaos`, `JULIA_NUM_GC_THREADS=4`, 100 M hint | 15 |
-| AL2023 rootfs chroot (glibc 2.34), plain | 1 |
-| AL2023 chroot + rr chaos + 4 GC threads | 15 |
-| SIGSTOP/CONT 57 % duty cycle (Lambda CPU-share emulation), AL2023, 4 GC threads | 12 |
-| live-HTTPS variant (real DynamoDB paging through curl during parse) | 1 |
-| full `lambda_loop` against stub runtime API + response replay | 1 |
-| `UV_USE_IO_URING=0` (Lambda blocks io_uring; forces libuv threadpool fallback) + chaos, ngcthreads=1 | 12 |
-| **QEMU microvm**: firecracker-CI 5.10 kernel, real 1.2 GB RAM, 2 vCPUs — GC cadence matches Lambda exactly (2 pauses in pass 1) | 3 boots × 5 passes |
+## Also hit while debugging (candidates for separate issues)
 
-GC cadence locally matches Lambda (~2 pauses per parse), so collection-during-parse is
-the *common* case, not the discriminator.
-
-Remaining environmental deltas after all of the above: KVM/firecracker virtual
-hardware itself (the microvm test ran under TCG; guest image also had to target
-westmere since TCG 5.2 lacks AVX), and Lambda's full seccomp/sandbox profile beyond
-the known io_uring block.
-
-## Discriminating experiment staged
-
-`JULIA_NUM_GC_THREADS=0` on the production function — this *removes thread [2]*.
-Crashes stopping implicates the mark helper (rooting view / safepoint handling / mark
-loop in the trimmed image); crashes moving to another thread implicates the signal
-machinery generally. Result pending.
-
-Also hit separately (likely distinct issues): `--trim=safe` verifier rejects `Base.lpad`
-and `DateTime(::String, ::DateFormat)`; a minimal entrypoint including the same modules
-trips 8 Parsers.jl float-path verifier errors that the production entrypoint (with its
-compat-override prelude) does not.
-
-Reproducer harness (parse driver, captured payloads, stub runtime API, replay server)
-available.
+- Fatal-signal reports for faults on threads without a Julia task context print no
+  frames and no ip (fix prepared: `KenoAIStaging/julia` branch
+  `crash-report-foreign-threads`).
+- `--trim=safe` verifier rejects `Base.lpad` and `DateTime(::String, ::DateFormat)`;
+  Parsers.jl float paths verify only with a compat-override prelude.
