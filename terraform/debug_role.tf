@@ -150,6 +150,17 @@ resource "aws_iam_role_policy" "debug" {
         aws_dynamodb_table.builds[*].arn)
       },
       {
+        # The second deliberate write: fixing up run/job items during incident
+        # response (clearing a burned `reported` claim so the bot retries a
+        # report, flipping a stuck counter). Previously this required SSM'ing a
+        # live worker for its role, which stops working the moment the fleet
+        # scales to zero.
+        Sid    = "FixupFarmState"
+        Effect = "Allow"
+        Action = "dynamodb:UpdateItem"
+        Resource = [aws_dynamodb_table.runs.arn, aws_dynamodb_table.jobs.arn]
+      },
+      {
         Sid      = "ReadResults"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:ListBucket"]
