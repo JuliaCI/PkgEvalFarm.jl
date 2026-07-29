@@ -16,7 +16,10 @@ resource "aws_s3_object" "broker_zip" {
 
   # CI publishes new bundles; don't let a stale local file revert them
   lifecycle {
-    ignore_changes = [source, source_hash, etag]
+    # tags_all too: CI's publish replaces the object, which strips S3 object
+    # tags; without ignoring them every apply repairs cosmetic tag drift
+    # (billing attribution lives on the bucket, not these objects)
+    ignore_changes = [source, source_hash, etag, tags, tags_all]
   }
 }
 

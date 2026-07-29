@@ -108,7 +108,10 @@ resource "aws_s3_object" "build_request_zip" {
   source_hash = try(filemd5("${path.module}/../buildreq/build/bootstrap.zip"), null)
 
   lifecycle {
-    ignore_changes = [source, source_hash, etag]
+    # tags_all too: CI's publish replaces the object, which strips S3 object
+    # tags; without ignoring them every apply repairs cosmetic tag drift
+    # (billing attribution lives on the bucket, not these objects)
+    ignore_changes = [source, source_hash, etag, tags, tags_all]
   }
 }
 
