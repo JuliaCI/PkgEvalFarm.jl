@@ -956,8 +956,10 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
-    costline = report.cost > 0 ?
-        "\nEstimated compute cost: " * dollars(report.cost) * " (EC2 spot)" : ""
+    costline = report.cost <= 0 ? "" :
+        report.cost_partial ?
+        "\nCompute cost: at least " * dollars(report.cost) * " (EC2 spot; partially metered)" :
+        "\nEstimated compute cost: " * dollars(report.cost) * " (EC2 spot)"
     deliver_final(gh, something(context.repo), something(context.issue), run, """
         $(mention)run `$run_id` finished — **$(report.summary)**
 
@@ -1433,12 +1435,32 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
                 " baseline results reused from run ", join(map(d -> "`$d`", donors), ", "),
                 " (pass `fresh_baseline = true` to re-evaluate)")
     total_cost = 0.0
+    nmetered = 0
     for j in jobs
-        total_cost += flt(j, "cost", 0.0)
+        # reused baselines legitimately carry no cost; count metering coverage
+        # over the jobs that actually ran
+        opt_str(j, "reused_from") === nothing || continue
+        str(j, "status") in TERMINAL_STATUSES || continue
+        if haskey(j, "cost") && j["cost"].N !== nothing
+            total_cost += flt(j, "cost", 0.0)
+            nmetered += 1
+        end
     end
-    total_cost > 0 &&
-        println(io, "- estimated compute cost: ", dollars(total_cost),
-                " (EC2 spot, job time only; reused baselines cost nothing)")
+    nran = count(jobs) do j
+        opt_str(j, "reused_from") === nothing && str(j, "status") in TERMINAL_STATUSES
+    end
+    if total_cost > 0
+        if nmetered < nran
+            # partial metering (e.g. cost recording deployed mid-run): the sum
+            # is a floor, not an estimate — do not present it as the total
+            println(io, "- compute cost: at least ", dollars(total_cost),
+                    " (EC2 spot, job time only; only ", nmetered, " of ", nran,
+                    " executed jobs were metered)")
+        else
+            println(io, "- estimated compute cost: ", dollars(total_cost),
+                    " (EC2 spot, job time only; reused baselines cost nothing)")
+        end
+    end
     println(io)
 
     config_names = String[something(c.name, "?") for c in configs]
@@ -1503,7 +1525,8 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            content_type="text/markdown; charset=utf-8")
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
-    return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost)
+    return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
+            cost_partial=(nmetered < nran))
 end
 
 # machine-readable dump of the run + job records (attribute values unwrapped)
