@@ -565,6 +565,18 @@ function lambda_loop(handle::F) where {F}
     catch err
         println(Core.stderr, "segv reporter unavailable")
     end
+    # executable-segment base addresses, so a SEGVREPORT ip is attributable to
+    # a library (libcurl's resolver threads are the prime crash suspect)
+    try
+        for line in eachline("/proc/self/maps")
+            if occursin("r-xp", line) && (occursin("libcurl", line) ||
+               occursin("libjulia", line) || occursin("bootstrap", line))
+                println(Core.stderr, "map: " * line)
+            end
+        end
+    catch err
+        println(Core.stderr, "map dump unavailable")
+    end
     api = ENV["AWS_LAMBDA_RUNTIME_API"]::String
     next_url = "http://$api/2018-06-01/runtime/invocation/next"
     next_dl = Downloads.Downloader()

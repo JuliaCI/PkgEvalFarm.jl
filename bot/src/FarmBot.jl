@@ -1139,6 +1139,16 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
                                status, completed, total, now, eta)
     update_comment(gh, something(context.repo), comment_id, body)
     @info "updated status comment" run_id status completed total
+    # Forensic canary: deliberately re-run the crash-suspect workload (the
+    # full-item parse the slim query above avoids) now that this tick's real
+    # work is done and durable. The trimmed runtime segfaults on this parse in
+    # Lambda (foreign-thread MAPERR, under investigation); with the SEGVREPORT
+    # handler armed, every tick becomes a diagnostic sample instead of the
+    # run-completion report being the sole shot. Remove once root-caused.
+    if status == "active" && total > 5000
+        canary = run_jobs(ctx, run_id)
+        @info "forensic canary parse survived" n=length(canary)
+    end
     return nothing
 end
 
@@ -1559,6 +1569,7 @@ struct TopEvent
     ghevent::Union{Nothing,String}      # x-github-event
     body::Union{Nothing,String}
     is_base64::Bool
+    canary::Union{Nothing,String}       # direct invoke: forensic parse of this run
 end
 
 function json_make(::Type{GhRepoFull}, x::LazyVal)
@@ -1602,6 +1613,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
     ghevent = Ref{Union{Nothing,String}}(nothing)
     body = Ref{Union{Nothing,String}}(nothing)
     is_base64 = Ref(false)
+    canary = Ref{Union{Nothing,String}}(nothing)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         # NB: locals in the nested closures carry unique names — reusing an outer
@@ -1652,12 +1664,14 @@ function json_make(::Type{TopEvent}, x::LazyVal)
             end
         elseif k == "body"
             s, p = json_string(v); body[] = s; return p
+        elseif k == "canary"
+            cs, cp = json_string(v); canary[] = cs; return cp
         elseif k == "isBase64Encoded"
             b, p = json_bool(v); is_base64[] = b; return p
         end
         return nothing
     end
-    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[]),
+    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[]),
            pos::Int
 end
 
@@ -1704,6 +1718,13 @@ scheduled fallback poll. Returns the response JSON.
 function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
                       gh::GitHubCtx=bot_gh())
     event = parse_json(event_body, TopEvent)
+    if event.canary !== nothing
+        # forensic direct invoke: run the crash-suspect full-item parse on
+        # demand (no claim, no side effects) with the SEGVREPORT handler armed
+        jobs = run_jobs(ctx, something(event.canary))
+        @info "forensic canary parse survived" n=length(jobs)
+        return "{\"ok\":true,\"jobs\":" * string(length(jobs)) * "}"
+    end
     if !isempty(event.dead_bodies)
         # the jobs DLQ: messages the queue gave up on become recorded results,
         # so runs still complete (with errors) and reports still get posted
