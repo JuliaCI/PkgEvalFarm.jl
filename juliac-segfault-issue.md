@@ -16,7 +16,7 @@ parsing a ~7.7 MB / 24k-item DynamoDB response (JSON.jl lazy API); ~1.3 M alloca
 crash consistently around the 2nd collection, ~130 MB RSS. Earlier the same workload
 showed two 300 s hangs (88 MB used) — possibly the same defect as a wedge.
 
-## Thread [2] identified: the GC mark helper
+## Fault characterization: a foreign thread, unmapped address
 
 Cold-start diagnostics deployed into the production function report:
 
@@ -26,12 +26,20 @@ total_memory=1249447936 physical_memory=1249447936 cpu_threads=2 nthreads=1 ngct
 
 - Memory is read *correctly*: ~1.19 GB = the microVM's RAM (function 1024 MB + overhead),
   total == physical, no cgroup layer. GC heuristics see the true limit.
-- Julia TLS threads: main + **one GC mark thread** (`ngcthreads=1`). gdb on an identical
-  local binary shows the mark thread parking in the *scheduler* between collections
-  (`task_done_hook → poptask → ijl_task_get_next`), as expected for modern GC threads.
-- ⇒ `[2]` is the mark helper; it dies during a collection. The absent backtrace suggests
-  the fault may be in/around the signal–safepoint path on that thread (sigaltstack /
-  handler state in the trimmed image?) rather than in unwindable mark-loop code.
+- The crash header's `[2]` is the **pid** (`jl_critical_error` prints `[%d]` = getpid;
+  the runtime process is pid 2 in the microVM) — not a thread id.
+- The **zero-frame backtrace is the fingerprint**: `jl_critical_error` prints frames
+  (even bare `ip:` lines) only for threads with a Julia task context. A fault on a
+  *foreign* thread (libuv threadpool worker, curl resolver — no ptls, ct == NULL)
+  yields exactly the observed header-only output.
+- `(1)` is `si_code = SEGV_MAPERR` — an unmapped address, not the `SEGV_ACCERR` that
+  safepoint / write-barrier faults on mprotected pages produce.
+- ⇒ a foreign thread dereferenced an unmapped address ~931 ms into a cold start, while
+  DNS resolution / TLS handshakes are in flight. Lambda's io_uring block pushes extra
+  work onto exactly these libuv threadpool threads relative to non-Lambda environments.
+- A chained MAPERR-only SIGSEGV reporter is now deployed in the bundle (logs tid,
+  thread comm, fault address, RIP, glibc backtrace, then forwards to Julia's handler);
+  the next production crash yields the faulting ip and thread identity.
 
 ## Extensive non-reproduction outside Lambda (same binary recipe, same data)
 
