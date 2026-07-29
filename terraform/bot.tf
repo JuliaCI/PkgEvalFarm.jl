@@ -121,10 +121,12 @@ resource "aws_lambda_function" "bot" {
   runtime       = "provided.al2023"
   architectures = ["x86_64"]
   handler       = "bootstrap"
-  # 1024 is ample: the report path peaks around 141 MB; the historical
-  # segfaults were a GC bug (see juliac-segfault-issue.md), not memory pressure
-  memory_size   = 1024
-  timeout       = 300 # report aggregation pages through every job of a run
+  # Lambda allocates CPU proportional to memory (~1 vCPU per 1769 MB): at 1024
+  # the first full-ecosystem report (24k jobs) blew the 300 s timeout on CPU,
+  # not memory (peak 188 MB). 2048 buys ~1.2 vCPU; the 900 s ceiling leaves
+  # slack for pathological runs.
+  memory_size   = 2048
+  timeout       = 900
 
   # the function URL is publicly invokable (webhook auth is HMAC inside); real
   # concurrency needs are minimal (stream: one batch per shard, schedule:
