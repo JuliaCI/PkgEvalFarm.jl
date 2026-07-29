@@ -27,3 +27,8 @@ ec2_worker_disk_gb = 400
 # The @pkgeval bot. Its GitHub token and webhook secret go into SSM after the
 # first apply (see the put-parameter commands in bot.tf).
 enable_bot = true
+
+# 12 h debug-role sessions: long enough for an overnight farm watch without
+# hourly re-minting. Drop back toward the 3600 default when that stops being
+# routine — these credentials get handed to a third party (the debug agent).
+debug_role_max_session_seconds = 43200
