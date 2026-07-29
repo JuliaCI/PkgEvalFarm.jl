@@ -843,6 +843,45 @@ function dead_job(ctx::LiteCtx, gh::GitHubCtx, run_id::String, config::String, p
     return nothing
 end
 
+"""
+Flip `active` runs whose every job is already terminal to `done`. The workers'
+transactional accounting makes a lost counter increment rare, but a worker (or
+this Lambda's DLQ path) dying between the final increment and the status flip
+still strands a finished run in `active` forever — this scheduled sweep is the
+backstop that heals it (the flip fires the stream, which posts the report).
+"""
+function reconcile_stuck_runs(ctx::LiteCtx)
+    start_key = ""
+    while true
+        payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                  "\"FilterExpression\":\"#s = :active AND completed_jobs >= total_jobs\"," *
+                  "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+                  "\"ExpressionAttributeValues\":{\":active\":{\"S\":\"active\"}}" *
+                  (isempty(start_key) ? "" : ",\"ExclusiveStartKey\":$start_key") * "}"
+        resp = parse_json(ddb(ctx, "Scan", payload), ItemsResp)
+        for run in something(resp.Items, Item[])
+            run_id = str(run, "run_id")
+            flip = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                   "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+                   "\"ConditionExpression\":\"#s = :active AND completed_jobs >= total_jobs\"," *
+                   "\"UpdateExpression\":\"SET #s = :done, finished_at = :now\"," *
+                   "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+                   "\"ExpressionAttributeValues\":{\":active\":{\"S\":\"active\"}," *
+                   "\":done\":{\"S\":\"done\"},\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+            try
+                ddb(ctx, "UpdateItem", flip)
+            catch err
+                err isa ErrorException && is_conditional_failure(err) && continue
+                rethrow()
+            end
+            @info "reconciled stuck run to done" run_id
+        end
+        resp.LastEvaluatedKey === nothing && break
+        start_key = json_item(something(resp.LastEvaluatedKey))
+    end
+    return nothing
+end
+
 "Mark a run failed (from any non-terminal state) and tell its submitter."
 function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::String)
     # `reported` is claimed in the same write: this path posts the notification
@@ -1509,6 +1548,9 @@ end
 function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
     name = bot_name()
     poll_mentions(ctx, gh, name)
+    # heal finished-but-stuck runs first, so check_finished_runs can report
+    # them within the same invocation
+    reconcile_stuck_runs(ctx)
     check_finished_runs(ctx, gh)
     check_failed_runs(ctx, gh)
     # after the checks above: a run that just finished or failed is reported

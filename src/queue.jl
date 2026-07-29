@@ -19,9 +19,11 @@ isodate(t=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 aws_retry(f; n=5) = retry(f; delays=ExponentialBackOff(; n, first_delay=1, max_delay=30))()
 
 # real AWS uses the ConditionalCheckFailedException code; some emulators only carry
-# the human-readable message with a generic 400 code
+# the human-readable message with a generic 400 code. A cancelled transaction
+# reports TransactionCanceledException with the per-item reasons in the message.
 is_conditional_failure(err) = err isa AWS.AWSException &&
     (occursin("ConditionalCheckFailed", err.code) ||
+     occursin("TransactionCanceled", err.code) && occursin("ConditionalCheckFailed", err.message) ||
      occursin("conditional request failed", lowercase(err.message)))
 
 # S3's answer to an If-None-Match: * PUT when the key already exists
@@ -489,11 +491,18 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
         end
     end
 
+    # The terminal-status write and the counter bump must be one atomic unit: a
+    # worker dying between two separate writes leaves every job terminal but the
+    # counter one short — the run can then never reach `done` (happened to run
+    # gh-5107486319). The `:running` condition also means a lost race (another
+    # worker already recorded this job) cancels the whole transaction, so the
+    # counter can't double-count.
     aws_retry() do
-        Dynamodb.update_item(
-            ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
-            ctx.cfg.jobs_table,
-            Dict("ConditionExpression" => "#s = :running",
+        Dynamodb.transact_write_items(
+            [Dict("Update" => Dict(
+                 "TableName" => ctx.cfg.jobs_table,
+                 "Key" => ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+                 "ConditionExpression" => "#s = :running",
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, finished_at = :now, log_key = :log_key, " *
@@ -513,20 +522,26 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                      ":cost" => SLOT_HOURLY_RATE[] === nothing ? nothing :
                                 result.duration / 3600 * something(SLOT_HOURLY_RATE[]),
                      ":peak_rss" => result.peak_rss,
-                     ":log_key" => result.log === nothing ? nothing : key)));
+                     ":log_key" => result.log === nothing ? nothing : key)))),
+             Dict("Update" => Dict(
+                 "TableName" => ctx.cfg.runs_table,
+                 "Key" => ddb_item(Dict("run_id" => job.run_id)),
+                 "UpdateExpression" => "ADD completed_jobs :one",
+                 "ExpressionAttributeValues" => ddb_item(Dict(":one" => 1))))];
             aws_config=ctx.aws)
     end
 
-    # bump the run's completion counter; the worker finishing the last job marks it done
+    # the worker finishing the last job marks the run done (transactions can't
+    # return values, hence the separate consistent read; the conditional flip
+    # tolerates racing workers, and a death right here is healed by the bot's
+    # scheduled reconciler)
     resp = aws_retry() do
-        Dynamodb.update_item(
+        Dynamodb.get_item(
             ddb_item(Dict("run_id" => job.run_id)), ctx.cfg.runs_table,
-            Dict("UpdateExpression" => "ADD completed_jobs :one",
-                 "ExpressionAttributeValues" => ddb_item(Dict(":one" => 1)),
-                 "ReturnValues" => "ALL_NEW");
+            Dict("ConsistentRead" => true);
             aws_config=ctx.aws)
     end
-    attrs = ddb_parse(resp["Attributes"])
+    attrs = ddb_parse(resp["Item"])
     if attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
         Dynamodb.update_item(
             ddb_item(Dict("run_id" => job.run_id)), ctx.cfg.runs_table,
