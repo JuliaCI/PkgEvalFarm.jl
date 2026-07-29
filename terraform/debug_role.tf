@@ -172,6 +172,16 @@ resource "aws_iam_role_policy" "debug" {
         Action   = ["lambda:GetFunctionConfiguration", "lambda:ListFunctions"]
         Resource = "*"
       },
+      {
+        # The second deliberate write (with RedriveJobs above): invoking the
+        # bot directly, for forensic canary events and reproducing handler
+        # behavior under debugging. Scoped to the one function; its handler
+        # treats unrecognized payloads as a routine poll.
+        Sid      = "InvokeBotForDebugging"
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.name_prefix}-bot"
+      },
     ]
   })
 }
