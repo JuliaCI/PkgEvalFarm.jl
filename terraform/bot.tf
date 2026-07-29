@@ -121,9 +121,8 @@ resource "aws_lambda_function" "bot" {
   runtime       = "provided.al2023"
   architectures = ["x86_64"]
   handler       = "bootstrap"
-  # deliberately back at 1024 while the trimmed-runtime segfault is under
-  # investigation: the crash reproduces here, and the JULIA_NUM_GC_THREADS=0
-  # experiment below needs the memory dimension held constant
+  # 1024 is ample: the report path peaks around 141 MB; the historical
+  # segfaults were a GC bug (see juliac-segfault-issue.md), not memory pressure
   memory_size   = 1024
   timeout       = 300 # report aggregation pages through every job of a run
 
@@ -139,10 +138,10 @@ resource "aws_lambda_function" "bot" {
 
   environment {
     variables = {
-      # single-threaded GC: the trimmed runtime has segfaulted on a non-main
-      # thread during large parses (parallel-mark suspect); this is the
-      # discriminating experiment, and mark threads only buy latency anyway
-      JULIA_NUM_GC_THREADS = "0"
+      # do NOT set JULIA_NUM_GC_THREADS=0 here: current 1.13 builds segfault in
+      # gc_queue_thread_local during the first collection when run with zero GC
+      # threads (reproduced locally; it kept the report path crashing even
+      # after the image write-barrier bug was fixed)
       BOT_TOKEN_PARAM      = var.bot_token_parameter
       WEBHOOK_SECRET_PARAM = var.bot_webhook_secret_parameter
       BOT_NAME             = var.bot_name
