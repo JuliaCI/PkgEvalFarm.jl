@@ -547,6 +547,15 @@ disable_low_speed_hook() =
     end
 
 function lambda_loop(handle::F) where {F}
+    # cold-start diagnostics: what the runtime believes about its sandbox.
+    # total_memory is the cgroup-constrained view the GC sizes itself from
+    # (vs physical_memory raw); ngcthreads is the parallel-mark pool. Logged
+    # once per container, and — usefully — *before* any crash later in life.
+    println(Core.stderr, "runtime diag: total_memory=" * string(Sys.total_memory()) *
+            " physical_memory=" * string(Sys.physical_memory()) *
+            " cpu_threads=" * string(Sys.CPU_THREADS) *
+            " nthreads=" * string(Base.Threads.nthreads()) *
+            " ngcthreads=" * string(Base.Threads.ngcthreads()))
     api = ENV["AWS_LAMBDA_RUNTIME_API"]::String
     next_url = "http://$api/2018-06-01/runtime/invocation/next"
     next_dl = Downloads.Downloader()

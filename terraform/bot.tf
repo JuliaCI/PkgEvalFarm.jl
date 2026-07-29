@@ -118,12 +118,10 @@ resource "aws_lambda_function" "bot" {
   runtime       = "provided.al2023"
   architectures = ["x86_64"]
   handler       = "bootstrap"
-  # 3 GB is not for the data (a full jobs query peaks well under 200 MB) but
-  # for GC pacing: the juliac-trimmed runtime has segfaulted under allocation
-  # pressure right at GC time (observed on 24k-job queries), and Julia sizes
-  # its collection threshold from the cgroup limit — headroom keeps the GC
-  # out of the request entirely
-  memory_size   = 3008
+  # deliberately back at 1024 while the trimmed-runtime segfault is under
+  # investigation: the crash reproduces here, and the JULIA_NUM_GC_THREADS=0
+  # experiment below needs the memory dimension held constant
+  memory_size   = 1024
   timeout       = 300 # report aggregation pages through every job of a run
 
   # the function URL is publicly invokable (webhook auth is HMAC inside); real
