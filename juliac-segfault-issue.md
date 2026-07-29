@@ -48,14 +48,16 @@ All clean, 5 full parses per run:
 | SIGSTOP/CONT 57 % duty cycle (Lambda CPU-share emulation), AL2023, 4 GC threads | 12 |
 | live-HTTPS variant (real DynamoDB paging through curl during parse) | 1 |
 | full `lambda_loop` against stub runtime API + response replay | 1 |
+| `UV_USE_IO_URING=0` (Lambda blocks io_uring; forces libuv threadpool fallback) + chaos, ngcthreads=1 | 12 |
+| **QEMU microvm**: firecracker-CI 5.10 kernel, real 1.2 GB RAM, 2 vCPUs — GC cadence matches Lambda exactly (2 pauses in pass 1) | 3 boots × 5 passes |
 
 GC cadence locally matches Lambda (~2 pauses per parse), so collection-during-parse is
 the *common* case, not the discriminator.
 
-Remaining environmental deltas: firecracker virtual hardware; io_uring — locally libuv
-runs an `iou-sqp` SQPOLL kernel thread, while Lambda's sandbox blocks io_uring, forcing
-libuv's threadpool fallback (different wakeup paths into the same scheduler the mark
-thread parks in).
+Remaining environmental deltas after all of the above: KVM/firecracker virtual
+hardware itself (the microvm test ran under TCG; guest image also had to target
+westmere since TCG 5.2 lacks AVX), and Lambda's full seccomp/sandbox profile beyond
+the known io_uring block.
 
 ## Discriminating experiment staged
 
