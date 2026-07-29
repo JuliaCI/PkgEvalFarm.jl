@@ -85,6 +85,11 @@ function build_lambda_bundle(app_dir::String;
     end
     symlink(".", joinpath(stage_libdir, "julia"))
 
+    # crash forensics: a chained SIGSEGV reporter (see segvreport.c). Compiled
+    # into the runtime-lib dir so the executable's RPATH resolves it by name.
+    run(`cc -shared -fPIC -O2 -o $(joinpath(stage_libdir, "libsegvreport.so"))
+        $(joinpath(@__DIR__, "segvreport.c"))`)
+
     zip = joinpath(build_dir, "bootstrap.zip")
     rm(zip; force=true)
     if Sys.which("zip") !== nothing

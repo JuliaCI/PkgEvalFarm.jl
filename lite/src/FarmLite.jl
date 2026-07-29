@@ -556,6 +556,15 @@ function lambda_loop(handle::F) where {F}
             " cpu_threads=" * string(Sys.CPU_THREADS) *
             " nthreads=" * string(Base.Threads.nthreads()) *
             " ngcthreads=" * string(Base.Threads.ngcthreads()))
+    # chained MAPERR-only SIGSEGV reporter: Julia prints no backtrace (not even
+    # an ip) for faults on foreign threads — this recovers tid/comm/addr/ip and
+    # a glibc backtrace for exactly those. Best effort: absent outside bundles.
+    try
+        ccall((:install_segv_reporter, "libsegvreport"), Cvoid, ())
+        println(Core.stderr, "segv reporter installed")
+    catch err
+        println(Core.stderr, "segv reporter unavailable")
+    end
     api = ENV["AWS_LAMBDA_RUNTIME_API"]::String
     next_url = "http://$api/2018-06-01/runtime/invocation/next"
     next_dl = Downloads.Downloader()
