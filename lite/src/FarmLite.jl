@@ -552,7 +552,7 @@ function lambda_loop(handle::F) where {F}
     # (vs physical_memory raw); ngcthreads is the parallel-mark pool. Logged
     # once per container, and — usefully — *before* any crash later in life.
     println(Core.stderr, "runtime diag: total_memory=" * string(Sys.total_memory()) *
-            " physical_memory=" * string(Sys.physical_memory()) *
+            " physical_memory=" * string(Sys.total_physical_memory()) *
             " cpu_threads=" * string(Sys.CPU_THREADS) *
             " nthreads=" * string(Base.Threads.nthreads()) *
             " ngcthreads=" * string(Base.Threads.ngcthreads()))
