@@ -138,6 +138,10 @@ resource "aws_lambda_function" "bot" {
 
   environment {
     variables = {
+      # single-threaded GC: the trimmed runtime has segfaulted on a non-main
+      # thread during large parses (parallel-mark suspect); this is the
+      # discriminating experiment, and mark threads only buy latency anyway
+      JULIA_NUM_GC_THREADS = "0"
       BOT_TOKEN_PARAM      = var.bot_token_parameter
       WEBHOOK_SECRET_PARAM = var.bot_webhook_secret_parameter
       BOT_NAME             = var.bot_name
