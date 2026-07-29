@@ -1121,7 +1121,7 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
     end
     eta = nothing
     if status == "active"
-        work_done, remaining = run_work(run_jobs(ctx, run_id))
+        work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
         if remaining >= 0
             eta = eta_from_work(str(run, "status_commented_at", ""),
                                 flt(run, "status_work_done", -1.0),
@@ -1186,13 +1186,23 @@ status_emoji(status::String) = issuccess(status) ? "✅" :
                                status == "kill"  ? "⏰" :
                                status == "skip"  ? "⏭" : "❓"
 
-function run_jobs(ctx::LiteCtx, run_id::String)
+"""
+All job items of a run. `slim=true` fetches only status/duration/est — the
+fields the hourly status tick needs — cutting the response (and the parse
+allocations, which have crashed the trimmed runtime on 24k-job runs) roughly
+fivefold. Report generation wants the full items.
+"""
+function run_jobs(ctx::LiteCtx, run_id::String; slim::Bool=false)
     jobs = Item[]
     start_key = ""
+    projection = slim ?
+        ",\"ProjectionExpression\":\"#s, #d, est\"," *
+        "\"ExpressionAttributeNames\":{\"#s\":\"status\",\"#d\":\"duration\"}" : ""
     while true
         payload = "{\"TableName\":$(JSON.json(ctx.jobs_table))," *
                   "\"KeyConditionExpression\":\"run_id = :run_id\"," *
                   "\"ExpressionAttributeValues\":{\":run_id\":{\"S\":$(JSON.json(run_id))}}" *
+                  projection *
                   (isempty(start_key) ? "" : ",\"ExclusiveStartKey\":$start_key") * "}"
         resp = parse_json(ddb(ctx, "Query", payload), ItemsResp)
         append!(jobs, something(resp.Items, Item[]))
