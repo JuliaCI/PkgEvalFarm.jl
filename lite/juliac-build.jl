@@ -6,6 +6,17 @@
 #
 # Included by `<app>/build/build.jl`, which calls `build_lambda_bundle(app_dir)`.
 
+# 1.12.x and 1.13.0-rc1 miscompile these bundles: under `--trim`, image-resident
+# mutable objects load with a permanently disarmed GC write barrier while being
+# unreachable from the root set, so runtime mutations lose their old->young
+# edges and the GC frees live objects (use-after-free segfaults in production;
+# see ../juliac-segfault-issue.md). Fixed by JuliaLang/julia#61474 (backported
+# in #62009): any release-1.13 build after rc1 — CI uses the `1.13-nightly`
+# channel until rc2 binaries are published.
+VERSION > v"1.13.0-rc1" ||
+    error("refusing to build with julia $VERSION: juliac --trim images built " *
+          "before 1.13.0-rc2 (JuliaLang/julia#62009) segfault at runtime")
+
 using Pkg
 
 # The trimmed binary contains no compiler and does no linear algebra, so skip the

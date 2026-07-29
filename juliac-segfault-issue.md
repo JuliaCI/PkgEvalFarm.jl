@@ -75,12 +75,20 @@ environment.
   `KenoAIStaging/julia` branch `trimming-test-image-gc-write-barrier` (off
   `release-1.13`); a working 1.12 backport of #61474 + test sits on
   `backport-1.12-image-gc-write-barrier`.
-- **This repo's workaround** (until the bundles build on >= 1.13.0-rc2, whose
-  binaries are not yet published): pre-grow the FDWatchers table at image-build
-  time in `lite/src/juliac-trim-compat.jl`, so the runtime never `resize!`s the
-  unrooted image vector — no young Memory is ever stored into it. Verified: the
-  stdlib-only repro survives 3/3 (crashed 3/3 stock), and the production bot binary
-  survives 120 s / 209 GCs under connection-refused churn (crashed at ~20 s stock).
+- **Workaround history**: a compile-time pre-grow of the FDWatchers table (bake a
+  large backing Memory into the image so the runtime never `resize!`s the unrooted
+  vector) validated cleanly in local harnesses but the CI-built production Lambda
+  still crashed with the original signature — the defect class is broader than any
+  single site, so the workaround was dropped in favor of the real fix: **the
+  bundles now build on the `1.13-nightly` channel** (release-1.13 nightlies carry
+  #62009; switch back to `'1.13'` once rc2+ binaries are published). Validated on
+  1.13.0-rc1.105: stock repro survives 3/3, bundle survives 793k-retry
+  connection-refused churn and 5/5 replayed 24,382-job report generations.
+- **Nightly fallout worth an upstream look**: post-rc1 builds serialize the
+  sysimage-resident BLAS stack's module `__init__`s into trimmed images that never
+  reference LinearAlgebra (rc1 dropped them), so the pruned bundle died in
+  `OpenBLAS_jll.__init__` at startup; the prelude now stubs those inits at compile
+  time. Possibly a side effect of #61474's serializer changes.
 
 ## Also hit while debugging (candidates for separate issues)
 

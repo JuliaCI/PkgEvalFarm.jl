@@ -359,34 +359,25 @@ Base.Experimental.entrypoint(Base.sync_end, (Channel{Any},))
 
 
 "Eagerly load libcurl and its dependency chain; call this first thing in main()."
-trim_compat_init() = Downloads.Curl.LibCURL.LibCURL_jll.eager_mode()
+# newer in-tree LibCURL_jll builds (post-rc1) drop eager_mode; dlopen'ing the
+# top of the dependency chain has the same effect (the LazyLibrary machinery
+# pulls in the deps)
+if isdefined(Downloads.Curl.LibCURL.LibCURL_jll, :eager_mode)
+    trim_compat_init() = Downloads.Curl.LibCURL.LibCURL_jll.eager_mode()
+else
+    trim_compat_init() = (Base.Libc.Libdl.dlopen(Downloads.Curl.LibCURL.LibCURL_jll.libcurl); nothing)
+end
 
-# --- FDWatchers image pre-grow (workaround, remove on julia >= 1.13.0-rc2) ---
-# Executed at *compile* time: juliac evaluates this file's top level while
-# building the image. FileWatching's fd-watcher table (a let-captured
-# Vector{Any}) is serialized into the image; before 1.13.0-rc2, `--trim`
-# leaves image objects unreachable from the GC root set with their write
-# barrier permanently unarmed, so when Downloads' socket_callback path
-# `resize!`s the table at runtime, the old->young edge to the fresh backing
-# Memory is recorded nowhere and the GC frees it while still referenced —
-# a use-after-free segfault (see ../../juliac-segfault-issue.md; fixed
-# upstream by JuliaLang/julia#61474 / #62009). Growing the table *now* bakes
-# a backing Memory large enough into the image that no runtime fd number can
-# ever trigger the resize! (fd numbers are bounded by RLIMIT_NOFILE, 1024 on
-# Lambda).
-let FileWatching = Downloads.Curl.FileWatching
-    fds = Vector{Cint}(undef, 2)
-    ccall(:pipe, Cint, (Ptr{Cint},), fds) == 0 || error("FDWatchers pre-grow: pipe failed")
-    hi = Cint(-1)
-    for target in (4095, 2047, 1023, 511)
-        hi = ccall(:fcntl, Cint, (Cint, Cint, Cint), fds[1], 0 #= F_DUPFD =#, Cint(target))
-        hi >= 0 && break
-    end
-    hi >= 0 || error("FDWatchers pre-grow: F_DUPFD failed")
-    t = FileWatching._FDWatcher(Base.RawFD(hi), true, false)
-    FileWatching.uvfinalize(t)   # closes the uv handle, clears the table slot
-    ccall(:close, Cint, (Cint,), hi)
-    ccall(:close, Cint, (Cint,), fds[1])
-    ccall(:close, Cint, (Cint,), fds[2])
-    @info "FDWatchers table pre-grown into the image" length = hi + 1
+# Post-rc1 1.13 builds serialize the sysimage-resident BLAS stack's module
+# `__init__`s into the trimmed image even though these apps never touch linear
+# algebra (LinearAlgebra is not even in the committed Manifests). Those inits
+# dlopen libopenblas/libblastrampoline, which the bundle prunes for size, so
+# the binary would die during startup. Neuter them at compile time: if BLAS
+# code were ever actually reached it would fail loudly at the ccall rather
+# than silently misbehave.
+for (uuid, name) in (("4536629a-c528-5b80-bd46-f80d51c5b363", "OpenBLAS_jll"),
+                     ("8e850b90-86db-534c-a0d3-1478176c7d93", "libblastrampoline_jll"),
+                     ("37e2e46d-f89d-539d-b4ee-838fcccc9c8e", "LinearAlgebra"))
+    m = Base.maybe_root_module(Base.PkgId(Base.UUID(uuid), name))
+    m isa Module && isdefined(m, :__init__) && @eval m __init__() = nothing
 end

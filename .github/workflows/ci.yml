@@ -75,9 +75,12 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           # juliac lives in the Julia install; the trim-compatible build needs
-          # 1.13, which is still a prerelease — hence include-all-prereleases
-          version: '1.13'
-          include-all-prereleases: true
+          # 1.13, and specifically a build newer than rc1: trimmed images built
+          # before JuliaLang/julia#62009 (first in rc2, unreleased as of
+          # 2026-07-29) lose GC write-barrier edges on image objects and
+          # segfault at runtime. The release-1.13 nightlies carry the fix;
+          # switch back to '1.13' once rc2+ binaries are published.
+          version: '1.13-nightly'
       - uses: julia-actions/cache@v2
       - name: Build broker
         run: julia --project=broker broker/build/build.jl
