@@ -54,6 +54,34 @@ kernel and a real 1 GB limit, rr chaos mode, SIGSTOP CPU throttling, io_uring di
 to socket_callback activity, which varied with the binary and workload, not the
 environment.
 
+## Resolution
+
+- **Mechanism pinned down**: `--trim` strips module binding tables (only modules,
+  `__init__`s and a few special functions survive in `jl_queue_module_for_serialization`),
+  so `FDWatchers` — a `let`-captured Vector reachable only through native-code gvar
+  slots, which are not GC roots — is unreachable from the root set and never marked.
+  Image objects load as `GC_OLD | GC_IN_IMAGE` (*unmarked* old), and `jl_gc_wb` only
+  arms for `GC_OLD_MARKED` parents: the write barrier can never fire. Verified
+  in-binary (mark bit still clear after 3 collections) and in the rr trace
+  (header nibble `0x6` at crash time).
+- **Fixed upstream, accidentally**: JuliaLang/julia#61474 ("GC: permanently mark
+  pkg/sysimage objects to speed up GC", merged 2026-05-21, labeled *performance*)
+  loads image objects `GC_OLD_MARKED | GC_IN_IMAGE` with a persistent image remset —
+  barrier armed from birth. Backported to `release-1.13` in #62009; **first release
+  with the fix is 1.13.0-rc2**. Julia 1.12.6 (current stable, ships juliac) is still
+  affected (verified crashing). Validation: repros crash 3/3 on 1.13.0-rc1 and
+  1.12.6, survive 3/3 on release-1.13 (rc2) and master.
+- **Regression test PR** (the fix currently has no test guarding the invariant):
+  `KenoAIStaging/julia` branch `trimming-test-image-gc-write-barrier` (off
+  `release-1.13`); a working 1.12 backport of #61474 + test sits on
+  `backport-1.12-image-gc-write-barrier`.
+- **This repo's workaround** (until the bundles build on >= 1.13.0-rc2, whose
+  binaries are not yet published): pre-grow the FDWatchers table at image-build
+  time in `lite/src/juliac-trim-compat.jl`, so the runtime never `resize!`s the
+  unrooted image vector — no young Memory is ever stored into it. Verified: the
+  stdlib-only repro survives 3/3 (crashed 3/3 stock), and the production bot binary
+  survives 120 s / 209 GCs under connection-refused churn (crashed at ~20 s stock).
+
 ## Also hit while debugging (candidates for separate issues)
 
 - Fatal-signal reports for faults on threads without a Julia task context print no
