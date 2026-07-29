@@ -280,7 +280,8 @@ end
 ## STS AssumeRole, SigV4-signed by hand, JSON response via Accept header
 
 hmac(key, data) = hmac_sha256(Vector{UInt8}(key), data)
-hexdigest(data) = bytes2hex(sha256(data))
+# hash an honest Vector: SHA's String path is quadratic (see FarmLite.hexdigest)
+hexdigest(data::String) = bytes2hex(sha256(Vector{UInt8}(codeunits(data))))
 
 function sigv4_headers(; method, host, path, body, region, service, creds,
                        time::DateTime=Dates.now(UTC))

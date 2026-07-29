@@ -58,7 +58,10 @@ env_creds() = AwsCreds(ENV["AWS_ACCESS_KEY_ID"], ENV["AWS_SECRET_ACCESS_KEY"],
                        get(ENV, "AWS_SESSION_TOKEN", nothing))
 
 hmac(key, data) = hmac_sha256(Vector{UInt8}(key), data)
-hexdigest(data) = bytes2hex(sha256(data))
+# hash an honest Vector: SHA's String/CodeUnits path degrades quadratically
+# (generic per-block copyto! re-copies the whole input; two sha256 passes over
+# a 10 MB db.json took ~500 s and starved report generation on Lambda)
+hexdigest(data::String) = bytes2hex(sha256(Vector{UInt8}(codeunits(data))))
 
 urlencode(s::AbstractString) = sprint() do io
     for b in codeunits(s)
