@@ -538,8 +538,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "ConditionExpression" => "#s = :running",
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
-                                       "#d = :duration, finished_at = :now, log_key = :log_key, " *
-                                       "cost = :cost, peak_rss = :peak_rss",
+                                       "#d = :duration, wall = :wall, finished_at = :now, " *
+                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss",
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
@@ -549,11 +549,15 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                      ":reason_message" => result.reason === nothing ? nothing :
                                           reason_message(result.reason),
                      ":version" => result.version,
-                     ":duration" => result.duration, ":now" => isodate(),
+                     ":duration" => result.duration, ":wall" => result.wall,
+                     ":now" => isodate(),
                      # what this job's slot-time cost on this worker (see
-                     # SLOT_HOURLY_RATE); the report sums these per run
+                     # SLOT_HOURLY_RATE); the report sums these per run. Priced
+                     # by wall occupancy when the worker measured it — the
+                     # test-phase duration alone misses most of the slot time
                      ":cost" => SLOT_HOURLY_RATE[] === nothing ? nothing :
-                                result.duration / 3600 * something(SLOT_HOURLY_RATE[]),
+                                (result.wall > 0 ? result.wall : result.duration) /
+                                3600 * something(SLOT_HOURLY_RATE[]),
                      ":peak_rss" => result.peak_rss,
                      ":log_key" => result.log === nothing ? nothing : key)))),
              Dict("Update" => Dict(

@@ -130,17 +130,25 @@ try
             # fabricate results: JSON fails on primary only; Crayons fails everywhere
             status = (claimed.job.package == "JSON" && claimed.job.config == "primary") ? "fail" :
                      claimed.job.package == "Crayons" ? "crash" : "test"
+            # one job carries a measured wall time: cost must price the slot
+            # occupancy, not the test-phase duration; the rest fall back to
+            # duration (a worker predating wall metering)
+            wall = claimed.job.package == "JSON" && claimed.job.config == "primary" ? 84.0 : 0.0
             result = PEF.JobResult(; status,
                 reason=status == "fail" ? "test_failures" :
                        status == "crash" ? "segfault" : nothing,
-                version="1.2.3", duration=42.0, peak_rss=1_234_567_890,
+                version="1.2.3", duration=42.0, wall, peak_rss=1_234_567_890,
                 log="log of $(claimed.job.package) on $(claimed.job.config)")
             PEF.record_result(ctx, claimed, result)
         end
         @test length(seen) == 6
         PEF.SLOT_HOURLY_RATE[] = nothing
         jobs = PEF.run_jobs(ctx, RUN_ID)
-        @test all(j -> isapprox(j["cost"], 42.0 / 3600 * 0.36; rtol=1e-6), jobs)
+        for j in jobs
+            billed = j["job_key"] == "primary#JSON" ? 84.0 : 42.0   # wall beats duration
+            @test isapprox(j["cost"], billed / 3600 * 0.36; rtol=1e-6)
+        end
+        @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["wall"] == 84.0
         @test all(j -> j["peak_rss"] == 1_234_567_890, jobs)
 
         run = PEF.get_run(ctx, RUN_ID)
@@ -189,9 +197,9 @@ try
         @test occursin("Packages that failed on both", report.markdown)  # Crayons
         @test occursin("package has test failures", report.markdown)  # stored reason_message
         @test occursin("possible new issues: 1 package", report.summary)
-        # 6 jobs x 42 s at $0.36/slot-h -> $0.0252, rendered to cents
+        # 5 jobs x 42 s + one 84 s wall-billed at $0.36/slot-h -> $0.0294
         @test occursin("estimated compute cost: \$0.03", report.markdown)
-        @test isapprox(report.cost, 6 * 42.0 / 3600 * 0.36; rtol=1e-6)
+        @test isapprox(report.cost, (5 * 42.0 + 84.0) / 3600 * 0.36; rtol=1e-6)
         @test PEF.FarmBot.dollars(12.3) == "\$12.30"
         @test PEF.FarmBot.dollars(0.0252) == "\$0.03"
 

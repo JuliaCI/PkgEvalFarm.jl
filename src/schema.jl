@@ -206,6 +206,11 @@ Base.@kwdef struct JobResult
     reason::Union{String,Nothing} = nothing
     version::Union{String,Nothing} = nothing
     duration::Float64 = 0.0
+    # wall time the slot spent on the whole evaluation (setup, install,
+    # precompile, test), which is what cost metering must price — `duration` is
+    # only the test/load phase's CPU time and misses ~60% of slot occupancy
+    # (skips and kills bill zero by it despite minutes of real slot time)
+    wall::Float64 = 0.0
     # peak cgroup memory of the sandbox in bytes (page cache included), for
     # memory-aware scheduling backtests; nothing when the metric was unavailable
     peak_rss::Union{Int,Nothing} = nothing

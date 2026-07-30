@@ -565,6 +565,10 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             state == :pending &&
                 hold_and_fill!(ctx, job, gated_seal_run, cpu, run_cache, run_cache_lock)
         end
+        # wall clock from here prices the slot: setup, install, precompile and
+        # test all occupy it (the seal-gate wait above deliberately does not —
+        # that time went to other jobs, which bill themselves)
+        eval_started = time()
         sealed_kwargs, sealed_cleanup = isempty(gated_seal_run) ? ((;), Returns(nothing)) :
             sealed_depot_kwargs(ctx, seal_id_of(gated_seal_run), [job.package])
         r = try
@@ -576,7 +580,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         JobResult(; status=String(r.status),
                   reason=r.reason === missing ? nothing : String(r.reason),
                   version=r.version === missing ? nothing : string(r.version),
-                  duration=Float64(r.duration),
+                  duration=Float64(r.duration), wall=time() - eval_started,
                   # haskey: tolerate a PkgEval pinned before peak_rss existed
                   peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
                   log=r.log === missing ? nothing : String(r.log))

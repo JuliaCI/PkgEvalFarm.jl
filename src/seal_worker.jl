@@ -71,6 +71,7 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         item = get_seal_item(ctx, job)
         deps = item === nothing ? String[] : String.(get(item, "deps", String[]))
 
+        eval_started = time()
         scratch = mktempdir(prefix="pkgeval_seal_")
         try
             export_dir = joinpath(scratch, "export")
@@ -129,12 +130,12 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                 end
                 record_learned_edges(ctx, job.package, get(graph, job.package, String[]))
                 JobResult(; status="sealed", version=r.version === missing ? nothing : string(r.version),
-                          duration=Float64(r.duration), log)
+                          duration=Float64(r.duration), wall=time() - eval_started, log)
             else
                 JobResult(; status="unsealable",
                           reason=r.reason === missing ? nothing : String(r.reason),
                           version=r.version === missing ? nothing : string(r.version),
-                          duration=Float64(r.duration), log)
+                          duration=Float64(r.duration), wall=time() - eval_started, log)
             end
         finally
             try
@@ -265,6 +266,7 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             config = config_from_dict(only(seal_run["configs"]))
             config = PkgEval.Configuration(config; cpus=[cpu], rr=PkgEval.RRDisabled)
 
+            eval_started = time()
             scratch = mktempdir(prefix="pkgeval_derive_")
             try
                 roots = [(d.uuid, d.key) for d in want.deps]
@@ -274,6 +276,7 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                     # requester compiled it locally): decline rather than
                     # produce an artifact that could not match the want
                     JobResult(; status="unsealable", reason="missing_dependency",
+                              wall=time() - eval_started,
                               log="derivation closure incomplete: missing " *
                                   join(first.(missing_keys, 12), ", "))
                 else
@@ -309,11 +312,13 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                                 "produced a different key (" * first(something(produced, "none"), 12) *
                                 "); environment reproduction was inexact") *
                                (published ? "; published" : "; nothing published")
-                        JobResult(; status="sealed", duration=Float64(r.duration), log)
+                        JobResult(; status="sealed", duration=Float64(r.duration),
+                                  wall=time() - eval_started, log)
                     else
                         JobResult(; status="unsealable",
                                   reason=r.reason === missing ? nothing : String(r.reason),
-                                  duration=Float64(r.duration), log)
+                                  duration=Float64(r.duration),
+                                  wall=time() - eval_started, log)
                     end
                 end
             finally
