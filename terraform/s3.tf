@@ -80,7 +80,10 @@ resource "aws_s3_bucket_cors_configuration" "results" {
 
   cors_rule {
     allowed_methods = ["GET", "HEAD"]
-    allowed_origins = ["*"]
+    # just our report page for now — the objects are public either way, so
+    # widening this for other consumers of the reports costs nothing beyond
+    # adding their origin here
+    allowed_origins = ["https://pkgeval-reports.julialang.org"]
     allowed_headers = ["Range"]
     expose_headers  = ["Content-Range", "Content-Length"]
     max_age_seconds = 3600

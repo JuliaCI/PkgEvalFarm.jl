@@ -1230,7 +1230,7 @@ s3_public_url(ctx::LiteCtx, key::String) =
 # Pages (site/index.html, deployed by .github/workflows/pages.yml); it loads
 # runs/<id>/report/report.json straight from the bucket, so runs upload only
 # their data and the link just carries the run id
-report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://juliaci.github.io/PkgEvalFarm.jl/")
+report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://pkgeval-reports.julialang.org/")
 report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
 
 issuccess(status::String) = status == "test" || status == "load"
