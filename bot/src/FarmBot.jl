@@ -1663,9 +1663,19 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         k = opt_str(job, "log_key")
         k === nothing && return -1
         key = something(k)
-        slash = findlast('/', key)
-        slash === nothing && return -1
-        dir = key[1:prevind(key, something(slash))]
+        # backwards byte scan for '/' (ASCII-safe): findlast(::Char, ::String)
+        # routes through the generic Function-predicate findlast, which the
+        # trim verifier rejects
+        cu = codeunits(key)
+        slash = 0
+        for i in length(cu):-1:1
+            if cu[i] == UInt8('/')
+                slash = i
+                break
+            end
+        end
+        slash == 0 && return -1
+        dir = key[1:prevind(key, slash)]
         get!(logdir_ids, dir) do
             push!(logdirs, dir)
             length(logdirs) - 1
