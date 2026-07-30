@@ -3,7 +3,8 @@
 using PkgEvalFarm
 using PkgEvalFarm: JobRef, JobResult, FarmConfig, RunSpec,
                    config_to_dict, config_from_dict, json_message, job_key, split_job_key,
-                   ddb_item, ddb_unwrap, new_run_id, log_key, report_key, cli_main
+                   ddb_item, ddb_unwrap, new_run_id, log_key, report_key, cli_main,
+                   error_line
 import PkgEval
 import JSON
 
@@ -18,6 +19,7 @@ split_job_key(job_key(job))
 log_key(job.run_id, job.config, job.package)
 report_key(job.run_id, "index.html")
 JobResult(; status="test", duration=1.0)
+error_line("\e[31mERROR: MethodError: no method matching f()\e[0m\n")
 
 for (k, v) in ddb_item(Dict("s" => "x", "n" => 3, "f" => 1.5, "b" => true,
                             "l" => ["a"], "m" => Dict("k" => "v"), "nul" => nothing))

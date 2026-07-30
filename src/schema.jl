@@ -226,3 +226,45 @@ reason_message(reason::Nothing) = ""
 reason_message(reason::AbstractString) =
     reason == "worker_exception" ? "the worker failed to evaluate the package" :
     PkgEval.reason_message(Symbol(reason))
+
+# error_line heuristics, mirroring the log-tail highlighting in bot/res/report.html
+# (analyzeTail): crash-class markers trump the first ERROR: line, which in turn
+# trumps a plain test failure location
+const ERROR_LINE_PRIORITY = (r"Assertion .* failed", r"Internal error:",
+                             r"Unreachable reached", r"GC error",
+                             r"ERROR: Method overwriting is not permitted")
+# ERROR: lines that only restate that testing failed, never why
+const ERROR_LINE_GENERIC = ("Some tests did not pass", "errored during testing",
+                            "/proc/self/stat", "failed process", "Test run finished",
+                            "ProcessExited")
+const ANSI_OR_CR = r"\e\[[0-9;]*[A-Za-z]|\r"
+
+"""
+    error_line(log) -> Union{String,Nothing}
+
+The first meaningful error line of a failing job's log — stored per job so reports
+can cluster shared failure signatures without refetching logs. Kept short: it is
+free-form text on a DynamoDB item that every full `run_jobs` read pays for.
+"""
+function error_line(log::AbstractString)
+    lines = split(replace(log, ANSI_OR_CR => ""), '\n')
+    for line in lines, pattern in ERROR_LINE_PRIORITY
+        occursin(pattern, line) && return error_line_clip(line)
+    end
+    for line in lines
+        l = lstrip(line)
+        if (startswith(l, "ERROR: ") || startswith(l, "UNHANDLED TASK ERROR: ")) &&
+           !any(g -> occursin(g, l), ERROR_LINE_GENERIC)
+            return error_line_clip(line)
+        end
+    end
+    for line in lines
+        occursin("Test Failed at", line) && return error_line_clip(line)
+    end
+    return nothing
+end
+
+function error_line_clip(line::AbstractString)
+    s = strip(line)
+    length(s) <= 240 ? String(s) : first(s, 239) * "…"
+end

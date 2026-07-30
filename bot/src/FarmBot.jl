@@ -1557,6 +1557,20 @@ end
 #           log_key, indexed by plogdir/alogdir (-1 = no log recorded); a
 #           reused baseline's log lives under the donor run's prefix, so the
 #           page must not assume this run's
+#   sigs    [{label, n}, ...]  shared failure signatures: hard new failures
+#           (fail/crash on primary, baseline OK) clustered by their stored
+#           error_line, most common first; omitted when no lines were recorded
+#   nfsig   {package: sig index, ...}  cluster membership for those packages
+
+# grouping key for a stored error_line: collapse details that vary per package
+# or process (addresses, source locations, LoadError nesting) but keep the
+# message; the raw line stays as the cluster's display label
+function normalize_error_line(line::String)
+    s = replace(line, r"0x[0-9a-f]+" => "0xADDR")
+    s = replace(s, r" at [^ ]+\.jl:\d+" => " at LOC")
+    s = replace(s, "LoadError: " => "")
+    return String(strip(s))
+end
 
 status_char(status::String) = status == "test"  ? "t" :
                               status == "load"  ? "l" :
@@ -1666,6 +1680,7 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         get!(by_pkg, str(job, "package"), Dict{String,Item}())[str(job, "config")] = job
     end
     first_row = true
+    nf_lines = Tuple{String,String}[]  # (package, stored error_line) of hard new failures
     for pkg in sort!(collect(keys(by_pkg)))
         group = by_pkg[pkg]
         haskey(group, primary_name) || continue
@@ -1675,6 +1690,15 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         a = against_name === nothing ? nothing : get(group, against_name, nothing)
         if a !== nothing && !(str(something(a), "status") in TERMINAL_STATUSES)
             a = nothing
+        end
+        # hard new failure: fail/crash on primary while the baseline passed
+        # (single-config runs count every hard failure) — same classification
+        # the page applies to build its new-failures section
+        if (pst == "fail" || pst == "crash") &&
+           (against_name === nothing ||
+            (a !== nothing && issuccess(str(something(a), "status"))))
+            el = opt_str(p, "error_line")
+            el === nothing || push!(nf_lines, (pkg, something(el)))
         end
         pver = opt_str(p, "version")
         aver = a === nothing ? nothing : opt_str(something(a), "version")
@@ -1697,7 +1721,47 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
                   ",", string(logdir_idx(p)), ",", string(logdir_idx(aa)), "]")
         end
     end
-    print(io, "],\"logdirs\":[")
+    print(io, "]")
+
+    # shared failure signatures: cluster the collected error lines by their
+    # normalized form; the page renders multi-package clusters as filters
+    sig_ids = Dict{String,Int}()
+    sig_labels = String[]
+    sig_counts = Int[]
+    assigned = Tuple{String,Int}[]
+    for (pkg, line) in nf_lines
+        key = normalize_error_line(line)
+        idx = get!(sig_ids, key) do
+            push!(sig_labels, line)
+            push!(sig_counts, 0)
+            length(sig_labels) - 1
+        end
+        sig_counts[idx + 1] += 1
+        push!(assigned, (pkg, idx))
+    end
+    if !isempty(sig_labels)
+        # most common first; ties keep first-seen order (plain sortperm — the
+        # keyword-sorting paths don't survive the trim verifier)
+        perm = sortperm([(-sig_counts[i], i) for i in 1:length(sig_counts)])
+        remap = Vector{Int}(undef, length(perm))
+        for (newi, oldi) in enumerate(perm)
+            remap[oldi] = newi - 1
+        end
+        print(io, ",\"sigs\":[")
+        for (i, oldi) in enumerate(perm)
+            i == 1 || print(io, ",")
+            print(io, "{\"label\":", JSON.json(sig_labels[oldi]),
+                  ",\"n\":", string(sig_counts[oldi]), "}")
+        end
+        print(io, "],\"nfsig\":{")
+        for (i, (pkg, idx)) in enumerate(assigned)
+            i == 1 || print(io, ",")
+            print(io, JSON.json(pkg), ":", string(remap[idx + 1]))
+        end
+        print(io, "}")
+    end
+
+    print(io, ",\"logdirs\":[")
     for (i, dir) in enumerate(logdirs)
         i == 1 || print(io, ",")
         print(io, JSON.json(dir))
