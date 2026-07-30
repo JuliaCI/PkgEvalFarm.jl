@@ -478,13 +478,24 @@ const $ = (id) => document.getElementById(id);
 
 (async function boot() {
   let D;
+  // served from GitHub Pages: ?run=<run_id> names the run to render, whose
+  // report.json is fetched straight from the results bucket (?bucket=
+  // overrides the bucket URL for other deployments). Without ?run= the page
+  // falls back to a report.json served next to it (local use, demos).
+  const params = new URLSearchParams(location.search);
+  const runId = params.get("run");
+  const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
+    .replace(/\/+$/, "");
+  const src = runId
+    ? `${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`
+    : "report.json";
   try {
-    const resp = await fetch("report.json");
+    const resp = await fetch(src);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     D = await resp.json();
   } catch (err) {
-    $("loadstate").textContent = "Could not load report.json (" + err.message + "). " +
-      "This page must be served next to its report.json.";
+    $("loadstate").textContent = "Could not load " + src + " (" + err.message + ")." +
+      (runId ? "" : " Without a ?run= parameter this page must be served next to its report.json.");
     return;
   }
   $("loadstate").hidden = true;

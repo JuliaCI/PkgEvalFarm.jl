@@ -1226,12 +1226,12 @@ s3_public_url(ctx::LiteCtx, key::String) =
     "https://$(ctx.bucket).s3.$(ctx.region).amazonaws.com/" *
     join(map(urlencode, split(key, '/')), '/')
 
-report_url(ctx::LiteCtx, run_id::String) = s3_public_url(ctx, report_key(run_id, "report.html"))
-
-# the interactive report page, baked into the binary at build time; a static
-# asset that renders the neighbouring report.json (and fetches log tails from
-# the bucket on demand), so the page itself is identical for every run
-const REPORT_HTML = read(joinpath(@__DIR__, "..", "res", "report.html"), String)
+# the interactive report page is a fixed static asset served from GitHub
+# Pages (site/index.html, deployed by .github/workflows/pages.yml); it loads
+# runs/<id>/report/report.json straight from the bucket, so runs upload only
+# their data and the link just carries the run id
+report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://juliaci.github.io/PkgEvalFarm.jl/")
+report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1530,8 +1530,6 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            content_type="text/markdown; charset=utf-8")
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
-    s3_put(ctx, report_key(run_id, "report.html"), REPORT_HTML;
-           content_type="text/html; charset=utf-8")
     s3_put(ctx, report_key(run_id, "report.json"),
            report_json(ctx, run, jobs, configs, total_cost, nmetered < nran);
            content_type="application/json")
@@ -1539,9 +1537,9 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             cost_partial=(nmetered < nran))
 end
 
-## compact per-package dataset rendered by report.html
+## compact per-package dataset rendered by the report page
 #
-# Schema (kept in sync with bot/res/report.html):
+# Schema (kept in sync with site/index.html):
 #   run     .id .bucket .bot .submitter .created .finished .trigger_url
 #           .trigger_label .total_jobs .cpu_hours .cost .cost_partial
 #           .primary/.against = {name, julia, repo, sha, flags}  (against only

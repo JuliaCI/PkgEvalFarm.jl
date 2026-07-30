@@ -221,10 +221,11 @@ try
         db = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "db.json")))
         @test length(db["jobs"]) == 6
 
-        # the interactive report: static page + compact dataset
-        html = fetch_raw(PEF.report_key(RUN_ID, "report.html"))
-        @test html == PEF.FarmBot.REPORT_HTML
-        @test occursin("PkgEval", html)
+        # the interactive report: the page itself lives on GitHub Pages, only
+        # its compact per-run dataset is uploaded; the report link carries the
+        # run id for the page to find it
+        @test PEF.FarmBot.report_url(lite, RUN_ID) ==
+              PEF.FarmBot.report_page() * "?run=" * RUN_ID
         rj = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "report.json")))
         @test rj["run"]["id"] == RUN_ID
         @test rj["run"]["primary"]["repo"] == "JuliaLang/julia"
@@ -583,7 +584,7 @@ try
             @test edited[end].first == "700001"
             @test occursin("@keno: run `$run_id` finished", edited[end].second)
             @test occursin("no new package failures", edited[end].second)
-            @test occursin("report.html", edited[end].second)
+            @test occursin("?run=$run_id", edited[end].second)
 
             # 4. and does not double-report
             n_edited = length(edited)

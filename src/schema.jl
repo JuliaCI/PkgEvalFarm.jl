@@ -227,7 +227,7 @@ reason_message(reason::AbstractString) =
     reason == "worker_exception" ? "the worker failed to evaluate the package" :
     PkgEval.reason_message(Symbol(reason))
 
-# error_line heuristics, mirroring the log-tail highlighting in bot/res/report.html
+# error_line heuristics, mirroring the log-tail highlighting in site/index.html
 # (analyzeTail): crash-class markers trump the first ERROR: line, which in turn
 # trumps a plain test failure location
 const ERROR_LINE_PRIORITY = (r"Assertion .* failed", r"Internal error:",

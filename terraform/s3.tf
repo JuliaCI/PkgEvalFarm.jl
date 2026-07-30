@@ -69,6 +69,24 @@ resource "aws_s3_bucket_policy" "results" {
   depends_on = [aws_s3_bucket_public_access_block.results]
 }
 
+# The interactive report page is served from GitHub Pages and fetches
+# report.json plus on-demand log tails (Range requests, which preflight)
+# straight from this bucket, so browsers need CORS on the objects that are
+# already world-readable under the policy above. Read-only: no methods beyond
+# GET/HEAD, and no credentials are involved.
+resource "aws_s3_bucket_cors_configuration" "results" {
+  count  = var.public_reports ? 1 : 0
+  bucket = aws_s3_bucket.results.id
+
+  cors_rule {
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = ["*"]
+    allowed_headers = ["Range"]
+    expose_headers  = ["Content-Range", "Content-Length"]
+    max_age_seconds = 3600
+  }
+}
+
 # The Lambda deployment zips live in their own private bucket that no farm
 # principal (worker/submitter/bot) has any grant on, so even a policy
 # regression on the results bucket cannot become privilege escalation via
