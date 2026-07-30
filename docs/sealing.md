@@ -138,7 +138,7 @@ exactly as today, and learned edges fold it into the static closure over
 successive runs. The job-level gate is unaffected: it is package-scoped with
 full context via the `test(X)` ↔ `seal(X)` mapping.
 
-## The cache-protocol scheme (experimental, `PKGEVAL_SEAL_SCHEME=protocol`)
+## The cache-protocol scheme (auto-selected per julia build)
 
 The depot scheme above has a residual trust hole: seal(X)'s published closure
 contains dependency files produced while X's code ran, so a malicious or
@@ -180,8 +180,14 @@ first requester compiles locally regardless — the win is every later
 consumer, starting with `test(X)` right behind the `seal(X)` that reported
 the want.
 
-Until hook-carrying julias are what the farm tests, the flag stays off and
-the depot scheme (with its documented trust bar) remains the default.
+There is no global switch. Expansion decides the scheme per configuration —
+"protocol" iff the julia under test carries `Base.CACHE_FETCH_HOOK`, detected
+by running it *sandboxed* (never on the host: detection carries exactly the
+same trust as evaluation) — and records it on the (per-fingerprint,
+create-only) seal run item. Every job of a seal run, and every test job
+gating on it, therefore sees one scheme; hookless julias get the depot
+scheme, i.e. exactly the pre-protocol behavior, and detection failures fall
+back the same way. Suboptimal beats a mixed state.
 
 ## Degradation ladder
 

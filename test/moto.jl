@@ -1238,6 +1238,7 @@ try
             Crayons = "aaaaaaaa-0000-0000-0000-000000000002"
             """)
         PEF.SEAL_REGISTRY_OVERRIDE[] = reg
+        PEF.SEAL_SCHEME_OVERRIDE[] = "depot"   # no sandbox here to detect with
         cache_dir = mktempdir()
 
         withenv("PKGEVAL_SEAL_CACHE" => cache_dir) do
@@ -1410,6 +1411,7 @@ try
             end
         end
         PEF.SEAL_REGISTRY_OVERRIDE[] = nothing
+        PEF.SEAL_SCHEME_OVERRIDE[] = nothing
     end
 
     @testset "cache-protocol scheme (proxy + namespaced publication)" begin
@@ -1422,8 +1424,10 @@ try
                           jobs_table="pkgeval-jobs", bucket="pkgeval-results")
         sctx = FarmCtx(scfg, aws)
         cache_dir = mktempdir()
-        withenv("PKGEVAL_SEAL_CACHE" => cache_dir, "PKGEVAL_SEAL_SCHEME" => "protocol") do
-            @test PEF.protocol_scheme()
+        withenv("PKGEVAL_SEAL_CACHE" => cache_dir) do
+            # scheme is a per-seal-run property now, not global state
+            @test PEF.seal_run_scheme(Dict{String,Any}("scheme" => "protocol")) == "protocol"
+            @test PEF.seal_run_scheme(Dict{String,Any}()) == "depot"   # pre-scheme runs
             proxy = PEF.start_seal_proxy!(sctx)
             try
                 base = "http://127.0.0.1:$(proxy.port)"
@@ -1482,7 +1486,7 @@ try
                 @test any(w -> occursin(uuid, w), proxy.wants)
 
                 # sandbox-facing kwargs carry the proxy coordinates, no mounts
-                kwargs, cleanup = PEF.sealed_depot_kwargs(sctx, ns, ["JSON"])
+                kwargs, cleanup = PEF.sealed_depot_kwargs(sctx, ns, ["JSON"]; scheme="protocol")
                 @test kwargs.env["PKGEVAL_CACHE_SERVER"] == base
                 @test kwargs.env["PKGEVAL_CACHE_NAMESPACE"] == ns
                 @test !haskey(kwargs, :mounts)
@@ -1593,7 +1597,6 @@ try
                 PEF.stop_seal_proxy!()
             end
         end
-        @test !PEF.protocol_scheme()   # flag off again outside withenv
     end
 
     @testset "broker STS against moto" begin

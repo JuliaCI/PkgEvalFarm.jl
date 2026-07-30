@@ -31,12 +31,12 @@ depot path (via PKGEVAL_EXTRA_DEPOTS, understood by the PkgEval fork).
 
 Returns `(kwargs, cleanup)`; call `cleanup()` after the evaluation.
 """
-function sealed_depot_kwargs(ctx::FarmCtx, seal_id::AbstractString, packages)
+function sealed_depot_kwargs(ctx::FarmCtx, seal_id::AbstractString, packages;
+                             scheme::AbstractString="depot")
     pkgeval_supports_seal() || return (;), Returns(nothing)
-    if protocol_scheme()
-        # the sandbox fetches through the loopback proxy on demand (needs the
-        # julia-under-test to carry Base.CACHE_FETCH_HOOK; without it the env
-        # vars are inert and the job just runs cold)
+    if scheme == "protocol"
+        # the sandbox fetches through the loopback proxy on demand; the
+        # expansion-side detection guarantees this julia carries the hook
         proxy = SEAL_PROXY[]
         proxy === nothing && return (;), Returns(nothing)
         return (; env=Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
@@ -65,6 +65,9 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     stop_heartbeat = start_heartbeat(ctx, claimed, "seal $(job.package)")
 
     result = try
+        seal_run = job_run(ctx, job, run_cache, run_cache_lock)
+        scheme = seal_run_scheme(seal_run)
+        protocol = scheme == "protocol"
         config = job_config(ctx, job, run_cache, run_cache_lock)
         # rr instruments test execution; sealing has none, so always disable it
         config = PkgEval.Configuration(config; cpus=[cpu], goal=:seal, rr=PkgEval.RRDisabled)
@@ -77,10 +80,10 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             export_dir = joinpath(scratch, "export")
             mkpath(export_dir)
             indexes = Dict{String,Any}()
-            eval_kwargs = if protocol_scheme()
+            eval_kwargs = if protocol
                 # deps arrive on demand through the proxy; publication happens
                 # below, namespaced by the registry
-                kwargs, _ = sealed_depot_kwargs(ctx, seal_id, deps)
+                kwargs, _ = sealed_depot_kwargs(ctx, seal_id, deps; scheme)
                 kwargs
             else
                 # pull-before-compile: canonical dep artifacts in a read-only
@@ -108,7 +111,7 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             log = r.log === missing ? "" : String(r.log)
             if String(r.status) == "seal"
                 graph, files_by_pkg = parse_seal_export(export_dir)
-                if protocol_scheme()
+                if protocol
                     unit_uuid = try
                         registry_uuid(seal_registry_dir(config), job.package)
                     catch err

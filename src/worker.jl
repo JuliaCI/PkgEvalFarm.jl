@@ -32,7 +32,9 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     init_slot_rate!(ctx, ninstances)
     if sealing_enabled(ctx.cfg) && pkgeval_supports_seal()
         sweep_seal_cache!()
-        protocol_scheme() && start_seal_proxy!(ctx)
+        # always up: whether any given run uses it is decided per seal run at
+        # expansion (hook-carrying julia -> protocol), and an idle proxy is free
+        start_seal_proxy!(ctx)
     end
 
     draining = Ref(false)
@@ -569,8 +571,14 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         # test all occupy it (the seal-gate wait above deliberately does not —
         # that time went to other jobs, which bill themselves)
         eval_started = time()
-        sealed_kwargs, sealed_cleanup = isempty(gated_seal_run) ? ((;), Returns(nothing)) :
-            sealed_depot_kwargs(ctx, seal_id_of(gated_seal_run), [job.package])
+        sealed_kwargs, sealed_cleanup = if isempty(gated_seal_run)
+            (;), Returns(nothing)
+        else
+            seal_run = job_run(ctx, JobRef(gated_seal_run, SEAL_CONFIG_NAME, ""),
+                               run_cache, run_cache_lock)
+            sealed_depot_kwargs(ctx, seal_id_of(gated_seal_run), [job.package];
+                                scheme=seal_run_scheme(seal_run))
+        end
         r = try
             PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
                                  use_cache, sealed_kwargs...)

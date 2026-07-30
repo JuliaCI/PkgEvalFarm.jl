@@ -456,7 +456,8 @@ the reserved config name and an empty context, which the bot's delivery guards
 already skip; they start `active` (there is no expand phase — jobs are added
 directly, possibly across many user runs).
 """
-function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::AbstractString)
+function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::AbstractString,
+                         scheme::AbstractString="depot")
     run_id = seal_run_id(seal_id)
     seal_config = Dict{String,Any}(config_dict)
     seal_config["name"] = SEAL_CONFIG_NAME
@@ -467,6 +468,9 @@ function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::Abstr
                 "submitter" => "sealer",
                 "status" => "active",
                 "kind" => "seal",
+                # decided once per fingerprint (create-only item): every job of
+                # this seal run — and every consumer gating on it — sees one scheme
+                "scheme" => String(scheme),
                 "configs" => JSON.json([seal_config]),
                 "packages" => "[]",
                 "context" => JSON.json(Dict("seal" => true)),
@@ -694,13 +698,15 @@ function setup_sealing(ctx::FarmCtx, run::AbstractDict, fresh::Vector{JobRef})
         isempty(packages) && continue
         try
             fingerprint = seal_fingerprint(config_dict)
-            id = ensure_seal_run(ctx, config_dict, fingerprint)
-            registry = seal_registry_dir(config_from_dict(config_dict))
+            config = config_from_dict(config_dict)
+            scheme = detect_seal_scheme(config, fingerprint)
+            id = ensure_seal_run(ctx, config_dict, fingerprint, scheme)
+            registry = seal_registry_dir(config)
             graph = seal_dep_graph(registry, packages, learned)
             ncreated, ready = add_seal_jobs(ctx, id, packages, graph)
             isempty(ready) || enqueue_seal_jobs(ctx, id, ready)
             mapping[name] = id
-            @info "sealing set up" run_id=run["run_id"] config=name seal_run=id ncreated nready=length(ready)
+            @info "sealing set up" run_id=run["run_id"] config=name seal_run=id scheme ncreated nready=length(ready)
         catch err
             @error "sealing setup failed for config; its jobs run cold" name exception=(err, catch_backtrace())
         end
