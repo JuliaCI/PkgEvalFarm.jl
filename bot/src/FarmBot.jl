@@ -1226,7 +1226,12 @@ s3_public_url(ctx::LiteCtx, key::String) =
     "https://$(ctx.bucket).s3.$(ctx.region).amazonaws.com/" *
     join(map(urlencode, split(key, '/')), '/')
 
-report_url(ctx::LiteCtx, run_id::String) = s3_public_url(ctx, report_key(run_id, "report.md"))
+# the interactive report page is a fixed static asset served from GitHub
+# Pages (site/index.html, deployed by .github/workflows/pages.yml); it loads
+# runs/<id>/report/report.json straight from the bucket, so runs upload only
+# their data and the link just carries the run id
+report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://pkgeval-reports.julialang.org/")
+report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1525,8 +1530,252 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            content_type="text/markdown; charset=utf-8")
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
+    s3_put(ctx, report_key(run_id, "report.json"),
+           report_json(ctx, run, jobs, configs, total_cost, nmetered < nran);
+           content_type="application/json")
     return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
             cost_partial=(nmetered < nran))
+end
+
+## compact per-package dataset rendered by the report page
+#
+# Schema (kept in sync with site/index.html):
+#   run     .id .bucket .bot .submitter .created .finished .trigger_url
+#           .trigger_label .total_jobs .cpu_hours .cost .cost_partial
+#           .primary/.against = {name, julia, repo, sha, flags}  (against only
+#           for two-config comparisons; repo/sha empty when `julia` is not a
+#           repo#sha spec)
+#   reasons [[code, message], ...]  (severity ordering lives in the page)
+#   pkgs    [[name, version, pstatus, preason, pduration,
+#             astatus, areason, aduration, aversion-if-different,
+#             plogdir, alogdir], ...]
+#           statuses as single chars (t/l/f/c/k/s/e), reasons as indices into
+#           `reasons` (-1 = none), durations in whole seconds
+#   logdirs ["runs/<id>/logs/<config>", ...]  log directory of each job's
+#           log_key, indexed by plogdir/alogdir (-1 = no log recorded); a
+#           reused baseline's log lives under the donor run's prefix, so the
+#           page must not assume this run's
+#   sigs    [{label, n}, ...]  shared failure signatures: hard new failures
+#           (fail/crash on primary, baseline OK) clustered by their stored
+#           error_line, most common first; omitted when no lines were recorded
+#   nfsig   {package: sig index, ...}  cluster membership for those packages
+
+# grouping key for a stored error_line: collapse details that vary per package
+# or process (addresses, source locations, LoadError nesting) but keep the
+# message; the raw line stays as the cluster's display label
+function normalize_error_line(line::String)
+    s = replace(line, r"0x[0-9a-f]+" => "0xADDR")
+    s = replace(s, r" at [^ ]+\.jl:\d+" => " at LOC")
+    s = replace(s, "LoadError: " => "")
+    return String(strip(s))
+end
+
+status_char(status::String) = status == "test"  ? "t" :
+                              status == "load"  ? "l" :
+                              status == "fail"  ? "f" :
+                              status == "crash" ? "c" :
+                              status == "kill"  ? "k" :
+                              status == "skip"  ? "s" : "e"
+
+function print_build_json(io::IO, key::String, cfg::ConfigInfo)
+    julia = something(cfg.julia, "nightly")
+    repo, sha = "", julia
+    hash = findfirst('#', julia)
+    if hash !== nothing
+        repo = julia[1:prevind(julia, hash)]
+        sha = julia[nextind(julia, hash):end]
+    end
+    print(io, ",", JSON.json(key), ":{\"name\":", JSON.json(something(cfg.name, key)),
+          ",\"julia\":", JSON.json(julia),
+          ",\"repo\":", JSON.json(repo), ",\"sha\":", JSON.json(sha), ",\"flags\":[")
+    flags = cfg.buildflags
+    if flags !== nothing
+        for (i, flag) in enumerate(something(flags))
+            i == 1 || print(io, ",")
+            print(io, JSON.json(flag))
+        end
+    end
+    print(io, "]}")
+end
+
+function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
+                     configs::Vector{ConfigInfo}, total_cost::Float64,
+                     cost_partial::Bool)
+    io = IOBuffer()
+    print(io, "{\"run\":{\"id\":", JSON.json(str(run, "run_id")))
+    print(io, ",\"bucket\":",
+          JSON.json("https://$(ctx.bucket).s3.$(ctx.region).amazonaws.com"))
+    print(io, ",\"bot\":", JSON.json(bot_name()))
+    print(io, ",\"submitter\":", JSON.json(str(run, "submitter", "?")))
+    print(io, ",\"created\":", JSON.json(str(run, "created_at", "")))
+    finished = opt_str(run, "finished_at")
+    finished === nothing || print(io, ",\"finished\":", JSON.json(something(finished)))
+    context = parse_json(str(run, "context", "{}"), RunContext)
+    if context.repo !== nothing && context.issue !== nothing
+        repo, issue = something(context.repo), something(context.issue)
+        print(io, ",\"trigger_url\":", JSON.json("https://github.com/$repo/pull/$issue"),
+              ",\"trigger_label\":", JSON.json("$repo#$issue"))
+    end
+    print_build_json(io, "primary", configs[1])
+    length(configs) == 2 && print_build_json(io, "against", configs[2])
+    # numbers go through string(): a non-String argument in these long vararg
+    # print calls degrades Base.print's loop to Any-typed dispatch, which the
+    # trim verifier rejects
+    print(io, ",\"total_jobs\":", string(int(run, "total_jobs", 0)))
+    cpu_seconds = 0.0
+    for j in jobs
+        cpu_seconds += flt(j, "duration", 0.0)
+    end
+    print(io, ",\"cpu_hours\":", string(round(cpu_seconds / 3600; digits=1)))
+    print(io, ",\"cost\":", string(round(total_cost; digits=2)),
+          ",\"cost_partial\":", cost_partial ? "true" : "false")
+    print(io, "},\"reasons\":[")
+
+    # reason vocabulary actually present in this run, as (code, message) pairs
+    codes = String[]
+    messages = Dict{String,String}()
+    for j in jobs
+        r = opt_str(j, "reason")
+        r === nothing && continue
+        code = something(r)
+        if !haskey(messages, code)
+            messages[code] = something(opt_str(j, "reason_message"), code)
+            push!(codes, code)
+        end
+    end
+    sort!(codes)
+    ridx = Dict{String,Int}()
+    for (i, code) in enumerate(codes)
+        ridx[code] = i - 1
+        i == 1 || print(io, ",")
+        print(io, "[", JSON.json(code), ",", JSON.json(messages[code]), "]")
+    end
+    reason_idx(job::Item) = begin
+        r = opt_str(job, "reason")
+        r === nothing ? -1 : get(ridx, something(r), -1)
+    end
+
+    logdirs = String[]
+    logdir_ids = Dict{String,Int}()
+    logdir_idx(job::Item) = begin
+        k = opt_str(job, "log_key")
+        k === nothing && return -1
+        key = something(k)
+        # backwards byte scan for '/' (ASCII-safe): findlast(::Char, ::String)
+        # routes through the generic Function-predicate findlast, which the
+        # trim verifier rejects
+        cu = codeunits(key)
+        slash = 0
+        for i in length(cu):-1:1
+            if cu[i] == UInt8('/')
+                slash = i
+                break
+            end
+        end
+        slash == 0 && return -1
+        dir = key[1:prevind(key, slash)]
+        get!(logdir_ids, dir) do
+            push!(logdirs, dir)
+            length(logdirs) - 1
+        end
+    end
+
+    print(io, "],\"pkgs\":[")
+    primary_name = something(configs[1].name, "primary")
+    against_name = length(configs) == 2 ? something(configs[2].name, "against") : nothing
+    by_pkg = Dict{String,Dict{String,Item}}()
+    for job in jobs
+        get!(by_pkg, str(job, "package"), Dict{String,Item}())[str(job, "config")] = job
+    end
+    first_row = true
+    nf_lines = Tuple{String,String}[]  # (package, stored error_line) of hard new failures
+    for pkg in sort!(collect(keys(by_pkg)))
+        group = by_pkg[pkg]
+        haskey(group, primary_name) || continue
+        p = group[primary_name]
+        pst = str(p, "status")
+        pst in TERMINAL_STATUSES || continue
+        a = against_name === nothing ? nothing : get(group, against_name, nothing)
+        if a !== nothing && !(str(something(a), "status") in TERMINAL_STATUSES)
+            a = nothing
+        end
+        # hard new failure: fail/crash on primary while the baseline passed
+        # (single-config runs count every hard failure) — same classification
+        # the page applies to build its new-failures section
+        if (pst == "fail" || pst == "crash") &&
+           (against_name === nothing ||
+            (a !== nothing && issuccess(str(something(a), "status"))))
+            el = opt_str(p, "error_line")
+            el === nothing || push!(nf_lines, (pkg, something(el)))
+        end
+        pver = opt_str(p, "version")
+        aver = a === nothing ? nothing : opt_str(something(a), "version")
+        ver = something(pver, something(aver, ""))
+        first_row || print(io, ",")
+        first_row = false
+        print(io, "[", JSON.json(pkg), ",", JSON.json(ver),
+              ",", JSON.json(status_char(pst)),
+              ",", string(reason_idx(p)),
+              ",", string(round(Int, flt(p, "duration", 0.0))))
+        if a === nothing
+            print(io, ",\"\",-1,0,0,", string(logdir_idx(p)), ",-1]")
+        else
+            aa = something(a)
+            print(io, ",", JSON.json(status_char(str(aa, "status"))),
+                  ",", string(reason_idx(aa)),
+                  ",", string(round(Int, flt(aa, "duration", 0.0))))
+            changed = pver !== nothing && aver !== nothing && pver != aver
+            print(io, ",", changed ? JSON.json(something(aver)) : "0",
+                  ",", string(logdir_idx(p)), ",", string(logdir_idx(aa)), "]")
+        end
+    end
+    print(io, "]")
+
+    # shared failure signatures: cluster the collected error lines by their
+    # normalized form; the page renders multi-package clusters as filters
+    sig_ids = Dict{String,Int}()
+    sig_labels = String[]
+    sig_counts = Int[]
+    assigned = Tuple{String,Int}[]
+    for (pkg, line) in nf_lines
+        key = normalize_error_line(line)
+        idx = get!(sig_ids, key) do
+            push!(sig_labels, line)
+            push!(sig_counts, 0)
+            length(sig_labels) - 1
+        end
+        sig_counts[idx + 1] += 1
+        push!(assigned, (pkg, idx))
+    end
+    if !isempty(sig_labels)
+        # most common first; ties keep first-seen order (plain sortperm — the
+        # keyword-sorting paths don't survive the trim verifier)
+        perm = sortperm([(-sig_counts[i], i) for i in 1:length(sig_counts)])
+        remap = Vector{Int}(undef, length(perm))
+        for (newi, oldi) in enumerate(perm)
+            remap[oldi] = newi - 1
+        end
+        print(io, ",\"sigs\":[")
+        for (i, oldi) in enumerate(perm)
+            i == 1 || print(io, ",")
+            print(io, "{\"label\":", JSON.json(sig_labels[oldi]),
+                  ",\"n\":", string(sig_counts[oldi]), "}")
+        end
+        print(io, "],\"nfsig\":{")
+        for (i, (pkg, idx)) in enumerate(assigned)
+            i == 1 || print(io, ",")
+            print(io, JSON.json(pkg), ":", string(remap[idx + 1]))
+        end
+        print(io, "}")
+    end
+
+    print(io, ",\"logdirs\":[")
+    for (i, dir) in enumerate(logdirs)
+        i == 1 || print(io, ",")
+        print(io, JSON.json(dir))
+    end
+    print(io, "]}")
+    return String(take!(io))
 end
 
 # machine-readable dump of the run + job records (attribute values unwrapped)

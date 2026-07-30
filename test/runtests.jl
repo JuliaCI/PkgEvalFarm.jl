@@ -49,6 +49,81 @@ const PEF = PkgEvalFarm
         # unknown settings fail loudly instead of being dropped
         @test_throws ErrorException PEF.config_from_dict(Dict("name" => "x", "frobnicate" => 1))
     end
+
+    @testset "error_line extraction" begin
+        el = PEF.error_line
+        # first non-generic ERROR: line wins, ANSI/\r stripped
+        @test el("Testing...\n\e[91mERROR: MethodError: no method matching f()\e[0m\r\n") ==
+              "ERROR: MethodError: no method matching f()"
+        # crash-class markers trump an earlier ERROR: line
+        @test el("ERROR: whatever\njulia: gc.c:123: Assertion `x' failed\n") ==
+              "julia: gc.c:123: Assertion `x' failed"
+        @test el("Internal error: during type inference\n") ==
+              "Internal error: during type inference"
+        # among crash-class markers, the first *line* wins, not the first pattern
+        @test el("Internal error: inference\njulia: Assertion `x' failed\n") ==
+              "Internal error: inference"
+        # generic restatements are skipped in favour of the failure location
+        @test el("""
+                 Loss: Test Failed at /pkg/test/runtests.jl:87
+                 ERROR: LoadError: Some tests did not pass: 3 passed, 1 failed
+                 """) == "Loss: Test Failed at /pkg/test/runtests.jl:87"
+        @test el("all fine\nTesting X tests passed\n") === nothing
+        # long lines are clipped to the 240-char budget
+        long = "ERROR: " * "x"^300
+        @test length(something(el(long))) == 240
+        @test endswith(something(el(long)), "…")
+    end
+end
+
+@testset "failure signature clustering" begin
+    # unit-drive of the bot's report_json over fabricated DynamoDB items
+    FB = PEF.FarmBot
+    attr = FB.FarmLite.attr
+    ctx = FB.FarmLite.LiteCtx(; region="us-east-1",
+        creds=FB.FarmLite.AwsCreds("t", "t", nothing),
+        queue_url="q", runs_table="r", jobs_table="j", bucket="b")
+    run = FB.FarmLite.Item("run_id" => attr("RID"), "submitter" => attr("kc"),
+                           "created_at" => attr("2026-07-30T06:00:00Z"),
+                           "total_jobs" => attr(6))
+    job(cfg, pkg, status; error_line=nothing) = begin
+        it = FB.FarmLite.Item("config" => attr(cfg), "package" => attr(pkg),
+                              "status" => attr(status), "duration" => attr(10.0))
+        error_line === nothing || (it["error_line"] = attr(error_line))
+        it
+    end
+    configs = [FB.ConfigInfo("primary", "JuliaLang/julia#abc", nothing),
+               FB.ConfigInfo("against", "v1.12.0", nothing)]
+    jobs = [
+        # same failure modulo location/LoadError nesting: one cluster of two
+        job("primary", "A", "fail";
+            error_line="ERROR: LoadError: MethodError: no method matching f() at /a/x.jl:12"),
+        job("against", "A", "test"),
+        job("primary", "B", "fail";
+            error_line="ERROR: MethodError: no method matching f() at /b/y.jl:99"),
+        job("against", "B", "test"),
+        # differs only in the address: still its own cluster, below the pair
+        job("primary", "C", "crash"; error_line="Unreachable reached at 0xdeadbeef"),
+        job("against", "C", "load"),
+        # fails on both builds: not a new failure, excluded
+        job("primary", "D", "fail"; error_line="ERROR: MethodError: no method matching f()"),
+        job("against", "D", "fail"; error_line="ERROR: MethodError: no method matching f()"),
+        # hard new failure without a recorded line: not in nfsig
+        job("primary", "E", "fail"),
+        job("against", "E", "test"),
+    ]
+    d = JSON.parse(FB.report_json(ctx, run, jobs, configs, 0.0, false))
+    @test length(d["sigs"]) == 2
+    @test d["sigs"][1]["n"] == 2  # most common first
+    @test occursin("MethodError", d["sigs"][1]["label"])
+    @test d["sigs"][2]["n"] == 1
+    @test d["nfsig"] == Dict("A" => 0, "B" => 0, "C" => 1)
+    @test !haskey(d["nfsig"], "D") && !haskey(d["nfsig"], "E")
+    # no error lines recorded => the fields are omitted entirely
+    d0 = JSON.parse(FB.report_json(ctx, run, [job("primary", "A", "fail"),
+                                              job("against", "A", "test")],
+                                   configs, 0.0, false))
+    @test !haskey(d0, "sigs") && !haskey(d0, "nfsig")
 end
 
 @testset "bot command parsing" begin

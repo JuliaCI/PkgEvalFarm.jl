@@ -229,6 +229,8 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::Abstr
                 # the donor's log verbatim: log_key is stored per job precisely
                 # so a result can point outside its own run's prefix
                 "log_key" => get(donor, "log_key", nothing),
+                (get(donor, "error_line", nothing) === nothing ? () :
+                 (("error_line" => donor["error_line"]),))...,
                 "reused_from" => donor_id,
                 "finished_at" => now,
                 "attempts" => 0))))
@@ -506,6 +508,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     result.status in TERMINAL_STATUSES || error("not a terminal status: $(result.status)")
 
     key = log_key(job.run_id, job.config, job.package)
+    stored_log = result.log
     if result.log !== nothing
         aws_retry() do
             try
@@ -518,11 +521,20 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                            "If-None-Match" => "*"));
                     aws_config=ctx.aws)
             catch err
-                # a crashed earlier attempt already uploaded this job's log
+                # a crashed earlier attempt already uploaded this job's log; that
+                # immutable log is what log_key points at, so derive error_line
+                # from it rather than from this retry's log
                 is_precondition_failed(err) || rethrow()
+                stored_log = String(copy(S3.get_object(ctx.cfg.bucket, key,
+                    Dict("return_raw" => true); aws_config=ctx.aws)))
             end
         end
     end
+    # first meaningful error line of hard failures, so the report can cluster
+    # shared failure signatures without the logs; absent on other jobs to keep
+    # the items (fetched wholesale by every run_jobs read) small
+    line = result.status in ("fail", "crash") && stored_log !== nothing ?
+           error_line(something(stored_log)) : nothing
 
     # The terminal-status write and the counter bump must be one atomic unit: a
     # worker dying between two separate writes leaves every job terminal but the
@@ -539,7 +551,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, wall = :wall, finished_at = :now, " *
-                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss",
+                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss" *
+                                       (line === nothing ? "" : ", error_line = :error_line"),
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
@@ -559,7 +572,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                 (result.wall > 0 ? result.wall : result.duration) /
                                 3600 * something(SLOT_HOURLY_RATE[]),
                      ":peak_rss" => result.peak_rss,
-                     ":log_key" => result.log === nothing ? nothing : key)))),
+                     ":log_key" => result.log === nothing ? nothing : key,
+                     (line === nothing ? () : ((":error_line" => line),))...)))),
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),

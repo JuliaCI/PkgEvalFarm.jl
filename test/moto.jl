@@ -134,11 +134,15 @@ try
             # occupancy, not the test-phase duration; the rest fall back to
             # duration (a worker predating wall metering)
             wall = claimed.job.package == "JSON" && claimed.job.config == "primary" ? 84.0 : 0.0
+            log = "log of $(claimed.job.package) on $(claimed.job.config)"
+            # give failures a signature line, as real test logs would have
+            status == "fail" &&
+                (log = "ERROR: MethodError: no method matching parse(::Foo)\n" * log)
+            status == "crash" && (log = "Unreachable reached at 0x1234\n" * log)
             result = PEF.JobResult(; status,
                 reason=status == "fail" ? "test_failures" :
                        status == "crash" ? "segfault" : nothing,
-                version="1.2.3", duration=42.0, wall, peak_rss=1_234_567_890,
-                log="log of $(claimed.job.package) on $(claimed.job.config)")
+                version="1.2.3", duration=42.0, wall, peak_rss=1_234_567_890, log)
             PEF.record_result(ctx, claimed, result)
         end
         @test length(seen) == 6
@@ -150,6 +154,13 @@ try
         end
         @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["wall"] == 84.0
         @test all(j -> j["peak_rss"] == 1_234_567_890, jobs)
+        # failing jobs get their first error line extracted; passing jobs
+        # don't carry the attribute at all
+        @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["error_line"] ==
+              "ERROR: MethodError: no method matching parse(::Foo)"
+        @test only(filter(j -> j["job_key"] == "primary#Crayons", jobs))["error_line"] ==
+              "Unreachable reached at 0x1234"
+        @test !haskey(only(filter(j -> j["job_key"] == "against#JSON", jobs)), "error_line")
 
         run = PEF.get_run(ctx, RUN_ID)
         @test run["completed_jobs"] == 6
@@ -171,7 +182,7 @@ try
     @testset "logs and report" begin
         jobs = PEF.run_jobs(ctx, RUN_ID)
         job = only(filter(j -> j["job_key"] == "primary#JSON", jobs))
-        @test PEF.job_log(ctx, job) == "log of JSON on primary"
+        @test endswith(PEF.job_log(ctx, job), "log of JSON on primary")
 
         # create-only uploads: conditional re-put of an existing log is rejected
         # and the original content survives (first write wins)
@@ -184,7 +195,7 @@ try
             err
         end
         @test PEF.is_precondition_failed(overwrite_err)
-        @test PEF.job_log(ctx, job) == "log of JSON on primary"
+        @test endswith(PEF.job_log(ctx, job), "log of JSON on primary")
 
         # report generation runs through FarmBot (the stdlib-only bot Lambda code)
         lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
@@ -209,6 +220,39 @@ try
         @test fetch_raw(PEF.report_key(RUN_ID, "report.md")) == report.markdown
         db = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "db.json")))
         @test length(db["jobs"]) == 6
+
+        # the interactive report: the page itself lives on GitHub Pages, only
+        # its compact per-run dataset is uploaded; the report link carries the
+        # run id for the page to find it
+        @test PEF.FarmBot.report_url(lite, RUN_ID) ==
+              PEF.FarmBot.report_page() * "?run=" * RUN_ID
+        rj = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "report.json")))
+        @test rj["run"]["id"] == RUN_ID
+        @test rj["run"]["primary"]["repo"] == "JuliaLang/julia"
+        @test rj["run"]["primary"]["sha"] == "abc123"
+        @test rj["run"]["against"]["sha"] == "v1.12.0"  # not a repo#sha spec
+        @test rj["run"]["against"]["repo"] == ""
+        @test rj["run"]["total_jobs"] == 6
+        # rows: [name, ver, pstatus, preason, pdur, astatus, areason, adur, aver,
+        #        plogdir, alogdir]
+        rows = Dict(r[1] => r for r in rj["pkgs"])
+        @test length(rows) == 3
+        @test rows["JSON"][3] == "f" && rows["JSON"][6] == "t"      # the new failure
+        @test rows["JSON"][4] >= 0                                  # has a reason...
+        @test rj["reasons"][rows["JSON"][4] + 1][1] == "test_failures"
+        @test rows["Crayons"][3] == "c" && rows["Crayons"][6] == "c"  # fails on both
+        @test rows["Example"][3] == "t" && rows["Example"][6] == "t"
+        @test rows["Example"][2] == "1.2.3"
+        @test rows["Example"][9] == 0  # same version on both sides
+        @test rows["Example"][5] == 42  # duration in whole seconds
+        # log locations come from each job's log_key
+        @test rj["logdirs"][rows["JSON"][10] + 1] == "runs/$RUN_ID/logs/primary"
+        @test rj["logdirs"][rows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
+        # the new failure's stored error_line becomes a failure signature;
+        # Crayons fails on both builds, so it is not clustered
+        @test rj["sigs"] == [Dict("label" => "ERROR: MethodError: no method matching parse(::Foo)",
+                                  "n" => 1)]
+        @test rj["nfsig"] == Dict("JSON" => 0)
     end
 
     @testset "worker error handling" begin
@@ -253,34 +297,39 @@ try
         PEF.heartbeat(ctx, claimed)  # expansion can be slow (may build Julia)
 
         # what a worker does after computing the package set
-        njobs = PEF.expand_run(ctx, run_id, ["Example", "JSON"])
-        @test njobs == 4
+        njobs = PEF.expand_run(ctx, run_id, ["Crayons", "Example", "JSON"])
+        @test njobs == 6
         SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "active"
-        @test run["total_jobs"] == 4
+        @test run["total_jobs"] == 6
         jobs = PEF.run_jobs(ctx, run_id)
-        @test length(jobs) == 4
+        @test length(jobs) == 6
 
         # baseline reuse: the first run is `done` with an identical `against`
         # config (immutable spec v1.12.0), so its results transferred — those
         # jobs arrive pre-completed, pointing at the donor's logs, and only the
         # primary side was enqueued
         reused = filter(j -> get(j, "reused_from", nothing) !== nothing, jobs)
-        @test length(reused) == 2
+        @test length(reused) == 3
         @test all(j -> j["config"] == "against", reused)
         @test all(j -> j["reused_from"] == RUN_ID, reused)
+        # the donor's error_line rides along for its crashed job, and stays
+        # absent for jobs that passed there
+        @test only(filter(j -> j["job_key"] == "against#Crayons", jobs))["error_line"] ==
+              "Unreachable reached at 0x1234"
+        @test !haskey(only(filter(j -> j["job_key"] == "against#JSON", jobs)), "error_line")
         @test only(filter(j -> j["job_key"] == "against#Example", jobs))["status"] == "test"
         @test startswith(only(filter(j -> j["job_key"] == "against#JSON", jobs))["log_key"],
                          "runs/$RUN_ID/")
-        @test run["completed_jobs"] == 2
+        @test run["completed_jobs"] == 3
 
         # a duplicate expand message after the flip only re-enqueues, never resets
         first_claim = PEF.claim_job(ctx; wait=1)
         @test first_claim isa PEF.ClaimedJob
-        njobs = PEF.expand_run(ctx, run_id, ["Example", "JSON"])  # redelivery scenario
-        @test njobs == 4
+        njobs = PEF.expand_run(ctx, run_id, ["Crayons", "Example", "JSON"])  # redelivery scenario
+        @test njobs == 6
         job_item = only(filter(j -> j["job_key"] == PEF.job_key(first_claim.job),
                                PEF.run_jobs(ctx, run_id)))
         @test job_item["status"] == "running"  # not reset back to pending
@@ -295,7 +344,21 @@ try
         end
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
-        @test run["completed_jobs"] == 4
+        @test run["completed_jobs"] == 6
+
+        # the report must point reused baseline logs at the donor run's prefix,
+        # and jobs recorded without a log get no location (-1)
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        PEF.FarmBot.generate_report(lite, run_id)
+        rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+            PEF.report_key(run_id, "report.json"),
+            Dict("return_raw" => true); aws_config=aws))))
+        rrows = Dict(r[1] => r for r in rj["pkgs"])
+        @test rj["logdirs"][rrows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
+        @test rrows["JSON"][10] == -1  # drained via JobResult without a log
     end
 
     @testset "fresh baseline opts out of reuse" begin
@@ -521,7 +584,7 @@ try
             @test edited[end].first == "700001"
             @test occursin("@keno: run `$run_id` finished", edited[end].second)
             @test occursin("no new package failures", edited[end].second)
-            @test occursin("report.md", edited[end].second)
+            @test occursin("?run=$run_id", edited[end].second)
 
             # 4. and does not double-report
             n_edited = length(edited)
