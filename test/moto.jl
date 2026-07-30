@@ -800,10 +800,22 @@ try
         # --- Buildkite state polling: failed builds become build-failed answers ---
         import HTTP as BkHTTP
         bk_state = Ref("running")
+        triggers = Ref(0)               # own-pipeline builds we actually fired
+        upstream_state = Ref("none")    # julia-pr's build of the commit, if any
         bk_router = BkHTTP.Router()
         BkHTTP.register!(bk_router, "POST", "/v2/organizations/testorg/pipelines/testpipe/builds",
-            req -> BkHTTP.Response(201, JSON.json(Dict(
-                "number" => 42, "state" => "scheduled", "web_url" => "http://bk/42"))))
+            req -> begin
+                triggers[] += 1
+                BkHTTP.Response(201, JSON.json(Dict(
+                    "number" => 42, "state" => "scheduled", "web_url" => "http://bk/42")))
+            end)
+        BkHTTP.register!(bk_router, "GET", "/v2/organizations/testorg/pipelines/julia-pr/builds",
+            req -> BkHTTP.Response(200, upstream_state[] == "none" ? "[]" :
+                JSON.json([Dict("number" => 7, "state" => upstream_state[],
+                                "web_url" => "http://bk/up/7")])))
+        BkHTTP.register!(bk_router, "GET", "/v2/organizations/testorg/pipelines/julia-pr/builds/7",
+            req -> BkHTTP.Response(200, JSON.json(Dict(
+                "number" => 7, "state" => upstream_state[], "web_url" => "http://bk/up/7"))))
         BkHTTP.register!(bk_router, "GET", "/v2/organizations/testorg/pipelines/testpipe/builds/42",
             req -> BkHTTP.Response(200, JSON.json(Dict(
                 "number" => 42, "state" => bk_state[], "web_url" => "http://bk/42"))))
@@ -879,6 +891,94 @@ try
                     "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$sha3\",\"variant\":\"linuxassert\"}", lctx)
                 @test occursin("build-failed", resp)
                 @test occursin("buildkite.com/testorg/testpipe/builds?commit=$sha3", resp)
+            end
+
+            # --- waiting on upstream CI builds instead of duplicating them ---
+            setattr(k, name, t) = Dynamodb.update_item(
+                Dict("build_key" => Dict("S" => k)), "pkgeval-builds",
+                Dict("UpdateExpression" => "SET #a = :t",
+                     "ExpressionAttributeNames" => Dict("#a" => name),
+                     "ExpressionAttributeValues" => Dict(":t" => Dict("S" => BuildRequest.isodate(t))));
+                aws_config=aws)
+            statusof(k) = FL.str(something(BuildRequest.get_claim(lctx, "pkgeval-builds", k)), "status", "")
+            # the body is JSON-escaped inside the response envelope, so match
+            # statuses positionally rather than with quoted-literal fragments
+            is_requested(resp) = occursin("\"statusCode\":202", resp) &&
+                occursin("requested", resp) && !occursin("already-requested", resp) &&
+                !occursin("waiting-upstream", resp)
+            with_env(Dict("PKGEVAL_BUILDS_TABLE" => "pkgeval-builds",
+                          "BUILDKITE_API_BASE" => "http://127.0.0.1:$bk_port",
+                          "BUILDKITE_ORG" => "testorg", "BUILDKITE_PIPELINE" => "testpipe",
+                          "BUILDKITE_TOKEN_PARAM" => "/pkgeval/buildkite-token",
+                          "BUILDKITE_UPSTREAM_PIPELINES" => "julia-pr")) do
+                # upstream in flight: no duplicate trigger, claim waits on it
+                upstream_state[] = "running"
+                shaU = "1111111111111111111111111111111111111112"
+                askU = "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$shaU\",\"variant\":\"linuxassert\"}"
+                n0 = triggers[]
+                resp = BuildRequest.handle_event(askU, lctx)
+                @test occursin("waiting-upstream", resp)
+                @test triggers[] == n0
+                @test statusof("$shaU/linuxassert") == "upstream"
+                # still in flight on re-ask: keep waiting, still no trigger
+                resp = BuildRequest.handle_event(askU, lctx)
+                @test occursin("already-requested", resp)
+                @test triggers[] == n0
+
+                # upstream turns terminal: first observation starts the grace
+                # clock; once it lapses (artifact never appeared), we trigger
+                # our own build — never build-failed from an upstream failure
+                upstream_state[] = "failed"
+                resp = BuildRequest.handle_event(askU, lctx)
+                @test occursin("already-requested", resp)
+                @test triggers[] == n0
+                setattr("$shaU/linuxassert", "upstream_done_at",
+                        Dates.now(UTC) - Dates.Minute(11))
+                resp = BuildRequest.handle_event(askU, lctx)
+                @test is_requested(resp)
+                @test triggers[] == n0 + 1
+                @test statusof("$shaU/linuxassert") == "requested"
+                claim = something(BuildRequest.get_claim(lctx, "pkgeval-builds", "$shaU/linuxassert"))
+                @test FL.int(claim, "build_number", -1) == 42
+
+                # upstream that recently *passed* while workers still ask
+                # (artifact upload lag): wait out the grace, then trigger
+                upstream_state[] = "passed"
+                shaP = "1111111111111111111111111111111111111113"
+                askP = "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$shaP\",\"variant\":\"linuxassert\"}"
+                nP = triggers[]
+                resp = BuildRequest.handle_event(askP, lctx)
+                @test occursin("waiting-upstream", resp)
+                @test triggers[] == nP
+                resp = BuildRequest.handle_event(askP, lctx)   # inside grace
+                @test occursin("already-requested", resp)
+                setattr("$shaP/linuxassert", "upstream_done_at",
+                        Dates.now(UTC) - Dates.Minute(11))
+                resp = BuildRequest.handle_event(askP, lctx)
+                @test is_requested(resp)
+                @test triggers[] == nP + 1
+
+                # no upstream build at all: trigger immediately, as ever
+                upstream_state[] = "none"
+                shaN = "1111111111111111111111111111111111111114"
+                resp = BuildRequest.handle_event(
+                    "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$shaN\",\"variant\":\"linuxassert\"}", lctx)
+                @test is_requested(resp)
+                @test statusof("$shaN/linuxassert") == "requested"
+
+                # upstream stuck in flight past the age backstop: take over
+                # with our own build rather than declaring failure
+                upstream_state[] = "running"
+                shaS = "1111111111111111111111111111111111111115"
+                askS = "{\"repo\":\"JuliaLang/julia\",\"sha\":\"$shaS\",\"variant\":\"linuxassert\"}"
+                resp = BuildRequest.handle_event(askS, lctx)
+                @test occursin("waiting-upstream", resp)
+                setat("$shaS/linuxassert", Dates.now(UTC) - Dates.Hour(4))
+                nS = triggers[]
+                resp = BuildRequest.handle_event(askS, lctx)
+                @test is_requested(resp)
+                @test triggers[] == nS + 1
+                @test statusof("$shaS/linuxassert") == "requested"
             end
         finally
             close(bk_server)

@@ -50,8 +50,20 @@ const ALLOWED_REPO = "JuliaLang/julia"
 const MAX_BUILD_AGE = 3 * 60 * 60
 const FAILED_RETRY_AGE = 24 * 60 * 60
 
+# When upstream CI (julia-pr/julia-ci) is already building a commit, we wait on
+# it instead of triggering a duplicate — its artifacts land in the same staging
+# buckets workers probe. Once that upstream build reaches a terminal state and
+# workers are *still* asking (i.e. the artifact never appeared, or upload lag),
+# this grace period bounds the wait before we trigger our own build after all.
+const UPSTREAM_DONE_GRACE = 10 * 60
+
 api_base() = get(ENV, "BUILDKITE_API_BASE", "https://api.buildkite.com")
 bk_token(ctx::LiteCtx) = ssm_parameter(ctx, ENV["BUILDKITE_TOKEN_PARAM"]::String)
+
+"Pipelines whose in-flight builds of a commit we wait on rather than duplicate.
+Empty disables the upstream check entirely."
+upstream_pipelines() =
+    split(get(ENV, "BUILDKITE_UPSTREAM_PIPELINES", "julia-pr,julia-ci"), ','; keepempty=false)
 
 "The slice of a Buildkite build object this module reads."
 struct BkBuild
@@ -76,6 +88,16 @@ function json_make(::Type{BkBuild}, x::LazyVal)
         return nothing
     end
     return BkBuild(number[], state[], web_url[]), pos::Int
+end
+
+function json_make(::Type{Vector{BkBuild}}, x::LazyVal)
+    out = BkBuild[]
+    pos = JSON.applyarray(x) do i, v
+        b, p = json_make(BkBuild, v)
+        push!(out, b)
+        return p
+    end
+    return out, pos::Int
 end
 
 struct ItemResp                        # GetItem
@@ -256,14 +278,183 @@ function trigger_build(token::String, org::String, pipeline::String,
     end
 end
 
-"Fetch the current state of a triggered build (\"running\", \"passed\", \"failed\", ...)."
-function build_state(ctx::LiteCtx, number::Int)
+"Fetch the current state of a build (\"running\", \"passed\", \"failed\", ...)."
+function build_state(ctx::LiteCtx, pipeline::String, number::Int)
     org = ENV["BUILDKITE_ORG"]::String
-    pipeline = ENV["BUILDKITE_PIPELINE"]::String
     url = "$(api_base())/v2/organizations/$org/pipelines/$pipeline/builds/$number"
     resp = http_request("GET", url; headers=["Authorization" => "Bearer " * bk_token(ctx)])
     resp.status == 200 || error("Buildkite build query failed (HTTP $(resp.status))")
     return parse_json(resp.body, BkBuild).state
+end
+build_state(ctx::LiteCtx, number::Int) =
+    build_state(ctx, ENV["BUILDKITE_PIPELINE"]::String, number)
+
+# "blocked" deliberately doesn't count: a build waiting on a manual unblock
+# may wait forever, and duplicating it is the lesser evil
+upstream_active(state::String) = state in ("running", "scheduled", "creating")
+
+"""
+Find an upstream CI build of `sha` worth waiting on: one that is in flight, or
+recently passed (its artifact may still be uploading). Returns
+`(pipeline, number, url, active)` or `nothing` — including on any API trouble,
+which degrades to triggering our own build, i.e. the pre-feature behavior.
+"""
+function find_upstream_build(ctx::LiteCtx, sha::String)
+    org = ENV["BUILDKITE_ORG"]::String
+    token = bk_token(ctx)
+    for pipeline in upstream_pipelines()
+        p = String(pipeline)
+        builds = try
+            url = "$(api_base())/v2/organizations/$org/pipelines/$p/builds?commit=$sha&per_page=10"
+            resp = http_request("GET", url; headers=["Authorization" => "Bearer " * token])
+            resp.status == 200 || continue
+            parse_json(resp.body, Vector{BkBuild})
+        catch err
+            msg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "upstream build query failed for " * p * ": " * msg)
+            continue
+        end
+        # prefer an in-flight build over a passed one; ignore failed/canceled
+        # (they don't block us — and their artifacts, if any, would have been
+        # found in the buckets before anyone asked here)
+        passed = nothing
+        for b in builds
+            b.number === nothing && continue
+            state = something(b.state, "")
+            number = something(b.number)
+            url = something(b.web_url, "")
+            if upstream_active(state)
+                return (p, number, url, true)
+            elseif state == "passed" && passed === nothing
+                passed = (p, number, url, false)
+            end
+        end
+        passed === nothing || return passed
+    end
+    return nothing
+end
+
+"Flip a fresh claim to waiting-on-upstream, recording which build to poll."
+function mark_claim_upstream(ctx::LiteCtx, table::String, key::String,
+                             pipeline::String, number::Int, url::String, active::Bool)
+    payload = "{\"TableName\":$(JSON.json(table))," *
+              "\"Key\":{\"build_key\":{\"S\":$(JSON.json(key))}}," *
+              "\"UpdateExpression\":\"SET #s = :u, upstream_pipeline = :p, " *
+              "upstream_number = :n, build_url = :url" *
+              (active ? "" : ", upstream_done_at = :done") * "\"," *
+              "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+              "\"ExpressionAttributeValues\":{\":u\":{\"S\":\"upstream\"}," *
+              "\":p\":{\"S\":$(JSON.json(pipeline))}," *
+              "\":n\":{\"N\":\"$number\"}," *
+              "\":url\":{\"S\":$(JSON.json(url))}" *
+              (active ? "" : ",\":done\":{\"S\":" * JSON.json(isodate()) * "}") * "}}"
+    ddb(ctx, "UpdateItem", payload)
+    return nothing
+end
+
+"Record when the upstream build was first seen terminal (starts the grace clock)."
+function mark_upstream_done(ctx::LiteCtx, table::String, key::String)
+    payload = "{\"TableName\":$(JSON.json(table))," *
+              "\"Key\":{\"build_key\":{\"S\":$(JSON.json(key))}}," *
+              "\"ConditionExpression\":\"attribute_not_exists(upstream_done_at)\"," *
+              "\"UpdateExpression\":\"SET upstream_done_at = :now\"," *
+              "\"ExpressionAttributeValues\":{\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        is_conditional_failure(err) || rethrow()
+    end
+    return nothing
+end
+
+"""
+Take over a claim whose upstream wait is done for (upstream failed, stalled
+past the age backstop, or passed without an artifact appearing): flip it to a
+normal `requested` claim — conditionally, so racing askers elect one trigger —
+and fire our own build. Answers like the fresh-claim path.
+"""
+function takeover_and_trigger(ctx::LiteCtx, table::String, key::String,
+                              commit::String, variant::String)
+    payload = "{\"TableName\":$(JSON.json(table))," *
+              "\"Key\":{\"build_key\":{\"S\":$(JSON.json(key))}}," *
+              "\"ConditionExpression\":\"#s = :u\"," *
+              "\"UpdateExpression\":\"SET #s = :r, requested_at = :now REMOVE upstream_done_at\"," *
+              "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
+              "\"ExpressionAttributeValues\":{\":u\":{\"S\":\"upstream\"}," *
+              "\":r\":{\"S\":\"requested\"}," *
+              "\":now\":{\"S\":$(JSON.json(isodate()))}}}"
+    try
+        ddb(ctx, "UpdateItem", payload)
+    catch err
+        is_conditional_failure(err) || rethrow()
+        return json_response(200, "{\"status\":\"already-requested\"}")
+    end
+    build = try
+        trigger_build(bk_token(ctx),
+                      ENV["BUILDKITE_ORG"]::String, ENV["BUILDKITE_PIPELINE"]::String,
+                      commit, variant)
+    catch err
+        # release so the next asker retries the whole decision from scratch
+        try
+            release_build_claim(ctx, table, key)
+        catch release_err
+            msg = (FarmLite.@trim_errmsg release_err)::String
+            println(Core.stderr, "failed to release build claim for " * key * ": " * msg)
+        end
+        rethrow()
+    end
+    if build.number !== nothing
+        try
+            record_build(ctx, table, key, something(build.number),
+                         something(build.web_url, ""))
+        catch err
+            msg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "failed to record build identity for " * key * ": " * msg)
+        end
+    end
+    return json_response(202, "{\"status\":\"requested\"}")
+end
+
+"""
+Poll a claim that is waiting on an upstream CI build. Still in flight (and
+young enough): keep waiting. Terminal, or stalled past MAX_BUILD_AGE: after a
+grace period for artifact upload lag, stop waiting and trigger our own build —
+never answer `build-failed` from here, since an upstream build's failure says
+nothing about whether *our* build would succeed.
+"""
+function poll_upstream(ctx::LiteCtx, table::String, key::String, c::Item)
+    variant = String(last(split(key, '/')))
+    commit = String(first(split(key, '/')))
+    asked = parse_isodate(str(c, "requested_at", ""))
+    stalled = asked !== nothing &&
+              Dates.now(UTC) - something(asked) >= Dates.Second(MAX_BUILD_AGE)
+    stalled && return takeover_and_trigger(ctx, table, key, commit, variant)
+
+    done_at = parse_isodate(str(c, "upstream_done_at", ""))
+    if done_at !== nothing
+        if Dates.now(UTC) - something(done_at) >= Dates.Second(UPSTREAM_DONE_GRACE)
+            return takeover_and_trigger(ctx, table, key, commit, variant)
+        end
+        return json_response(200, "{\"status\":\"already-requested\"}")
+    end
+
+    pipeline = str(c, "upstream_pipeline", "")
+    number = int(c, "upstream_number", -1)
+    state = if isempty(pipeline) || number < 0
+        nothing
+    else
+        try
+            build_state(ctx, pipeline, number)
+        catch err
+            msg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "upstream state query failed for " * key * ": " * msg)
+            nothing
+        end
+    end
+    if state !== nothing && !upstream_active(something(state))
+        mark_upstream_done(ctx, table, key)   # grace clock; next asks decide
+    end
+    return json_response(200, "{\"status\":\"already-requested\"}")
 end
 
 failed_response(url::String) =
@@ -293,6 +484,7 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
               String(first(split(key, '/')))
     end
     str(c, "status", "") == "failed" && return failed_response(url)
+    str(c, "status", "") == "upstream" && return poll_upstream(ctx, table, key, c)
     asked = parse_isodate(str(c, "requested_at", ""))
     expired = asked !== nothing &&
               Dates.now(UTC) - something(asked) >= Dates.Second(MAX_BUILD_AGE)
@@ -356,6 +548,38 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
     key = string(commit, "/", variant)
     if !claim_build(ctx, table, key, "lambda")
         return poll_claim(ctx, table, key)
+    end
+
+    # If upstream CI is already building (or just built) this commit, wait on
+    # it instead of triggering a duplicate: its artifacts land in the same
+    # staging buckets, so the workers' retry loop picks them up identically.
+    # poll_upstream owns the wait from here — including falling back to our
+    # own build if upstream fails, stalls, or passes without an artifact.
+    upstream = try
+        find_upstream_build(ctx, commit)
+    catch err
+        msg = (FarmLite.@trim_errmsg err)::String
+        println(Core.stderr, "upstream check failed for " * key * ": " * msg)
+        nothing
+    end
+    if upstream !== nothing
+        pipeline, number, up_url, active = something(upstream)
+        try
+            mark_claim_upstream(ctx, table, key, pipeline, number, up_url, active)
+            return json_response(202, "{\"status\":\"waiting-upstream\"}")
+        catch err
+            # an unmarkable claim must not wedge as a bare "requested" with no
+            # build identity: release it and let the next asker redo the dance
+            msg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "failed to mark upstream claim for " * key * ": " * msg)
+            try
+                release_build_claim(ctx, table, key)
+            catch release_err
+                msg2 = (FarmLite.@trim_errmsg release_err)::String
+                println(Core.stderr, "failed to release build claim for " * key * ": " * msg2)
+            end
+            return json_response(202, "{\"status\":\"waiting-upstream\"}")
+        end
     end
 
     # The claim is taken *before* the trigger (that is what makes it a dedup),
