@@ -121,8 +121,14 @@ resource "aws_iam_role_policy" "debug" {
       {
         Sid    = "InspectQueue"
         Effect = "Allow"
-        Action = "sqs:GetQueueAttributes"
+        Action = [
+          "sqs:GetQueueAttributes",
+          # without GetQueueUrl every CLI/SDK convenience path 403s before it
+          # ever reaches the (already-granted) attribute read
+          "sqs:GetQueueUrl",
+        ]
         Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+          aws_sqs_queue.jobs_seal.arn,
         aws_sqs_queue.jobs_dlq.arn]
       },
       {
@@ -135,7 +141,9 @@ resource "aws_iam_role_policy" "debug" {
         # the DLQ is included so the dead-letter consumer path can be exercised
         # directly (inject a synthetic dead message, watch the bot fail the run)
         # without driving eight failed receives through the live queues
-        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn, aws_sqs_queue.jobs_dlq.arn]
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+          aws_sqs_queue.jobs_seal.arn,
+        aws_sqs_queue.jobs_dlq.arn]
       },
       {
         Sid    = "ReadFarmState"
