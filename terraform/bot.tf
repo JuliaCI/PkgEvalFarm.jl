@@ -121,12 +121,12 @@ resource "aws_lambda_function" "bot" {
   runtime       = "provided.al2023"
   architectures = ["x86_64"]
   handler       = "bootstrap"
-  # Lambda allocates CPU proportional to memory (~1 vCPU per 1769 MB): at 1024
-  # the first full-ecosystem report (24k jobs) blew the 300 s timeout on CPU,
-  # not memory (peak 188 MB). 2048 buys ~1.2 vCPU; the 900 s ceiling leaves
-  # slack for pathological runs.
-  memory_size   = 2048
-  timeout       = 900
+  # 1024 is ample: a full-ecosystem (24k-job) report peaks at ~188 MB and its
+  # real work is tens of seconds even at this size's fractional vCPU — the
+  # historical timeout was the quadratic-hashing stall (see FarmLite.hexdigest),
+  # not the workload
+  memory_size   = 1024
+  timeout       = 300
 
   # the function URL is publicly invokable (webhook auth is HMAC inside); real
   # concurrency needs are minimal (stream: one batch per shard, schedule:
