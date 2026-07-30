@@ -37,12 +37,18 @@ locals {
       # workers may only *create* objects, never overwrite: uploads must carry
       # If-None-Match: * (which S3 rejects with 412 if the key exists), so a
       # rogue job with worker credentials cannot falsify already-recorded logs
+      # — or, under compilecache/, already-published sealed artifacts (whose
+      # immutability is what makes first-writer-wins publication sound, see
+      # docs/sealing.md)
       {
         Sid       = "WorkersCreateOnly"
         Effect    = "Deny"
         Principal = "*"
         Action    = "s3:PutObject"
-        Resource  = "${aws_s3_bucket.results.arn}/runs/*"
+        Resource = [
+          "${aws_s3_bucket.results.arn}/runs/*",
+          "${aws_s3_bucket.results.arn}/compilecache/*",
+        ]
         Condition = {
           StringNotEquals = { "s3:if-none-match" = "*" }
           ArnLike         = { "aws:PrincipalArn" = local.worker_role_arns }
@@ -142,6 +148,25 @@ resource "aws_s3_bucket_lifecycle_configuration" "results" {
 
     expiration {
       days = 180
+    }
+  }
+
+  # Sealed compilecache artifacts are keyed by the exact Julia build: PR-build
+  # prefixes are worthless once their run finishes, and even a recurring
+  # baseline goes stale as master moves. 30 days comfortably covers baseline
+  # reuse across PR runs. (If release-build prefixes should ever persist as a
+  # package-server dataset, carve them out via object tags, not by raising
+  # this.)
+  rule {
+    id     = "expire-compilecache"
+    status = "Enabled"
+
+    filter {
+      prefix = "compilecache/"
+    }
+
+    expiration {
+      days = 30
     }
   }
 }

@@ -1109,6 +1109,280 @@ try
                              "pkgeval-runs"; aws_config=aws)
     end
 
+    @testset "sealed compilecache" begin
+        seal_q = SQS.create_queue("pkgeval-jobs-seal"; aws_config=aws)["QueueUrl"]
+        scfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
+                          seal_queue_url=seal_q, runs_table="pkgeval-runs",
+                          jobs_table="pkgeval-jobs", bucket="pkgeval-results")
+        sctx = FarmCtx(scfg, aws)
+
+        # fixture registry: JSON -> Crayons, Example and Crayons are leaves
+        reg = mktempdir()
+        mkpath(joinpath(reg, "J", "JSON"))
+        write(joinpath(reg, "Registry.toml"), """
+            [packages]
+            aaaaaaaa-0000-0000-0000-000000000001 = { name = "Example", path = "E/Example" }
+            aaaaaaaa-0000-0000-0000-000000000002 = { name = "Crayons", path = "C/Crayons" }
+            aaaaaaaa-0000-0000-0000-000000000003 = { name = "JSON", path = "J/JSON" }
+            """)
+        write(joinpath(reg, "J", "JSON", "Deps.toml"), """
+            ["0"]
+            Crayons = "aaaaaaaa-0000-0000-0000-000000000002"
+            """)
+        PEF.SEAL_REGISTRY_OVERRIDE[] = reg
+        cache_dir = mktempdir()
+
+        withenv("PKGEVAL_SEAL_CACHE" => cache_dir) do
+            packages = ["Example", "Crayons", "JSON"]
+            run_id = PEF.create_run(sctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
+                                    submitter="tester", reuse=false)
+            expand = nothing
+            for _ in 1:10
+                expand = PEF.claim_job(sctx; wait=1)
+                expand isa PEF.ClaimedExpand && break
+            end
+            @test expand isa PEF.ClaimedExpand
+            @test PEF.expand_run(sctx, run_id, packages) == 6
+            SQS.delete_message(expand.queue_url, expand.receipt_handle; aws_config=aws)
+
+            # expansion recorded the config -> seal-run mapping (one per julia)
+            run = PEF.get_run(sctx, run_id)
+            seal_runs = run["seal_runs"]
+            @test length(seal_runs) == 2
+            @test seal_runs["primary"] != seal_runs["against"]
+            sr = seal_runs["primary"]
+            @test startswith(sr, "seal-")
+
+            # seal jobs exist with counters: leaves ready, JSON gated on Crayons
+            seal_jobs = Dict(j["package"] => j for j in PEF.run_jobs(sctx, sr))
+            @test length(seal_jobs) == 3
+            @test seal_jobs["JSON"]["remaining"] == 1
+            @test seal_jobs["JSON"]["deps"] == ["Crayons"]
+            @test seal_jobs["Crayons"]["remaining"] == 0
+            @test "JSON" in seal_jobs["Crayons"]["dependents"]
+            @test PEF.get_run(sctx, sr)["total_jobs"] == 3
+
+            # workers prefer the seal queue: the next claims are seal jobs (the
+            # ready leaves of both seal runs), before any of the 6 test jobs
+            gated_state, gated_run = PEF.seal_state(sctx, run,
+                                                    PEF.JobRef(run_id, "primary", "JSON"))
+            @test gated_state == :pending && gated_run == sr
+
+            claimed_seals = 0
+            for _ in 1:12
+                c = PEF.claim_job(sctx; wait=1)
+                c isa PEF.ClaimedJob || continue
+                if PEF.is_seal_job(c.job)
+                    claimed_seals += 1
+                    # complete it the way process_seal_job does, sans evaluation
+                    PEF.record_result(sctx, c, PEF.JobResult(; status="sealed", duration=1.0))
+                    item = PEF.get_seal_item(sctx, c.job)
+                    deps = unique(String.(get(item, "dependents", String[])))
+                    isempty(deps) || PEF.propagate_seal_completion(sctx, c.job.run_id, deps)
+                else
+                    # a test job surfaced: only legal once its seal queue is empty;
+                    # release it and keep going
+                    PEF.release_job(sctx, c; delay=0)
+                end
+                claimed_seals == 4 && break
+            end
+            @test claimed_seals == 4   # Example+Crayons for both seal runs
+
+            # Crayons' completion decremented and enqueued JSON in both seal runs
+            @test PEF.ddb_parse(Dynamodb.get_item(
+                PEF.ddb_item(Dict("run_id" => sr, "job_key" => "seal#JSON")),
+                scfg.jobs_table; aws_config=aws)["Item"])["remaining"] == 0
+            for _ in 1:8
+                c = PEF.claim_job(sctx; wait=1)
+                c isa PEF.ClaimedJob || continue
+                if PEF.is_seal_job(c.job)
+                    @test c.job.package == "JSON"
+                    PEF.record_result(sctx, c, PEF.JobResult(; status="sealed", duration=1.0))
+                else
+                    PEF.release_job(sctx, c; delay=0)
+                end
+            end
+
+            # both seal runs completed and flipped done; the gate reads terminal
+            @test PEF.get_run(sctx, sr)["status"] == "done"
+            @test PEF.seal_status(sctx, sr, "JSON") == :terminal
+            @test PEF.seal_state(sctx, run, PEF.JobRef(run_id, "primary", "JSON")) ==
+                  (:terminal, sr)
+            # absent seal job (package never sealed) -> :none, run immediately
+            @test PEF.seal_status(sctx, sr, "NeverSealed") == :none
+
+            # publication: first-writer-wins with checksums, topological
+            # ordering, taint on content mismatch
+            mktempdir() do export_dir
+                for (pkg, file) in [("Crayons", "Crayons_aa.ji"), ("JSON", "JSON_bb.ji")]
+                    mkpath(joinpath(export_dir, "v1.13", pkg))
+                    write(joinpath(export_dir, "v1.13", pkg, file), "bytes of $pkg")
+                end
+                graph = Dict("JSON" => ["Crayons"], "Crayons" => String[])
+                files = Dict("JSON" => ["v1.13/JSON/JSON_bb.ji"],
+                             "Crayons" => ["v1.13/Crayons/Crayons_aa.ji"])
+                sid = PEF.seal_id_of(sr)
+                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
+                @test sort(published) == ["Crayons", "JSON"] && isempty(tainted)
+
+                # identical republish: no-op, no taint
+                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
+                @test sort(published) == ["Crayons", "JSON"] && isempty(tainted)
+
+                # a losing race with *different* content taints the dependent
+                write(joinpath(export_dir, "v1.13", "Crayons", "Crayons_aa.ji"), "DIFFERENT")
+                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
+                if PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
+                                         Vector{UInt8}("x")) == :created &&
+                   PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
+                                         Vector{UInt8}("y")) == :exists_differs
+                    # moto reports checksums: full taint semantics observable
+                    @test published == String[] && tainted == ["Crayons", "JSON"]
+                else
+                    @test_skip "moto build doesn't return checksums; taint degrades to exists_unknown"
+                end
+
+                # consumption: index-driven closure fetch + hardlink depot
+                closure, indexes = PEF.sealed_closure!(sctx, sid, ["JSON"])
+                @test "v1.13/JSON/JSON_bb.ji" in closure
+                @test "v1.13/Crayons/Crayons_aa.ji" in closure   # transitive via index
+                @test haskey(indexes, "JSON")
+                depot = mktempdir()
+                @test PEF.materialize_sealed_depot(sid, closure, depot) == 2
+                @test read(joinpath(depot, "compiled", "v1.13", "Crayons", "Crayons_aa.ji"),
+                           String) == "bytes of Crayons"
+
+                # all_versions listing sees files indexes don't (version skew)
+                stray = "v1.13/Crayons/Crayons_zz.ji"
+                PEF.put_sealed_object(sctx, PEF.seal_artifact_key(sid, stray),
+                                      Vector{UInt8}("skewed"))
+                @test PEF.sealed_version_dirs(sctx, sid) == ["v1.13"]
+                listed = PEF.list_sealed_package_files(sctx, sid, "v1.13", "Crayons")
+                @test stray in listed
+                all_closure, _ = PEF.sealed_closure!(sctx, sid, ["Crayons"]; all_versions=true)
+                @test stray in all_closure
+            end
+
+            # reconciliation: a stuck counter (deps all terminal) is healed and
+            # a ready-but-unclaimed job re-enqueued
+            Dynamodb.update_item(
+                PEF.ddb_item(Dict("run_id" => sr, "job_key" => "seal#JSON")),
+                scfg.jobs_table,
+                Dict("UpdateExpression" => "SET #s = :p, remaining = :r",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => PEF.ddb_item(Dict(":p" => "pending", ":r" => 1)));
+                aws_config=aws)
+            healed = PEF.reconcile_seal_run(sctx, sr)
+            @test healed == ["JSON"]
+            c = PEF.claim_job(sctx; wait=1)
+            @test c isa PEF.ClaimedJob && c.job.package == "JSON" && PEF.is_seal_job(c.job)
+            PEF.record_result(sctx, c, PEF.JobResult(; status="unsealable",
+                                                     reason="precompile", duration=1.0))
+
+            # learned edges round-trip
+            PEF.record_learned_edges(sctx, "JSON", ["Crayons", "TestExtras"])
+            @test PEF.learned_edges(sctx)["JSON"] == ["Crayons", "TestExtras"]
+
+            # augmentation: a second run sharing the config adds only missing
+            # packages, and completed deps count as satisfied
+            graph2 = Dict("NewPkg" => ["Crayons"], "Crayons" => String[])
+            ncreated, ready = PEF.add_seal_jobs(sctx, sr, ["NewPkg", "Crayons"], graph2)
+            @test ncreated == 1
+            @test "NewPkg" in ready          # Crayons already terminal
+            @test PEF.get_run(sctx, sr)["status"] == "active"   # done -> reactivated
+            @test PEF.get_run(sctx, sr)["total_jobs"] == 4
+
+            # drain the queues so later testsets start clean
+            for _ in 1:20
+                c = PEF.claim_job(sctx; wait=1)
+                c === nothing && break
+                c isa PEF.ClaimedJob || continue
+                PEF.record_result(sctx, c, PEF.JobResult(; status=PEF.is_seal_job(c.job) ?
+                                                          "sealed" : "test", duration=1.0))
+            end
+        end
+        PEF.SEAL_REGISTRY_OVERRIDE[] = nothing
+    end
+
+    @testset "cache-protocol scheme (proxy + namespaced publication)" begin
+        import HTTP as ProxyHTTP
+        scfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
+                          seal_queue_url="unused", runs_table="pkgeval-runs",
+                          jobs_table="pkgeval-jobs", bucket="pkgeval-results")
+        sctx = FarmCtx(scfg, aws)
+        cache_dir = mktempdir()
+        withenv("PKGEVAL_SEAL_CACHE" => cache_dir, "PKGEVAL_SEAL_SCHEME" => "protocol") do
+            @test PEF.protocol_scheme()
+            proxy = PEF.start_seal_proxy!(sctx)
+            try
+                base = "http://127.0.0.1:$(proxy.port)"
+                ns, uuid = "deadbeef", "aaaaaaaa-0000-0000-0000-000000000003"
+                key = "ab" ^ 32
+
+                # publication from a fixture export, only under the registry
+                # uuid and only files inside the unit's own cache dir
+                mktempdir() do export_dir
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "JSON"))
+                    write(joinpath(export_dir, "compiled", "v1.13", "JSON", "JSON_k.ji"), "JI")
+                    open(joinpath(export_dir, "seal_keys.toml"), "w") do io
+                        println(io, """
+                            [JSON]
+                            uuid = "$uuid"
+                            key = "$key"
+                            preimage = "v1"
+                            ji = "v1.13/JSON/JSON_k.ji"
+                            so = ""
+                            """)
+                    end
+                    @test PEF.publish_protocol!(sctx, ns, export_dir, "JSON", uuid)
+
+                    # a claimed foreign uuid is refused
+                    @test !PEF.publish_protocol!(sctx, ns, export_dir, "JSON",
+                                                 "bbbbbbbb-0000-0000-0000-000000000009")
+
+                    # a path outside the unit's cache dir is refused
+                    open(joinpath(export_dir, "seal_keys.toml"), "w") do io
+                        println(io, """
+                            [JSON]
+                            uuid = "$uuid"
+                            key = "$("cd"^32)"
+                            preimage = "v1"
+                            ji = "v1.13/Other/JSON_k.ji"
+                            so = ""
+                            """)
+                    end
+                    @test !PEF.publish_protocol!(sctx, ns, export_dir, "JSON", uuid)
+                end
+
+                # the proxy serves the framed pair (S3-backed, then local cache)
+                resp = ProxyHTTP.get("$base/cache/v1/$ns/$uuid/$key"; status_exception=false)
+                @test resp.status == 200
+                payload = resp.body
+                len_ji = Int(ltoh(reinterpret(UInt64, payload[1:8])[1]))
+                @test String(payload[9:8+len_ji]) == "JI"
+                @test Int(ltoh(reinterpret(UInt64, payload[9+len_ji:16+len_ji])[1])) == 0
+                @test isfile(joinpath(cache_dir, ns, "kv", uuid, key))   # cached locally
+
+                # misses 404; wants are collected with their full context
+                @test ProxyHTTP.get("$base/cache/v1/$ns/$uuid/$("ee"^32)";
+                                    status_exception=false).status == 404
+                @test ProxyHTTP.post("$base/want/v1"; body="v1\nuuid=$uuid",
+                                     status_exception=false).status == 202
+                @test any(w -> occursin(uuid, w), proxy.wants)
+
+                # sandbox-facing kwargs carry the proxy coordinates, no mounts
+                kwargs, cleanup = PEF.sealed_depot_kwargs(sctx, ns, ["JSON"])
+                @test kwargs.env["PKGEVAL_CACHE_SERVER"] == base
+                @test kwargs.env["PKGEVAL_CACHE_NAMESPACE"] == ns
+                @test !haskey(kwargs, :mounts)
+                cleanup()
+            finally
+                PEF.stop_seal_proxy!()
+            end
+        end
+        @test !PEF.protocol_scheme()   # flag off again outside withenv
+    end
+
     @testset "broker STS against moto" begin
         with_env(Dict("AWS_ACCESS_KEY_ID" => "testing", "AWS_SECRET_ACCESS_KEY" => "testing",
                       "FARM_REGION" => "us-east-1", "STS_ENDPOINT" => endpoint)) do

@@ -19,6 +19,9 @@ Base.@kwdef struct FarmConfig
     # queues are nowhere near FIFO under backlog (observed to be close to
     # recency-biased), so priority *between* queues is the only ordering tool.
     slow_queue_url::String = ""
+    # queue for compilecache seal jobs (docs/sealing.md); workers poll it before
+    # anything else. Empty = sealing disabled: the farm behaves exactly as before
+    seal_queue_url::String = ""
     # name of the build-request Lambda, invoked via the plain Invoke API;
     # empty when the deployment has no build-request broker
     build_request_function::String = ""
@@ -32,6 +35,7 @@ FarmConfig(d::AbstractDict) = FarmConfig(; region=d["region"], queue_url=d["queu
                                          runs_table=d["runs_table"], jobs_table=d["jobs_table"],
                                          bucket=d["bucket"],
                                          slow_queue_url=get(d, "slow_queue_url", ""),
+                                         seal_queue_url=get(d, "seal_queue_url", ""),
                                          build_request_function=get(d, "build_request_function", ""))
 
 function farm_config_from_env(env=ENV)
@@ -39,6 +43,7 @@ function farm_config_from_env(env=ENV)
                runs_table=env["PKGEVAL_RUNS_TABLE"], jobs_table=env["PKGEVAL_JOBS_TABLE"],
                bucket=env["PKGEVAL_BUCKET"],
                slow_queue_url=get(env, "PKGEVAL_SLOW_QUEUE_URL", ""),
+               seal_queue_url=get(env, "PKGEVAL_SEAL_QUEUE_URL", ""),
                build_request_function=get(env, "PKGEVAL_BUILD_REQUEST_FUNCTION", ""))
 end
 
@@ -46,6 +51,7 @@ Base.Dict(cfg::FarmConfig) =
     Dict("region" => cfg.region, "queue_url" => cfg.queue_url, "runs_table" => cfg.runs_table,
          "jobs_table" => cfg.jobs_table, "bucket" => cfg.bucket,
          "slow_queue_url" => cfg.slow_queue_url,
+         "seal_queue_url" => cfg.seal_queue_url,
          "build_request_function" => cfg.build_request_function)
 
 "A FarmConfig plus the AWS credentials/config used to talk to it."
@@ -206,7 +212,9 @@ Base.@kwdef struct JobResult
     log::Union{String,Nothing} = nothing  # uploaded to S3, not stored in DynamoDB
 end
 
-const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
+const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error",
+                           # seal jobs only (docs/sealing.md); never appear in user runs
+                           "sealed", "unsealable")
 issuccess(status::AbstractString) = status in ("test", "load")
 
 reason_message(reason::Nothing) = ""

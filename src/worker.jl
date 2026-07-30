@@ -30,6 +30,10 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
     init_slot_rate!(ctx, ninstances)
+    if sealing_enabled(ctx.cfg) && pkgeval_supports_seal()
+        sweep_seal_cache!()
+        protocol_scheme() && start_seal_proxy!(ctx)
+    end
 
     draining = Ref(false)
     run_cache = Dict{String,Dict{String,Any}}()    # run_id -> parsed run item
@@ -140,6 +144,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         else
             rethrow()
         end
+    finally
+        stop_seal_proxy!()
     end
 end
 
@@ -493,13 +499,18 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
     end
 end
 
-"Look up (and cache) the run item, returning the `Configuration` this job refers to."
-function job_config(ctx::FarmCtx, job::JobRef, run_cache, run_cache_lock)
-    run = lock(run_cache_lock) do
+"Look up (and cache) the run item a job belongs to."
+function job_run(ctx::FarmCtx, job::JobRef, run_cache, run_cache_lock)
+    lock(run_cache_lock) do
         get!(run_cache, job.run_id) do
             get_run(ctx, job.run_id)
         end
     end
+end
+
+"Look up (and cache) the run item, returning the `Configuration` this job refers to."
+function job_config(ctx::FarmCtx, job::JobRef, run_cache, run_cache_lock)
+    run = job_run(ctx, job, run_cache, run_cache_lock)
     config_dict = only(filter(c -> c["name"] == job.config, run["configs"]))
     return config_from_dict(config_dict)
 end
@@ -533,6 +544,7 @@ end
 function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                      run_cache, run_cache_lock)
     job = claimed.job
+    is_seal_job(job) && return process_seal_job(ctx, claimed, cpu, run_cache, run_cache_lock)
     @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu
 
     stop_heartbeat = start_heartbeat(ctx, claimed, job.package)
@@ -541,9 +553,24 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         config = job_config(ctx, job, run_cache, run_cache_lock)
         config = PkgEval.Configuration(config; cpus=[cpu])
         # redeliveries skip the package cache: cache interactions are the most likely
-        # source of irreproducible failures (mirrors evaluate()'s retry behavior)
+        # source of irreproducible failures (mirrors evaluate()'s retry behavior).
+        # The sealed depot and its gate are skipped too, for the same reason.
         use_cache = claimed.attempts <= 1
-        r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package); use_cache)
+        gated_seal_run = ""
+        if use_cache
+            run = job_run(ctx, job, run_cache, run_cache_lock)
+            state, gated_seal_run = seal_state(ctx, run, job)
+            state == :pending &&
+                hold_and_fill!(ctx, job, gated_seal_run, cpu, run_cache, run_cache_lock)
+        end
+        sealed_kwargs, sealed_cleanup = isempty(gated_seal_run) ? ((;), Returns(nothing)) :
+            sealed_depot_kwargs(ctx, seal_id_of(gated_seal_run), [job.package])
+        r = try
+            PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
+                                 use_cache, sealed_kwargs...)
+        finally
+            sealed_cleanup()
+        end
         JobResult(; status=String(r.status),
                   reason=r.reason === missing ? nothing : String(r.reason),
                   version=r.version === missing ? nothing : string(r.version),

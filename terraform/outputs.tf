@@ -77,3 +77,8 @@ output "slow_queue_url" {
   description = "URL of the long-jobs queue (workers drain it before the main queue)."
   value       = aws_sqs_queue.jobs_slow.url
 }
+
+output "seal_queue_url" {
+  description = "URL of the compilecache seal queue (docs/sealing.md; workers poll it first)."
+  value       = aws_sqs_queue.jobs_seal.url
+}

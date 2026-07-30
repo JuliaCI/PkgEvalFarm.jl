@@ -150,6 +150,14 @@ end
     end
 end
 
+@testset "seal unit tests" begin
+    include("seal.jl")
+end
+
+@testset "cache-protocol e2e" begin
+    include("protocol_e2e.jl")
+end
+
 @testset "broker unit tests" begin
     include("broker.jl")
 end

@@ -27,6 +27,23 @@ resource "aws_sqs_queue" "jobs" {
   })
 }
 
+# Seal queue: compilecache seal jobs (docs/sealing.md), polled by workers
+# before everything else — sealing must run ahead of the test jobs it warms,
+# and priority between queues is the only ordering SQS honors. Messages are
+# enqueued as their dependency counters hit zero (topological waves).
+resource "aws_sqs_queue" "jobs_seal" {
+  name                       = "${var.name_prefix}-jobs-seal"
+  visibility_timeout_seconds = 1800
+  message_retention_seconds  = 4 * 24 * 60 * 60 # 4 days
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
+    # seal jobs never wait on CI builds (their run is active, so the build is
+    # staged) and give up on themselves after 3 attempts; this is pure backstop
+    maxReceiveCount = 6
+  })
+}
+
 # Long-jobs queue: at expansion, jobs above a run-mix-derived duration cutoff
 # land here and workers drain it before the main queue. Priority *between*
 # queues is the only ordering SQS honors — standard-queue delivery under

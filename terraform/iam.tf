@@ -102,11 +102,14 @@ resource "aws_iam_role" "worker" {
 # shared between the brokered worker role and the EC2 instance profile.
 # Every action maps to a specific code path; keep it that way:
 #   sqs receive/delete/changevis   claim_job / record_result / heartbeat
-#   sqs send                       expand fan-out (enqueue_jobs)
+#   sqs send                       expand fan-out (enqueue_jobs) + seal readiness
 #   runs get/update                run spec fetch, completion counter, expand flip
-#   jobs update                    claim + record (conditional writes)
-#   jobs batchwrite                expand fan-out (write_jobs)
+#   runs put                       ensure_seal_run (create-only, conditional)
+#   jobs get/update                claim + record + seal gate (conditional writes)
+#   jobs put/batchwrite            expand fan-out (write_jobs, add_seal_jobs)
 #   s3 put runs/*                  log upload
+#   s3 get/put compilecache/*      sealed artifacts (create-only via If-None-Match,
+#                                  enforced by the bucket policy)
 locals {
   worker_policy = jsonencode({
     Version = "2012-10-17"
@@ -120,7 +123,8 @@ locals {
           "sqs:ChangeMessageVisibility",
           "sqs:SendMessage",
         ]
-        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+        aws_sqs_queue.jobs_seal.arn]
       },
       {
         Sid    = "RunState"
@@ -128,6 +132,8 @@ locals {
         Action = [
           "dynamodb:GetItem",
           "dynamodb:UpdateItem",
+          # seal runs are created by whichever expansion needs them first
+          "dynamodb:PutItem",
           # baseline reuse scans for donor runs at expansion (the table has one
           # item per run, so this stays cheap)
           "dynamodb:Scan",
@@ -138,7 +144,12 @@ locals {
         Sid    = "JobState"
         Effect = "Allow"
         Action = [
+          # seal gate checks + seal-item reads
+          "dynamodb:GetItem",
           "dynamodb:UpdateItem",
+          # seal jobs are added with per-item conditional puts (shared seal
+          # runs must not double-count between concurrent expansions)
+          "dynamodb:PutItem",
           "dynamodb:BatchWriteItem",
           # baseline reuse reads the donor run's job results
           "dynamodb:Query",
@@ -150,6 +161,26 @@ locals {
         Effect   = "Allow"
         Action   = "s3:PutObject"
         Resource = "${aws_s3_bucket.results.arn}/runs/*"
+      },
+      {
+        Sid    = "SealedCompilecache"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+        ]
+        Resource = "${aws_s3_bucket.results.arn}/compilecache/*"
+      },
+      {
+        # dynamic discovery lists a package's published cachefiles (all
+        # versions, not just what its producer's index recorded)
+        Sid      = "ListSealedCompilecache"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.results.arn
+        Condition = {
+          StringLike = { "s3:prefix" = "compilecache/*" }
+        }
       },
     ]
   })

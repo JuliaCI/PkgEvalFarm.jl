@@ -47,6 +47,8 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
                     run_id::AbstractString=new_run_id(), reuse::Bool=true)
     config_names = [cfg.name for cfg in spec.configs]
     allunique(config_names) || error("configuration names must be unique: $config_names")
+    SEAL_CONFIG_NAME in config_names &&
+        error("configuration name \"$SEAL_CONFIG_NAME\" is reserved for seal jobs")
 
     Dynamodb.put_item(ddb_item(Dict(
             "run_id" => run_id,
@@ -99,6 +101,11 @@ function completed_runs(ctx::FarmCtx)
             Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
         end
         for item in ddb_parse.(resp["Items"])
+            # seal runs are `done` runs too, and their config differs from a
+            # user config only by `name` — which config_fingerprint ignores —
+            # so without this they would donate "sealed" statuses as baseline
+            # results (and pollute duration estimates)
+            startswith(String(item["run_id"]), "seal-") && continue
             push!(runs, (String(get(item, "created_at", "")), String(item["run_id"]),
                          JSON.parse(item["configs"])))
         end
@@ -299,6 +306,18 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
         write_jobs(ctx, fresh; est=job_est)
         isempty(reused) || write_reused_jobs(ctx, run_id, donor_id, reused, reused_results)
     end
+
+    # sealing (docs/sealing.md): idempotent, so a redelivered expand message
+    # re-running it only re-sends harmless duplicate seal messages. Must happen
+    # before test messages go out — workers gate test jobs on the mapping below
+    seal_runs = setup_sealing(ctx, run, fresh)
+    if seal_runs !== nothing
+        Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+            Dict("UpdateExpression" => "SET seal_runs = :sr",
+                 "ExpressionAttributeValues" => ddb_item(Dict(":sr" => seal_runs)));
+            aws_config=ctx.aws)
+    end
+
     try
         Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
             Dict("ConditionExpression" => "#s = :expanding",
@@ -368,14 +387,28 @@ the queue was empty or the received job turned out to be already finished (its s
 duplicate message is deleted).
 """
 function claim_job(ctx::FarmCtx; wait::Int=20)
-    # Slow jobs first: the whole point of the second queue is that long jobs
-    # must start while short work remains to backfill behind them, and queue
-    # priority is the only ordering SQS actually honors. WaitTimeSeconds=1 is
-    # still a long poll (it consults every storage host, unlike wait=0 which
-    # samples and can miss), so an "empty" answer is trustworthy.
+    # Seal jobs first, then slow jobs: sealing must run ahead of the tests it
+    # warms, and long jobs must start while short work remains to backfill
+    # behind them — and queue priority is the only ordering SQS actually
+    # honors. WaitTimeSeconds=1 is still a long poll (it consults every
+    # storage host, unlike wait=0 which samples and can miss), so an "empty"
+    # answer is trustworthy.
     slow = slow_queue(ctx.cfg)
-    queues = slow == ctx.cfg.queue_url ?
-        ((ctx.cfg.queue_url, wait),) : ((slow, 1), (ctx.cfg.queue_url, wait))
+    queues = Tuple{String,Int}[]
+    sealing_enabled(ctx.cfg) && pkgeval_supports_seal() &&
+        push!(queues, (ctx.cfg.seal_queue_url, 1))
+    slow == ctx.cfg.queue_url || push!(queues, (slow, 1))
+    push!(queues, (ctx.cfg.queue_url, wait))
+    return claim_from_queues(ctx, queues)
+end
+
+"Claim from the seal queue only — the hold-and-fill path of a gated test job."
+function claim_seal_job(ctx::FarmCtx; wait::Int=1)
+    sealing_enabled(ctx.cfg) || return nothing
+    return claim_from_queues(ctx, [(ctx.cfg.seal_queue_url, wait)])
+end
+
+function claim_from_queues(ctx::FarmCtx, queues)
     message, from_queue = nothing, ""
     for (queue, w) in queues
         resp = SQS.receive_message(queue,

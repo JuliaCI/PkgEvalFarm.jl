@@ -1,6 +1,7 @@
 module PkgEvalFarm
 
 using AWS
+import Base64
 using Dates
 using HTTP
 using JSON
@@ -28,7 +29,10 @@ using .FarmBot: FarmBot, FarmLite
 include("schema.jl")
 include("auth.jl")
 include("queue.jl")
+include("seal.jl")
+include("seal_proxy.jl")
 include("worker.jl")
+include("seal_worker.jl")
 include("submit.jl")
 include("cli.jl")
 

@@ -271,6 +271,10 @@ Environment=JULIA=/home/worker/.juliaup/bin/julia
 Environment=AWS_REGION=${region}
 Environment=PKGEVAL_QUEUE_URL=${queue_url}
 Environment=PKGEVAL_SLOW_QUEUE_URL=${slow_queue_url}
+Environment=PKGEVAL_SEAL_QUEUE_URL=${seal_queue_url}
+# local sealed-artifact cache on the instance volume (survives across jobs,
+# swept by age at worker start)
+Environment=PKGEVAL_SEAL_CACHE=/var/cache/pkgeval-seal
 # fleet-drain coordination: the worker manages its own ASG scale-in protection
 Environment=PKGEVAL_BUILD_REQUEST_FUNCTION=${build_request_function}
 # graceful drain: ExecStop (and the spot-notice watcher) touch this file; the

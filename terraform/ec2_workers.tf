@@ -232,6 +232,7 @@ resource "aws_launch_template" "ec2_worker" {
     region         = var.region
     queue_url      = aws_sqs_queue.jobs.url
     slow_queue_url = aws_sqs_queue.jobs_slow.url
+    seal_queue_url = aws_sqs_queue.jobs_seal.url
     # by name, not reference: the launch template cannot depend on the ASG
     asg_name               = "${var.name_prefix}-ec2-worker"
     build_request_function = local.build_request_enabled == 1 ? aws_lambda_function.build_request[0].function_name : ""
