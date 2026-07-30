@@ -11,6 +11,7 @@
 # successive runs.
 
 is_seal_job(job::JobRef) = startswith(job.run_id, "seal-")
+is_derivation_job(job::JobRef) = startswith(job.run_id, "deriv-")
 seal_id_of(run_id::AbstractString) = String(chopprefix(run_id, "seal-"))
 
 "How long a gated test job waits (filling the time with seal work) before
@@ -176,6 +177,194 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         @warn "seal propagation failed; reconciliation will heal" job.package err
     end
     return
+end
+
+## derivation execution (docs/sealing.md, stage 2)
+
+"""
+    fetch_derivation_closure(ctx, ns, roots) -> (artifacts, pins, missing)
+
+Resolve a derivation's dependency closure by key: BFS from the want's direct
+deps through each artifact's `.meta` sidecar. `artifacts` is `(meta, blob)`
+pairs ready to materialize; `pins` maps uuid to name/version for the
+whole-environment pin; `missing` lists unfetchable keys (unkeyable "-" deps
+are skipped — stdlibs live in the julia build itself).
+"""
+function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
+    seen = Set{String}()
+    artifacts = Tuple{Dict{String,Any},Vector{UInt8}}[]
+    pins = Dict{String,Any}()
+    missing_keys = String[]
+    queue = [(String(uuid), String(key)) for (uuid, key) in roots]
+    while !isempty(queue)
+        uuid, key = popfirst!(queue)
+        (key == "-" || key in seen) && continue
+        push!(seen, key)
+        meta_body = get_kv(ctx, ns, uuid, key; meta=true)
+        blob = get_kv(ctx, ns, uuid, key)
+        if meta_body === nothing || blob === nothing
+            push!(missing_keys, key)
+            continue
+        end
+        meta = try
+            JSON.parse(String(meta_body))
+        catch
+            push!(missing_keys, key)
+            continue
+        end
+        push!(artifacts, (meta, blob))
+        version = String(get(meta, "version", "-"))
+        if version != "-"
+            pins[uuid] = Dict("name" => String(meta["name"]), "uuid" => uuid,
+                              "version" => version)
+        end
+        for d in get(meta, "deps", Any[])
+            d isa AbstractDict || continue
+            push!(queue, (lowercase(String(get(d, "uuid", ""))), String(get(d, "key", "-"))))
+        end
+    end
+    return artifacts, pins, missing_keys
+end
+
+"Unpack fetched artifacts into a depot at the filenames their producers used."
+function materialize_derivation_depot(artifacts, depot::AbstractString)
+    n = 0
+    for (meta, blob) in artifacts
+        pair = unframe_pair(blob)
+        pair === nothing && continue
+        ji, so = pair
+        dir = joinpath(depot, "compiled", String(meta["vdir"]), String(meta["name"]))
+        mkpath(dir)
+        write(joinpath(dir, String(meta["ji"])), ji)
+        so_name = String(get(meta, "so", ""))
+        !isempty(so_name) && !isempty(so) && write(joinpath(dir, so_name), so)
+        n += 1
+    end
+    return n
+end
+
+function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
+                                run_cache, run_cache_lock)
+    job = claimed.job
+    ns = String(chopprefix(job.run_id, "deriv-"))
+    stop_heartbeat = start_heartbeat(ctx, claimed, "derive $(first(job.package, 12))")
+    @info "deriving" ns key=first(job.package, 12) attempt=claimed.attempts slot=cpu
+
+    result = try
+        item = get_seal_item(ctx, job)
+        want = item === nothing ? nothing :
+               parse_want_preimage(String(get(item, "preimage", "")))
+        if want === nothing || !isdefined(PkgEval, :evaluate_derive)
+            JobResult(; status="unsealable", reason="worker_exception",
+                      log="derivation item unreadable, or PkgEval lacks evaluate_derive")
+        else
+            # the julia/flags context comes from the namespace's seal run — the
+            # trusted record of what this fingerprint means
+            seal_run = job_run(ctx, JobRef(seal_run_id(ns), SEAL_CONFIG_NAME, ""),
+                               run_cache, run_cache_lock)
+            config = config_from_dict(only(seal_run["configs"]))
+            config = PkgEval.Configuration(config; cpus=[cpu], rr=PkgEval.RRDisabled)
+
+            scratch = mktempdir(prefix="pkgeval_derive_")
+            try
+                roots = [(d.uuid, d.key) for d in want.deps]
+                artifacts, pins, missing_keys = fetch_derivation_closure(ctx, ns, roots)
+                if !isempty(missing_keys)
+                    # a dep of the closure was never published (e.g. the
+                    # requester compiled it locally): decline rather than
+                    # produce an artifact that could not match the want
+                    JobResult(; status="unsealable", reason="missing_dependency",
+                              log="derivation closure incomplete: missing " *
+                                  join(first.(missing_keys, 12), ", "))
+                else
+                    depot = joinpath(scratch, "depot")
+                    materialize_derivation_depot(artifacts, depot)
+                    pins_file = joinpath(scratch, "derive_pins.toml")
+                    open(pins_file, "w") do io
+                        TOML.print(io, pins)
+                    end
+                    export_dir = joinpath(scratch, "export")
+                    mkpath(export_dir)
+                    r = PkgEval.evaluate_derive(config,
+                            PkgEval.Package(; name=want.name,
+                                            version=VersionNumber(want.version));
+                            use_cache=claimed.attempts <= 1, export_dir, pins_file,
+                            mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
+                            env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT,
+                                     "PKGEVAL_CACHE_SERVER" => proxy_url(),
+                                     "PKGEVAL_CACHE_NAMESPACE" => ns))
+                    log = r.log === missing ? "" : String(r.log)
+                    if String(r.status) == "derive"
+                        unit_uuid = try
+                            registry_uuid(seal_registry_dir(config), want.name)
+                        catch err
+                            @warn "could not resolve unit uuid" want.name err
+                            nothing
+                        end
+                        produced = produced_key(export_dir, want.name)
+                        published = unit_uuid !== nothing &&
+                            publish_protocol!(ctx, ns, export_dir, want.name, unit_uuid)
+                        log *= "\n\nDerivation " *
+                               (produced == job.package ? "matched the wanted key" :
+                                "produced a different key (" * first(something(produced, "none"), 12) *
+                                "); environment reproduction was inexact") *
+                               (published ? "; published" : "; nothing published")
+                        JobResult(; status="sealed", duration=Float64(r.duration), log)
+                    else
+                        JobResult(; status="unsealable",
+                                  reason=r.reason === missing ? nothing : String(r.reason),
+                                  duration=Float64(r.duration), log)
+                    end
+                end
+            finally
+                try
+                    rm(scratch; recursive=true, force=true)
+                catch err
+                    @warn "failed to clean derivation scratch" err
+                end
+            end
+        end
+    catch err
+        if claimed.attempts >= 3
+            @error "derivation errored repeatedly; recording unsealable" exception=(err, catch_backtrace())
+            JobResult(; status="error", reason="worker_exception",
+                      log=sprint(showerror, err, catch_backtrace()))
+        else
+            @error "derivation errored; releasing for retry" exception=(err, catch_backtrace())
+            release_job(ctx, claimed)
+            return
+        end
+    finally
+        stop_heartbeat()
+    end
+
+    try
+        record_result(ctx, claimed, result)
+        @info "derivation finished" key=first(job.package, 12) result.status
+    catch err
+        @error "failed to record derivation result" exception=(err, catch_backtrace())
+        release_job(ctx, claimed)
+    end
+    return
+end
+
+"The unit's produced key from a derivation/seal export, or `nothing`."
+function produced_key(export_dir::AbstractString, unit::AbstractString)
+    keys_file = joinpath(export_dir, "seal_keys.toml")
+    isfile(keys_file) || return nothing
+    entry = try
+        get(TOML.parsefile(keys_file), unit, nothing)
+    catch
+        nothing
+    end
+    entry isa AbstractDict ? String(get(entry, "key", "")) : nothing
+end
+
+"The running proxy's base URL (empty when the proxy is down — the client
+degrades to misses)."
+function proxy_url()
+    proxy = SEAL_PROXY[]
+    proxy === nothing ? "" : "http://127.0.0.1:$(proxy.port)"
 end
 
 "Parse a seal evaluation's export: the resolved dependency graph (TOML written

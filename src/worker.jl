@@ -544,6 +544,8 @@ end
 function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                      run_cache, run_cache_lock)
     job = claimed.job
+    is_derivation_job(job) &&
+        return process_derivation_job(ctx, claimed, cpu, run_cache, run_cache_lock)
     is_seal_job(job) && return process_seal_job(ctx, claimed, cpu, run_cache, run_cache_lock)
     @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu
 

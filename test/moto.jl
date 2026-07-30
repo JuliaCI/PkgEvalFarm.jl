@@ -1406,8 +1406,11 @@ try
 
     @testset "cache-protocol scheme (proxy + namespaced publication)" begin
         import HTTP as ProxyHTTP
+        # same physical queue as the sealing testset (create_queue is idempotent):
+        # want ingestion enqueues real derivation messages
+        seal_q = SQS.create_queue("pkgeval-jobs-seal"; aws_config=aws)["QueueUrl"]
         scfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
-                          seal_queue_url="unused", runs_table="pkgeval-runs",
+                          seal_queue_url=seal_q, runs_table="pkgeval-runs",
                           jobs_table="pkgeval-jobs", bucket="pkgeval-results")
         sctx = FarmCtx(scfg, aws)
         cache_dir = mktempdir()
@@ -1476,6 +1479,108 @@ try
                 @test kwargs.env["PKGEVAL_CACHE_NAMESPACE"] == ns
                 @test !haskey(kwargs, :mounts)
                 cleanup()
+
+                # --- stage 2: wants become derivation jobs -------------------
+                frame_rt = PEF.unframe_pair(PEF.frame_pair(Vector{UInt8}(b"JI"), Vector{UInt8}(b"SO")))
+                @test frame_rt !== nothing && String(frame_rt[1]) == "JI" &&
+                      String(frame_rt[2]) == "SO"
+                @test PEF.unframe_pair(UInt8[1, 2, 3]) === nothing
+
+                dep_uuid = "aaaaaaaa-0000-0000-0000-000000000002"
+                dep_key, unit_key = "cd" ^ 32, "ef" ^ 32
+                preimage = join(["v2", "julia=1.99.0+abc", "name=JSON",
+                                 "uuid=$uuid", "version=1.0.0", "tree=$("11"^20)",
+                                 "flags=163", "prefs=0",
+                                 "dep=$dep_uuid:1f2e:4.1.0:$dep_key"], "\n")
+                w = PEF.parse_want_preimage(preimage)
+                @test w.name == "JSON" && w.version == "1.0.0"
+                @test only(w.deps).key == dep_key && only(w.deps).version == "4.1.0"
+                @test PEF.parse_want_preimage("v1\nuuid=x") === nothing
+                @test PEF.parse_want_preimage("v2\nname=JSON") === nothing
+
+                # publish a two-level closure with metadata: JSON@key -> Crayons@key
+                mktempdir() do export_dir
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "Crayons"))
+                    write(joinpath(export_dir, "compiled", "v1.13", "Crayons", "Crayons_kk.ji"), "DEPJI")
+                    open(joinpath(export_dir, "seal_keys.toml"), "w") do io
+                        println(io, """
+                            [Crayons]
+                            uuid = "$dep_uuid"
+                            key = "$dep_key"
+                            version = "4.1.0"
+                            preimage = "v2"
+                            ji = "v1.13/Crayons/Crayons_kk.ji"
+                            so = ""
+                            deps = []
+                            """)
+                    end
+                    @test PEF.publish_protocol!(sctx, ns, export_dir, "Crayons", dep_uuid)
+                end
+                mktempdir() do export_dir
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "JSON"))
+                    write(joinpath(export_dir, "compiled", "v1.13", "JSON", "JSON_kk.ji"), "UNITJI")
+                    open(joinpath(export_dir, "seal_keys.toml"), "w") do io
+                        println(io, """
+                            [JSON]
+                            uuid = "$uuid"
+                            key = "$unit_key"
+                            version = "1.0.0"
+                            preimage = "v2"
+                            ji = "v1.13/JSON/JSON_kk.ji"
+                            so = ""
+
+                            [[JSON.deps]]
+                            uuid = "$dep_uuid"
+                            name = "Crayons"
+                            version = "4.1.0"
+                            key = "$dep_key"
+                            """)
+                    end
+                    @test PEF.publish_protocol!(sctx, ns, export_dir, "JSON", uuid)
+                end
+
+                # the closure walk follows the meta chain and pins everything
+                artifacts, pins, missing_keys = PEF.fetch_derivation_closure(
+                    sctx, ns, [(uuid, unit_key)])
+                @test isempty(missing_keys)
+                @test length(artifacts) == 2
+                @test pins[dep_uuid]["version"] == "4.1.0"
+                @test pins[uuid]["name"] == "JSON"
+                depot = mktempdir()
+                @test PEF.materialize_derivation_depot(artifacts, depot) == 2
+                @test read(joinpath(depot, "compiled", "v1.13", "Crayons", "Crayons_kk.ji"),
+                           String) == "DEPJI"
+                # a root that was never published is reported missing
+                _, _, missing2 = PEF.fetch_derivation_closure(sctx, ns, [(uuid, "12"^32)])
+                @test missing2 == ["12"^32]
+
+                # want ingestion: dedup'd derivation job + one seal-queue message
+                @test PEF.ingest_want(sctx, ns, preimage) !== nothing
+                @test PEF.ingest_want(sctx, ns, preimage) === nothing   # duplicate
+                want_key = bytes2hex(PEF.SHA.sha256(codeunits(preimage)))
+                c = PEF.claim_job(sctx; wait=1)
+                @test c isa PEF.ClaimedJob
+                @test PEF.is_derivation_job(c.job)
+                @test c.job.package == want_key
+                item = PEF.get_seal_item(sctx, c.job)
+                @test item["name"] == "JSON" && item["uuid"] == uuid
+                @test PEF.parse_want_preimage(item["preimage"]).version == "1.0.0"
+                PEF.record_result(sctx, c, PEF.JobResult(; status="unsealable",
+                                                         reason="missing_dependency",
+                                                         duration=0.1))
+                @test PEF.claim_job(sctx; wait=1) === nothing   # no duplicate message
+                run = PEF.get_run(sctx, PEF.deriv_run_id(ns))
+                @test run["kind"] == "deriv" && run["total_jobs"] == 1
+
+                # the proxy route drives the same path end to end
+                resp = ProxyHTTP.post("$base/want/v2/otherns"; body=preimage,
+                                      status_exception=false)
+                @test resp.status == 202
+                c2 = PEF.claim_job(sctx; wait=1)
+                @test c2 isa PEF.ClaimedJob && c2.job.run_id == "deriv-otherns"
+                PEF.record_result(sctx, c2, PEF.JobResult(; status="unsealable",
+                                                          reason="missing_dependency",
+                                                          duration=0.1))
             finally
                 PEF.stop_seal_proxy!()
             end

@@ -26,8 +26,47 @@ function frame_pair(ji::Vector{UInt8}, so::Union{Nothing,Vector{UInt8}})
          reinterpret(UInt8, [htol(UInt64(length(so)))]), so)
 end
 
+"Inverse of `frame_pair`; `nothing` on malformed frames."
+function unframe_pair(blob::Vector{UInt8})
+    length(blob) >= 16 || return nothing
+    len_ji = Int(ltoh(reinterpret(UInt64, blob[1:8])[1]))
+    length(blob) >= 16 + len_ji || return nothing
+    len_so = Int(ltoh(reinterpret(UInt64, blob[9+len_ji:16+len_ji])[1]))
+    length(blob) >= 16 + len_ji + len_so || return nothing
+    return blob[9:8+len_ji], blob[17+len_ji:16+len_ji+len_so]
+end
+
+"""
+Fetch a kv object (`meta=true` for the `.meta` sidecar) through the local
+disk cache, then S3; `nothing` when absent. Objects are immutable, so the
+disk cache is trusted forever.
+"""
+function get_kv(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
+                key::AbstractString; meta::Bool=false)
+    suffix = meta ? ".meta" : ""
+    local_path = joinpath(seal_cache_root(), ns, "kv", uuid, key * suffix)
+    isfile(local_path) && return read(local_path)
+    s3key = kv_object_key(ns, uuid, key) * suffix
+    body = try
+        resp = aws_retry() do
+            S3.get_object(ctx.cfg.bucket, s3key, Dict("return_raw" => true);
+                          aws_config=ctx.aws)
+        end
+        copy(resp)
+    catch err
+        is_not_found(err) || @warn "kv fetch failed" s3key err
+        return nothing
+    end
+    mkpath(dirname(local_path))
+    tmp = local_path * ".tmp.$(getpid()).$(objectid(current_task()))"
+    write(tmp, body)
+    mv(tmp, local_path; force=true)
+    return body
+end
+
 const SEAL_PROXY = Ref{Any}(nothing)
-const PROXY_PATH_RE = r"^/cache/v1/([0-9a-f]{1,64})/([0-9a-f-]{36})/([0-9a-f]{64})$"
+const PROXY_PATH_RE = r"^/cache/v1/([0-9a-z-]{1,64})/([0-9a-f-]{36})/([0-9a-f]{64})$"
+const WANT_PATH_RE = r"^/want/v2/([0-9a-z-]{1,64})$"
 
 """
 Start the loopback proxy. GETs are served from the local kv cache, then S3
@@ -41,27 +80,12 @@ function start_seal_proxy!(ctx::FarmCtx)
     wants_lock = ReentrantLock()
 
     function fetch_kv(ns, uuid, key)
-        local_path = joinpath(seal_cache_root(), ns, "kv", uuid, key)
-        isfile(local_path) && return read(local_path)
-        s3key = kv_object_key(ns, uuid, key)
+        negkey = string(ns, '/', uuid, '/', key)
         lock(neg_lock) do
-            get(negative, s3key, 0.0) > time()
+            get(negative, negkey, 0.0) > time()
         end && return nothing
-        body = try
-            resp = aws_retry() do
-                S3.get_object(ctx.cfg.bucket, s3key, Dict("return_raw" => true);
-                              aws_config=ctx.aws)
-            end
-            copy(resp)
-        catch err
-            is_not_found(err) || @warn "kv fetch failed" s3key err
-            lock(() -> negative[s3key] = time() + 30, neg_lock)
-            return nothing
-        end
-        mkpath(dirname(local_path))
-        tmp = local_path * ".tmp.$(getpid()).$(objectid(current_task()))"
-        write(tmp, body)
-        mv(tmp, local_path; force=true)
+        body = get_kv(ctx, ns, uuid, key)
+        body === nothing && lock(() -> negative[negkey] = time() + 30, neg_lock)
         return body
     end
 
@@ -71,12 +95,24 @@ function start_seal_proxy!(ctx::FarmCtx)
             body = fetch_kv(String(m[1]), String(m[2]), String(m[3]))
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
-        elseif req.method == "POST" && target == "/want/v1"
+        elseif req.method == "POST" && (m = match(WANT_PATH_RE, target)) !== nothing
             preimage = String(req.body)
             lock(wants_lock) do
                 length(wants) < 10_000 && push!(wants, preimage)
             end
-            @debug "cache want" preimage=first(preimage, 200)
+            # a v2 want is a complete derivation request: dedup it into a
+            # derivation job so an executor slot can produce the artifact
+            try
+                ingest_want(ctx, String(m[1]), preimage)
+            catch err
+                @warn "want ingestion failed" err
+            end
+            return HTTP.Response(202)
+        elseif req.method == "POST" && target == "/want/v1"
+            # older clients: telemetry only
+            lock(wants_lock) do
+                length(wants) < 10_000 && push!(wants, String(req.body))
+            end
             return HTTP.Response(202)
         end
         return HTTP.Response(404)
@@ -105,6 +141,107 @@ function stop_seal_proxy!()
     SEAL_PROXY[] = nothing
     close(proxy.server)
     return nothing
+end
+
+## derivation ingestion (docs/sealing.md, stage 2)
+#
+# A v2 want preimage carries everything needed to reproduce the requester's
+# environment for one package: identity (name/uuid/version/tree), flags/prefs,
+# and per direct dep its uuid, build_id, resolved version and own context key.
+# Sandbox-authored data throughout — treated as a work order, never as truth
+# about namespaces (publication still resolves uuids through the registry).
+
+"Parse a v2 preimage into its fields, or `nothing` when malformed."
+function parse_want_preimage(body::AbstractString)
+    lines = split(body, '\n')
+    (isempty(lines) || lines[1] != "v2") && return nothing
+    fields = Dict{String,String}()
+    deps = NamedTuple[]
+    for line in lines[2:end]
+        if startswith(line, "dep=")
+            parts = split(chopprefix(line, "dep="), ':')
+            length(parts) == 4 || return nothing
+            push!(deps, (; uuid=String(parts[1]), build_id=String(parts[2]),
+                         version=String(parts[3]), key=String(parts[4])))
+        else
+            kv = split(line, '='; limit=2)
+            length(kv) == 2 || return nothing
+            fields[String(kv[1])] = String(kv[2])
+        end
+    end
+    for required in ("name", "uuid", "version", "tree", "julia")
+        haskey(fields, required) || return nothing
+    end
+    occursin(r"^[0-9a-f-]{36}$", fields["uuid"]) || return nothing
+    return (; name=fields["name"], uuid=lowercase(fields["uuid"]),
+            version=fields["version"], deps)
+end
+
+deriv_run_id(ns::AbstractString) = "deriv-" * ns
+
+"Idempotently create the bookkeeping run derivation jobs of one namespace hang off."
+function ensure_deriv_run(ctx::FarmCtx, ns::AbstractString)
+    run_id = deriv_run_id(ns)
+    try
+        Dynamodb.put_item(ddb_item(Dict(
+                "run_id" => run_id,
+                "created_at" => isodate(),
+                "submitter" => "derivations",
+                "status" => "active",
+                "kind" => "deriv",
+                "configs" => "[]",
+                "packages" => "[]",
+                "context" => JSON.json(Dict("seal" => true)),
+                "total_jobs" => 0,
+                "completed_jobs" => 0)), ctx.cfg.runs_table,
+            Dict("ConditionExpression" => "attribute_not_exists(run_id)");
+            aws_config=ctx.aws)
+    catch err
+        is_conditional_failure(err) || rethrow()
+    end
+    return run_id
+end
+
+"""
+Turn a v2 want into (at most) one derivation job: conditional item creation
+dedups concurrent reporters, and the winning writer enqueues the seal-queue
+message. The message's "package" field carries the derivation *key* — the
+name would be ambiguous across versions/contexts.
+"""
+function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
+    sealing_enabled(ctx.cfg) || return nothing
+    want = parse_want_preimage(body)
+    want === nothing && return nothing
+    key = bytes2hex(SHA.sha256(codeunits(body)))
+    run_id = ensure_deriv_run(ctx, ns)
+    try
+        Dynamodb.put_item(ddb_item(Dict(
+                "run_id" => run_id,
+                "job_key" => job_key("deriv", key),
+                "config" => "deriv",
+                "package" => key,
+                "kind" => "deriv",
+                "name" => want.name,
+                "uuid" => want.uuid,
+                "version" => want.version,
+                "preimage" => String(body),
+                "status" => "pending",
+                "attempts" => 0,
+                "created_at" => isodate())), ctx.cfg.jobs_table,
+            Dict("ConditionExpression" => "attribute_not_exists(run_id)");
+            aws_config=ctx.aws)
+    catch err
+        is_conditional_failure(err) || rethrow()
+        return nothing   # already wanted (possibly already produced)
+    end
+    Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+        Dict("UpdateExpression" => "SET #s = :active REMOVE finished_at ADD total_jobs :one",
+             "ExpressionAttributeNames" => Dict("#s" => "status"),
+             "ExpressionAttributeValues" => ddb_item(Dict(":active" => "active", ":one" => 1)));
+        aws_config=ctx.aws)
+    enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
+    @info "derivation enqueued" ns want.name want.version key=first(key, 12)
+    return key
 end
 
 "Registered name -> uuid from a registry checkout — the *trusted* namespace
@@ -159,6 +296,34 @@ function publish_protocol!(ctx::FarmCtx, seal_id::AbstractString, export_dir::Ab
     ji_path === nothing && return false
     so_path = unit_file(String(get(entry, "so", "")))
     body = frame_pair(read(ji_path), so_path === nothing ? nothing : read(so_path))
-    outcome = put_sealed_object(ctx, kv_object_key(seal_id, lowercase(unit_uuid), key), body)
-    return outcome in (:created, :exists_same, :exists_unknown)
+    object_key = kv_object_key(seal_id, lowercase(unit_uuid), key)
+    outcome = put_sealed_object(ctx, object_key, body)
+    outcome in (:created, :exists_same, :exists_unknown) || return false
+
+    # the .meta sidecar makes the store a by-key DAG: filenames for
+    # materialization plus each direct dep's identity and context key, so a
+    # closure resolves by fetching keys — no indexes, no build_id lookups.
+    # Dep entries are sandbox-reported but carry no authority: a wrong dep key
+    # only makes a derivation's closure walk miss and decline.
+    rel = splitpath(String(entry["ji"]))
+    deps = Any[]
+    raw_deps = get(entry, "deps", Any[])
+    if raw_deps isa AbstractVector
+        for d in raw_deps
+            d isa AbstractDict || continue
+            push!(deps, Dict("uuid" => lowercase(String(get(d, "uuid", ""))),
+                             "name" => String(get(d, "name", "")),
+                             "version" => String(get(d, "version", "-")),
+                             "key" => String(get(d, "key", "-"))))
+        end
+    end
+    meta = Dict("name" => unit, "uuid" => lowercase(unit_uuid),
+                "version" => String(get(entry, "version", "-")),
+                "vdir" => rel[1], "ji" => basename(ji_path),
+                "so" => so_path === nothing ? "" : basename(so_path),
+                "deps" => deps)
+    put_sealed_object(ctx, object_key * ".meta",
+                      Vector{UInt8}(codeunits(JSON.json(meta)));
+                      content_type="application/json")
+    return true
 end

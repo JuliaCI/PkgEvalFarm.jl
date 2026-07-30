@@ -162,6 +162,24 @@ it by moving demand to a loader hook with full resolution context:
   every fetched candidate, so a wrong object is a wasted GET, never a wrong
   load.
 
+**Stage 2 — derivations.** A v2 want is a complete work order: per direct dep
+it carries the resolved version and the dep's *own* context key, and every
+published artifact carries a `.meta` sidecar (filenames plus its direct deps'
+identities and keys), making the store a by-key DAG. The proxy dedups each
+want into a derivation job on the seal queue; an executor slot resolves the
+closure by key through the meta chain (declining if anything was never
+published), materializes it, pins the *entire* environment
+(`/derive_pins.toml`), and runs `goal = :derive` — like `:seal` but without
+TestEnv, since the requester wanted the package as a dependency. The produced
+key is checked against the want; on mismatch (inexact environment
+reproduction) the artifact still publishes under its true key, which is a
+valid artifact some other context may want. Trust is unchanged: executing a
+derivation for D runs only code from D's closure, and publication still goes
+under the registry's uuid for D. There is deliberately no proxy-hold: the
+first requester compiles locally regardless — the win is every later
+consumer, starting with `test(X)` right behind the `seal(X)` that reported
+the want.
+
 Until hook-carrying julias are what the farm tests, the flag stays off and
 the depot scheme (with its documented trust bar) remains the default.
 
