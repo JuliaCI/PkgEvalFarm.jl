@@ -284,6 +284,13 @@ try
         jobs = PEF.run_jobs(ctx, run_id)
         @test length(jobs) == 6
 
+        # the fan-out is published for the landing view's progress gauge; the
+        # 3 reused jobs never upload logs here, so the page needs the offset
+        expjson = JSON.parse(String(copy(S3.get_object(ctx.cfg.bucket,
+            PEF.report_key(run_id, "expand.json"), Dict("return_raw" => true);
+            aws_config=aws))))
+        @test expjson == Dict("total_jobs" => 6, "reused" => 3)
+
         # baseline reuse: the first run is `done` with an identical `against`
         # config (immutable spec v1.12.0), so its results transferred — those
         # jobs arrive pre-completed, pointing at the donor's logs, and only the
@@ -527,6 +534,20 @@ try
             @test run["packages"] == ["Example"]
             @test run["context"]["repo"] == "JuliaLang/julia"
             @test run["submitter"] == "keno via @pkgeval"
+            # the submission is published for the report page's landing view
+            runjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key(run_id, "run.json"), Dict("return_raw" => true);
+                aws_config=aws))))
+            @test runjson["id"] == run_id
+            @test runjson["submitter"] == "keno via @pkgeval"
+            @test runjson["trigger_label"] == "JuliaLang/julia#12345"
+            # the trigger links straight to the comment that started the run
+            # (whose id is also the comment-derived run id's suffix)
+            @test runjson["trigger_url"] ==
+                  "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
+                  chopprefix(run_id, "gh-")
+            @test runjson["configs"][1]["name"] == "primary"
+            @test !haskey(runjson, "failed")
             @test run["configs"][1]["name"] == "primary"
             @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
             @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
@@ -811,6 +832,20 @@ try
         # terminal: a later failure path racing this one loses quietly
         PEF.fail_run(ctx, run_id, "another reason")
         @test PEF.get_run(ctx, run_id)["failure_reason"] == "the Julia build failed: http://bk/9"
+        # the bot's failure report rewrites the public run.json with why (this
+        # run has no GitHub context, so the stub is never contacted)
+        lfail = PEF.FarmLite.LiteCtx(; region="us-east-1",
+                    creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+                    queue_url, slow_queue_url, runs_table="pkgeval-runs",
+                    jobs_table="pkgeval-jobs", bucket="pkgeval-results",
+                    endpoint="http://127.0.0.1:$port")
+        PEF.FarmBot.check_failed_runs(lfail,
+            PEF.FarmLite.GitHubCtx("unused", "http://127.0.0.1:1"))
+        failjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+            PEF.report_key(run_id, "run.json"), Dict("return_raw" => true);
+            aws_config=aws))))
+        @test failjson["failed"] == true
+        @test failjson["why"] == "the Julia build failed: http://bk/9"
         # retire the run's stray expand message so later testsets don't claim it
         while (c = PEF.claim_job(ctx; wait=1)) !== nothing
             SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)

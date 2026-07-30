@@ -106,6 +106,7 @@
     font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
     padding: 2px 10px; border-radius: 999px;
   }
+  .pill[hidden] { display: none; }
   .pill.done { background: var(--good-wash); color: var(--good-text); }
   .pill.done::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
 
@@ -400,6 +401,33 @@
 
   .load-state { padding: 60px 0; text-align: center; color: var(--ink-3); font-size: 14px; }
 
+  #runindex .lede { max-width: none; }
+  .runidx-rows { border-top: 1px solid var(--hairline); }
+  .runidx-row {
+    display: flex; justify-content: space-between; align-items: baseline; gap: 8px 16px;
+    padding: 9px 2px; border-bottom: 1px solid var(--hairline); font-size: 13.5px; flex-wrap: wrap;
+  }
+  .runidx-row .rid a { font-weight: 600; color: var(--ink); }
+  .runidx-row .meta { color: var(--ink-3); font-size: 12.5px; }
+  .runidx-row .meta a { color: var(--ink-2); }
+  .runidx-row .flr-line { flex-basis: 100%; text-align: right; font-size: 12.5px; }
+  .runidx-row .flr { color: var(--critical); }
+  .runidx-row .flr a { color: inherit; text-decoration: underline; }
+  .runidx-chip {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 1px 8px; border-radius: 999px; margin-left: 10px; white-space: nowrap;
+  }
+  .runidx-chip.ok { background: var(--good-wash); color: var(--good-text); }
+  .runidx-chip.bad { background: var(--critical-wash); color: var(--critical); }
+  .runidx-chip.run { background: var(--accent-wash); color: var(--accent-ink); }
+  .runidx-chip.q { background: var(--muted-wash); color: var(--ink-2); }
+  .runidx-prog { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle; }
+  .runidx-prog .bar {
+    width: 120px; height: 6px; border-radius: 3px;
+    background: var(--muted-wash); overflow: hidden;
+  }
+  .runidx-prog .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+
   footer {
     margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--hairline);
     color: var(--ink-3); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 20px;
@@ -414,6 +442,18 @@
     <span class="pill done" id="runstatus" hidden>done</span>
   </header>
   <div class="load-state" id="loadstate">Loading report data…</div>
+  <div id="runindex" hidden>
+    <section class="block" id="runidx-active" hidden>
+      <h2>In progress</h2>
+      <div class="runidx-rows" id="runidx-active-rows"></div>
+    </section>
+    <section class="block">
+      <h2>Recent runs <span class="n" id="runidx-n"></span></h2>
+      <p class="lede">Reports published by this farm, newest first. Open one, or link a report
+        directly as <span class="mono" style="white-space: nowrap">?run=&lt;run id&gt;</span>.</p>
+      <div class="runidx-rows" id="runidx-rows"></div>
+    </section>
+  </div>
   <div id="app" hidden>
     <div class="meta-line" id="metaline"></div>
 
@@ -476,32 +516,250 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 
+async function fetchJson(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  return resp.json();
+}
+
+const escHtml = (s) => String(s).replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const linkify = (s) =>   // escape first, then turn bare URLs into links
+  escHtml(s).replace(/https?:\/\/[^\s<)]+/g, (u) => `<a href="${u}">${u}</a>`);
+
 (async function boot() {
   let D;
   // served from GitHub Pages: ?run=<run_id> names the run to render, whose
-  // report.json is fetched straight from the results bucket (?bucket=
-  // overrides the bucket URL for other deployments). Without ?run= the page
-  // falls back to a report.json served next to it (local use, demos).
+  // report.json is fetched straight from the results bucket; without ?run=
+  // the page is the farm dashboard. ?bucket= overrides the bucket URL for
+  // other deployments, or for local testing against a static file tree
+  // (?bucket=http://localhost:8000 with runs/<id>/report/report.json in it).
   const params = new URLSearchParams(location.search);
   const runId = params.get("run");
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
-  const src = runId
-    ? `${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`
-    : "report.json";
+  if (!runId) return recentRuns(bucket, params);
   try {
-    const resp = await fetch(src);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    D = await resp.json();
+    D = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`);
   } catch (err) {
-    $("loadstate").textContent = "Could not load " + src + " (" + err.message + ")." +
-      (runId ? "" : " Without a ?run= parameter this page must be served next to its report.json.");
+    // no report — an unfinished (or failed) run still has its submission
+    // record to explain itself with
+    let run = null;
+    try {
+      run = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/run.json`);
+    } catch { /* nothing recorded at all */ }
+    const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
+    $("loadstate").innerHTML = run === null
+      ? `Could not load the report for run <span class="mono">${escHtml(runId)}</span> ` +
+        `(${escHtml(err.message)}).` + back
+      : run.failed
+      ? `Run <span class="mono">${escHtml(runId)}</span> failed — ` +
+        linkify(run.why || "unspecified failure") + "." + back
+      : `Run <span class="mono">${escHtml(runId)}</span> is still in progress — ` +
+        "its report will appear here once it finishes." + back;
     return;
   }
   $("loadstate").hidden = true;
   $("app").hidden = false;
   main(D);
 })();
+
+// ---- landing page: recent runs from the bucket listing --------------------
+// The bucket allows anonymous listing only of the top-level run prefixes
+// (exactly prefix=runs/&delimiter=/, see terraform/s3.tf); run ids embed
+// their creation time (YYYYMMDD-HHMMSS-...), so lexicographic order is
+// chronological and the newest runs are the tail of the listing.
+async function recentRuns(bucket, params) {
+  const esc = escHtml;
+  const ids = [];
+  try {
+    let token = null;
+    do {
+      const url = `${bucket}/?list-type=2&prefix=runs%2F&delimiter=%2F` +
+        (token ? `&continuation-token=${encodeURIComponent(token)}` : "");
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
+      for (const p of xml.querySelectorAll("CommonPrefixes > Prefix")) {
+        const m = /^runs\/([^/]+)\/$/.exec(p.textContent);
+        if (m) ids.push(m[1]);
+      }
+      token = xml.querySelector("IsTruncated")?.textContent === "true"
+        ? xml.querySelector("NextContinuationToken")?.textContent : null;
+    } while (token);
+    if (!ids.length) throw new Error("listing came back empty");
+  } catch (err) {
+    $("loadstate").textContent = `Could not list runs (${err.message}). ` +
+      "Open a report directly with ?run=<run id>.";
+    return;
+  }
+  ids.sort().reverse();
+  const shown = ids.slice(0, 30);
+  const when = (id) => {
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/.exec(id);
+    return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]} UTC` : "";
+  };
+  const href = (id) => "?run=" + encodeURIComponent(id) +
+    (params.get("bucket") ? "&bucket=" + encodeURIComponent(params.get("bucket")) : "");
+  $("runidx-n").textContent = `(${shown.length} of ${ids.length})`;
+  $("runidx-rows").innerHTML = shown.map((id) => `
+    <div class="runidx-row">
+      <span class="rid"><a class="mono" target="_self" href="${esc(href(id))}">${esc(id)}</a
+        ><span class="runidx-chip" data-chip="${esc(id)}" hidden></span></span>
+      <span class="meta" data-run="${esc(id)}">${esc(when(id))}</span>
+    </div>`).join("");
+  $("loadstate").hidden = true;
+  $("runindex").hidden = false;
+  // probe the newest dozen: finished runs (report.json) get a verdict chip
+  // and their outcome; unfinished ones carry a run.json instead (written at
+  // submission, marked on failure), which moves live runs up into the
+  // in-progress section with a log-count progress gauge. Runs with neither
+  // stay bare — they predate run.json, or their submission's upload failed
+  const runMeta = (run, id) => {
+    const bits = [];
+    if (run.trigger_url && run.trigger_label)
+      bits.push(`<a href="${esc(run.trigger_url)}">${esc(run.trigger_label)}</a>`);
+    else if (run.primary)   // untriggered (CLI) runs: say what was tested
+      bits.push(esc(run.primary.sha.slice(0, 10) +
+                    (run.against ? " vs " + run.against.sha.slice(0, 10) : "")));
+    else if (run.configs && run.configs.length)   // ditto, from a run.json
+      bits.push(esc(run.configs.map((c) => {
+        const h = (c.julia || "nightly").split("#").pop();
+        return /^[0-9a-f]{7,40}$/.test(h) ? h.slice(0, 10) : h;
+      }).join(" vs ")));
+    if (run.submitter && run.submitter !== "?") bits.push(esc(run.submitter));
+    if (run.total_jobs) bits.push(`${run.total_jobs} jobs`);
+    return bits;
+  };
+  const elapsed = (a, b) => {
+    const s = (Date.parse(b) - Date.parse(a)) / 1000;
+    if (!(s > 0)) return null;
+    return s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
+  };
+  const OKS = new Set(["t", "l"]);
+  const countNewFails = (D) => {
+    const hasA = !!D.run.against;
+    let n = 0;
+    for (const r of D.pkgs) {
+      const ps = r[2], as = r[5];
+      if (!hasA || !as) { if (!hasA && !OKS.has(ps) && ps !== "s") n++; continue; }
+      if (!OKS.has(ps) && ps !== "s" && OKS.has(as)) n++;
+    }
+    return n;
+  };
+  const renderFinished = (id, D) => {
+    const n = countNewFails(D);
+    setChip(id, n ? "bad" : "ok",
+            n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
+    const bits = runMeta(D.run, id);
+    const took = D.run.finished && elapsed(D.run.created, D.run.finished);
+    if (took) bits.push(took);
+    if (D.run.cost > 0) bits.push(`$${D.run.cost.toFixed(2)}`);
+    bits.push(esc(when(id)));
+    metaEl(id).innerHTML = bits.join(" · ");
+  };
+  const renderFailed = (id, run) => {
+    setChip(id, "bad", "failed");
+    metaEl(id).innerHTML = [...runMeta(run, id), esc(when(id))].join(" · ");
+    // the (often long) reason gets its own line so the meta column — and its
+    // trigger links — stays aligned with every other row
+    const row = metaEl(id).closest(".runidx-row");
+    let fl = row.querySelector(".flr-line");
+    if (!fl) {
+      fl = document.createElement("div");
+      fl.className = "flr-line";
+      row.appendChild(fl);
+    }
+    fl.innerHTML = `<span class="flr">${linkify(run.why || "unspecified failure")}</span>`;
+  };
+  // a live run that reached a terminal state moves back among the finished,
+  // newest first; the in-progress section folds away once it empties
+  const demote = (row, id) => {
+    const next = [...$("runidx-rows").children].find((r) =>
+      r.querySelector(".runidx-chip").dataset.chip < id);
+    $("runidx-rows").insertBefore(row, next || null);
+    if (!$("runidx-active-rows").children.length) $("runidx-active").hidden = true;
+  };
+  for (const id of shown.slice(0, 12)) {
+    const rjson = (name) =>
+      fetchJson(`${bucket}/runs/${encodeURIComponent(id)}/report/${name}`);
+    rjson("report.json")
+      .then((D) => renderFinished(id, D))
+      .catch(() => rjson("run.json").then((run) => {
+        if (run.failed) { renderFailed(id, run); return; }
+        // live run: move its row up, gauge progress now, and each minute
+        // re-probe — first for a terminal state, else recount the logs
+        const row = metaEl(id).closest(".runidx-row");
+        $("runidx-active-rows").appendChild(row);
+        $("runidx-active").hidden = false;
+        setChip(id, "q", "queued");
+        metaEl(id).innerHTML = [...runMeta(run, id), esc(when(id))].join(" · ") +
+          ' · <span class="runidx-prog"><span class="n"></span>' +
+          '<span class="bar" hidden><i style="width:0"></i></span></span>';
+        const tick = () => rjson("report.json")
+          .then((D) => { renderFinished(id, D); demote(row, id); clearInterval(iv); })
+          .catch(() => rjson("run.json").then((now) => {
+            if (now.failed) { renderFailed(id, now); demote(row, id); clearInterval(iv); }
+            else return liveProgress(bucket, id);
+          }).catch(() => {}));
+        const iv = setInterval(tick, 60_000);
+        liveProgress(bucket, id).catch(() => {});
+      }).catch(() => {}));
+  }
+}
+
+const metaEl = (id) => document.querySelector(`.meta[data-run="${CSS.escape(id)}"]`);
+const setChip = (id, cls, text) => {
+  const c = document.querySelector(`.runidx-chip[data-chip="${CSS.escape(id)}"]`);
+  c.className = "runidx-chip " + cls;
+  c.textContent = text;
+  c.hidden = false;
+};
+
+// gauge an in-flight run's progress: count its uploaded logs (each finished
+// job writes one; reused baseline jobs never do, expand.json carries that
+// offset next to the fan-out total, which is absent while still expanding)
+async function liveProgress(bucket, id) {
+  const run = `${bucket}/runs/${encodeURIComponent(id)}`;
+  let logs = 0, latest = "";
+  let token = null;
+  do {
+    // no delimiter: all configs' logs in one (paginated) listing
+    const url = `${bucket}/?list-type=2&prefix=` +
+      encodeURIComponent(`runs/${id}/logs/`) +
+      (token ? `&continuation-token=${encodeURIComponent(token)}` : "");
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
+    for (const c of xml.querySelectorAll("Contents > LastModified")) {
+      logs++;
+      if (c.textContent > latest) latest = c.textContent;
+    }
+    token = xml.querySelector("IsTruncated")?.textContent === "true"
+      ? xml.querySelector("NextContinuationToken")?.textContent : null;
+  } while (token);
+  let done = logs, total = 0;
+  try {
+    const exp = await fetchJson(`${run}/report/expand.json`);
+    done += exp.reused || 0;
+    total = exp.total_jobs || 0;
+  } catch { /* still expanding */ }
+  const prog = document.querySelector(
+    `.meta[data-run="${CSS.escape(id)}"] .runidx-prog`);
+  if (!prog) return;
+  const ago = latest ? Math.round((Date.now() - Date.parse(latest)) / 60000) : null;
+  if (!total) {   // no expand.json yet: submitted, waiting for a worker
+    prog.querySelector(".n").textContent = "waiting for a worker to expand the run";
+    return;
+  }
+  setChip(id, "run", "running");
+  prog.querySelector(".n").textContent = `${done} of ${total} jobs` +
+    (ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`);
+  const bar = prog.querySelector(".bar");
+  bar.hidden = false;
+  bar.querySelector("i").style.width =
+    `${Math.min(100, Math.round(done / total * 100))}%`;
+}
 
 function main(D) {
   // ---- vocabulary -------------------------------------------------------

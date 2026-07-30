@@ -397,9 +397,10 @@ could strand a run whose first submission crashed between put and send.
 function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
                     packages::Vector{String}, context_json::String, submitter::String,
                     reuse::Bool=true)
+    created_at = isodate()
     item = Item(
         "run_id" => attr(run_id),
-        "created_at" => attr(isodate()),
+        "created_at" => attr(created_at),
         "submitter" => attr(submitter),
         "status" => attr("expanding"),
         "configs" => attr(configs_json),
@@ -425,6 +426,13 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
     end
     sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}";
                      queue_url=FarmLite.slow_queue(ctx))
+    # best-effort: the landing view just won't know about this run until its
+    # report lands, so a hiccup here must not fail the submission
+    try
+        publish_run_json(ctx, run_id, submitter, created_at, context_json, configs_json)
+    catch err
+        @error "failed to publish run.json" run_id msg=error_message(err)
+    end
     return created
 end
 
@@ -625,7 +633,9 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     configs_json = "[" * config_json("primary", primary; assertions=true) * "," *
                          config_json("against", against; assertions=true) * "]"
     context_json = "{\"repo\":$(JSON.json(repo)),\"issue\":$number," *
-                   "\"requester\":$(JSON.json(requester))}"
+                   "\"requester\":$(JSON.json(requester))" *
+                   (comment_id === nothing ? "" :
+                    ",\"comment\":$(something(comment_id))") * "}"
     # a comment-derived run id makes submission idempotent: webhook redelivery,
     # the fallback poll rediscovering the same mention, and webhook+poll overlap
     # all collapse into one run (kicking off a run is expensive)
@@ -669,12 +679,14 @@ struct RunContext
     repo::Union{Nothing,String}
     issue::Union{Nothing,Int}
     requester::Union{Nothing,String}
+    comment::Union{Nothing,Int}   # the triggering comment, when one exists
 end
 
 function json_make(::Type{RunContext}, x::LazyVal)
     repo = Ref{Union{Nothing,String}}(nothing)
     issue = Ref{Union{Nothing,Int}}(nothing)
     requester = Ref{Union{Nothing,String}}(nothing)
+    comment = Ref{Union{Nothing,Int}}(nothing)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         if k == "repo"
@@ -683,11 +695,21 @@ function json_make(::Type{RunContext}, x::LazyVal)
             n, p = json_int(v); issue[] = Int(n); return p
         elseif k == "requester"
             s, p = json_string(v); requester[] = s; return p
+        elseif k == "comment"
+            n, p = json_int(v); comment[] = Int(n); return p
         end
         return nothing
     end
-    return RunContext(repo[], issue[], requester[]), pos::Int
+    return RunContext(repo[], issue[], requester[], comment[]), pos::Int
 end
+
+"""
+The link a run's trigger label points at: the comment that started the run
+when the context recorded one, the PR otherwise.
+"""
+trigger_link(repo::String, issue::Int, comment::Union{Nothing,Int}) =
+    "https://github.com/$repo/pull/$issue" *
+    (comment === nothing ? "" : "#issuecomment-$(something(comment))")
 
 function check_finished_runs(ctx::LiteCtx, gh::GitHubCtx)
     start_key = ""
@@ -905,6 +927,11 @@ function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::Strin
     @info "run marked failed" run_id why
     # the stream filter only fires on "done", so failure is reported here
     run = get_run(ctx, run_id)
+    try
+        publish_run_json(ctx, run; failed_why=why)
+    catch err
+        @error "failed to publish failed run.json" run_id msg=error_message(err)
+    end
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
@@ -1006,9 +1033,14 @@ function report_failed_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
         rethrow()
     end
 
+    why = str(run, "failure_reason", "unspecified failure")
+    try
+        publish_run_json(ctx, run; failed_why=why)
+    catch err
+        @error "failed to publish failed run.json" run_id msg=error_message(err)
+    end
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
-    why = str(run, "failure_reason", "unspecified failure")
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
     deliver_final(gh, something(context.repo), something(context.issue), run,
                   mention * "run `" * run_id * "` **failed** — " * why * ".")
@@ -1232,6 +1264,46 @@ s3_public_url(ctx::LiteCtx, key::String) =
 # their data and the link just carries the run id
 report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://pkgeval-reports.julialang.org/")
 report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
+
+"""
+Public per-run submission record at `runs/<id>/report/run.json`: written at
+submission and rewritten with `failed_why` when the run fails, it is all the
+report page's landing view knows about a run that has no report.json yet
+(in flight, or failed before reporting). Workers add the job total next to it
+(expand.json, see `expand_run`) once the fan-out is known.
+"""
+function publish_run_json(ctx::LiteCtx, run_id::String, submitter::String,
+                          created::String, context_json::String, configs_json::String;
+                          failed_why::Union{Nothing,String}=nothing)
+    io = IOBuffer()
+    print(io, "{\"id\":", JSON.json(run_id))
+    print(io, ",\"submitter\":", JSON.json(submitter))
+    print(io, ",\"created\":", JSON.json(created))
+    context = parse_json(context_json, RunContext)
+    if context.repo !== nothing && context.issue !== nothing
+        repo, issue = something(context.repo), something(context.issue)
+        print(io, ",\"trigger_url\":", JSON.json(trigger_link(repo, issue, context.comment)),
+              ",\"trigger_label\":", JSON.json("$repo#$issue"))
+    end
+    print(io, ",\"configs\":[")
+    for (i, c) in enumerate(parse_json(configs_json, Vector{ConfigInfo}))
+        i > 1 && print(io, ",")
+        print(io, "{\"name\":", JSON.json(something(c.name, "?")),
+              ",\"julia\":", JSON.json(something(c.julia, "nightly")), "}")
+    end
+    print(io, "]")
+    failed_why === nothing ||
+        print(io, ",\"failed\":true,\"why\":", JSON.json(something(failed_why)))
+    print(io, "}")
+    s3_put(ctx, report_key(run_id, "run.json"), String(take!(io));
+           content_type="application/json")
+    return nothing
+end
+
+publish_run_json(ctx::LiteCtx, run::Item; failed_why::Union{Nothing,String}=nothing) =
+    publish_run_json(ctx, str(run, "run_id"), str(run, "submitter", "?"),
+                     str(run, "created_at", ""), str(run, "context", "{}"),
+                     str(run, "configs", "[]"); failed_why)
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1613,7 +1685,7 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     context = parse_json(str(run, "context", "{}"), RunContext)
     if context.repo !== nothing && context.issue !== nothing
         repo, issue = something(context.repo), something(context.issue)
-        print(io, ",\"trigger_url\":", JSON.json("https://github.com/$repo/pull/$issue"),
+        print(io, ",\"trigger_url\":", JSON.json(trigger_link(repo, issue, context.comment)),
               ",\"trigger_label\":", JSON.json("$repo#$issue"))
     end
     print_build_json(io, "primary", configs[1])
