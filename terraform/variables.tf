@@ -174,6 +174,23 @@ variable "ec2_worker_julia_channel" {
   default     = "1.12"
 }
 
+variable "seal_scheme" {
+  description = <<-EOT
+    Compilecache sealing scheme on workers (docs/sealing.md): "depot" shares
+    artifacts via materialized read-only depots; "protocol" uses the loader
+    hook + loopback proxy (requires the julia under test to carry
+    Base.CACHE_FETCH_HOOK — hookless julias under this scheme seal without
+    effect). Applies to newly launched instances.
+  EOT
+  type        = string
+  default     = "depot"
+
+  validation {
+    condition     = contains(["depot", "protocol"], var.seal_scheme)
+    error_message = "seal_scheme must be \"depot\" or \"protocol\"."
+  }
+}
+
 variable "bot_submitter_team" {
   description = "Team gating @bot commands. null = same as submitter_team; empty string = any github_org member (classic Nanosoldier's documented policy)."
   type        = string
