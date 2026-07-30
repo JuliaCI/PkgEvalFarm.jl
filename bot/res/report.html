@@ -1,0 +1,1102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PkgEval report</title>
+<!-- every link leaves the report (logs, GitHub, sibling files); keep the page open -->
+<base target="_blank">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #faf9fb;
+    --surface: #ffffff;
+    --surface-2: #f4f2f7;
+    --ink: #1c1a21;
+    --ink-2: #5b5766;
+    --ink-3: #8d8896;
+    --hairline: #e6e3ec;
+    --hairline-2: #d8d4e0;
+    --accent: #9558b2;
+    --accent-ink: #7a4495;
+    --accent-wash: #f3ebf8;
+    --good: #0ca30c;
+    --good-text: #087408;
+    --good-wash: #e9f6e9;
+    --warning: #b97c00;
+    --warning-dot: #fab219;
+    --warning-wash: #fdf3dc;
+    --serious: #c05024;
+    --serious-dot: #ec835a;
+    --serious-wash: #fcece5;
+    --critical: #d03b3b;
+    --critical-wash: #fbe9e9;
+    --infra: #4a5a8a;
+    --infra-wash: #eaeef8;
+    --muted-wash: #efedf2;
+    --chart-bar: #2a78d6;
+    --code-bg: #f4f2f7;
+    --shadow: 0 1px 2px rgba(28, 26, 33, 0.05), 0 4px 16px rgba(28, 26, 33, 0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --page: #131118;
+      --surface: #1c1922;
+      --surface-2: #242029;
+      --ink: #f0eef4;
+      --ink-2: #b5b0c0;
+      --ink-3: #7f7a8a;
+      --hairline: #2e2a36;
+      --hairline-2: #3a3544;
+      --accent: #b07cc9;
+      --accent-ink: #c79ddb;
+      --accent-wash: #2b2233;
+      --good: #0ca30c;
+      --good-text: #4cc44c;
+      --good-wash: #1b2a1b;
+      --warning: #e0a52e;
+      --warning-dot: #fab219;
+      --warning-wash: #322a17;
+      --serious: #f09468;
+      --serious-dot: #ec835a;
+      --serious-wash: #33221b;
+      --critical: #e05e5e;
+      --critical-wash: #341d1d;
+      --infra: #93a5d6;
+      --infra-wash: #202536;
+      --muted-wash: #28242f;
+      --chart-bar: #3987e5;
+      --code-bg: #16141b;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.3);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono {
+    font-family: "JuliaMono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em;
+  }
+  button { font: inherit; color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 24px 64px; }
+
+  .masthead {
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 28px 0 10px;
+  }
+  .brand { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 9px; }
+  .brand .dots { display: inline-flex; gap: 3px; }
+  .brand .dots i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .brand .dots i:nth-child(1) { background: #cb3c33; }
+  .brand .dots i:nth-child(2) { background: #389826; }
+  .brand .dots i:nth-child(3) { background: #9558b2; }
+  .runid { font-size: 15px; color: var(--ink-2); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+    padding: 2px 10px; border-radius: 999px;
+  }
+  .pill.done { background: var(--good-wash); color: var(--good-text); }
+  .pill.done::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+
+  .meta-line {
+    color: var(--ink-2); font-size: 13.5px;
+    display: flex; flex-wrap: wrap; gap: 4px 18px;
+    padding-bottom: 20px; border-bottom: 1px solid var(--hairline);
+  }
+  .meta-line strong { color: var(--ink); font-weight: 600; }
+
+  .vs-card {
+    margin-top: 20px;
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 0 18px; align-items: stretch;
+  }
+  .vs-card.single { grid-template-columns: 1fr; }
+  .build {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px;
+    padding: 14px 18px; box-shadow: var(--shadow);
+  }
+  .build .role { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+  .build.primary .role { color: var(--accent-ink); }
+  .build .sha { margin-top: 4px; font-size: 14px; }
+  .build .sha a, .build .sha span { color: var(--ink); font-weight: 600; }
+  .build .flags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .flag {
+    font-family: ui-monospace, Menlo, monospace; font-size: 11.5px;
+    background: var(--surface-2); border: 1px solid var(--hairline);
+    border-radius: 6px; padding: 1px 7px; color: var(--ink-2);
+  }
+  .vs-mid { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; }
+  .vs-mid .vs { font-size: 12px; font-weight: 700; color: var(--ink-3); letter-spacing: 0.08em; }
+  .vs-mid a { font-size: 12.5px; white-space: nowrap; }
+
+  .verdict {
+    margin-top: 26px; display: flex; align-items: center; gap: 12px;
+    font-size: 17px; font-weight: 600;
+  }
+  .verdict .count { font-size: 34px; font-weight: 700; letter-spacing: -0.02em; color: var(--critical); }
+  .verdict.ok .count { color: var(--good-text); }
+  .verdict .what { color: var(--ink); }
+  .verdict .sub { display: block; font-size: 13px; font-weight: 400; color: var(--ink-2); }
+
+  .tiles {
+    margin-top: 18px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px;
+  }
+  .tile {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px;
+    padding: 12px 14px 10px; box-shadow: var(--shadow);
+    text-align: left; cursor: pointer; transition: border-color 0.12s;
+  }
+  .tile:hover { border-color: var(--hairline-2); }
+  .tile[disabled] { cursor: default; }
+  .tile .v { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
+  .tile .l { font-size: 12.5px; color: var(--ink-2); margin-top: 1px; }
+  .tile.crit .v { color: var(--critical); }
+  .tile.good .v { color: var(--good-text); }
+
+  .runfacts {
+    margin-top: 14px; color: var(--ink-2); font-size: 13px;
+    display: flex; flex-wrap: wrap; gap: 4px 22px;
+  }
+  .runfacts b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  section.block { margin-top: 34px; }
+  .block > h2 {
+    font-size: 16.5px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 4px;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  .block > h2 .n { color: var(--ink-3); font-weight: 600; font-size: 14px; }
+  .block > .lede { margin: 0 0 14px; color: var(--ink-2); font-size: 13.5px; max-width: 68ch; }
+
+  .rerun-box {
+    background: var(--code-bg); border: 1px solid var(--hairline); border-radius: 10px;
+    position: relative;
+  }
+  .rerun-box pre {
+    margin: 0; padding: 14px 16px; overflow-x: auto; max-height: 180px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+    color: var(--ink);
+  }
+  .copy-btn {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--surface); border: 1px solid var(--hairline-2); border-radius: 7px;
+    font-size: 12px; font-weight: 600; padding: 4px 10px; cursor: pointer; color: var(--ink-2);
+  }
+  .copy-btn:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  .filterbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    margin-bottom: 14px;
+  }
+  .search {
+    flex: 1 1 220px; max-width: 340px;
+    background: var(--surface); border: 1px solid var(--hairline-2); border-radius: 8px;
+    padding: 6px 12px; font: inherit; font-size: 13.5px; color: var(--ink);
+  }
+  .search::placeholder { color: var(--ink-3); }
+  .chip {
+    border: 1px solid var(--hairline-2); background: var(--surface); border-radius: 999px;
+    font-size: 12.5px; font-weight: 600; padding: 3px 12px; cursor: pointer; color: var(--ink-2);
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .chip[aria-pressed="true"] { background: var(--accent-wash); border-color: var(--accent); color: var(--ink); }
+
+  .group {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px;
+    box-shadow: var(--shadow); margin-bottom: 10px; overflow: hidden;
+  }
+  .group > summary {
+    list-style: none; cursor: pointer; user-select: none;
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 16px; font-weight: 600; font-size: 14px;
+  }
+  .group > summary::-webkit-details-marker { display: none; }
+  .group > summary::before {
+    content: ""; width: 7px; height: 7px; border: solid var(--ink-3); border-width: 0 1.5px 1.5px 0;
+    transform: rotate(-45deg); transition: transform 0.12s; flex: none;
+  }
+  .group[open] > summary::before { transform: rotate(45deg); }
+  @media (prefers-reduced-motion: reduce) {
+    .group > summary::before { transition: none; }
+  }
+  .group > summary .n {
+    margin-left: auto; font-variant-numeric: tabular-nums;
+    color: var(--ink-2); font-weight: 600; font-size: 13px;
+  }
+  .sbadge {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: 0.01em;
+    border-radius: 6px; padding: 1.5px 8px; white-space: nowrap;
+  }
+  .sbadge .ic { font-size: 10.5px; }
+  .st-c { background: var(--critical-wash); color: var(--critical); }
+  .st-f { background: var(--serious-wash); color: var(--serious); }
+  .st-k { background: var(--warning-wash); color: var(--warning); }
+  .st-t, .st-l { background: var(--good-wash); color: var(--good-text); }
+  .st-s { background: var(--muted-wash); color: var(--ink-2); }
+  .st-e { background: var(--infra-wash); color: var(--infra); }
+
+  .rows { border-top: 1px solid var(--hairline); }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(220px, 1.4fr) minmax(150px, 1fr) minmax(170px, 1fr);
+    gap: 4px 14px; align-items: center;
+    padding: 7px 16px; border-top: 1px solid var(--hairline);
+    font-size: 13.5px;
+  }
+  .row:first-child { border-top: none; }
+  .row:hover { background: var(--surface-2); }
+  .row .pkg { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .row .pkg a { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+  .row .ver { color: var(--ink-3); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .row .side { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .row .side .dur { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .row .side .lg { font-size: 12px; }
+  .row .side .arr { color: var(--ink-3); font-size: 12px; }
+
+  .subhead {
+    font-size: 14.5px; font-weight: 700; margin: 22px 0 2px;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  .subhead .n { color: var(--ink-3); font-weight: 600; font-size: 13px; }
+  #other-groups .lede { margin: 0 0 10px; color: var(--ink-2); font-size: 13px; max-width: 72ch; }
+
+  .sigpanel {
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px;
+    box-shadow: var(--shadow); margin-bottom: 14px; padding: 6px 0;
+  }
+  .sigpanel .sp-head {
+    padding: 6px 16px 8px; font-size: 12.5px; color: var(--ink-2);
+    border-bottom: 1px solid var(--hairline);
+  }
+  .sigrow {
+    display: flex; align-items: baseline; gap: 12px; width: 100%;
+    padding: 7px 16px; border: none; background: none; text-align: left; cursor: pointer;
+    font-size: 13px; border-top: 1px solid var(--hairline);
+  }
+  .sigrow:first-of-type { border-top: none; }
+  .sigrow:hover { background: var(--surface-2); }
+  .sigrow[aria-pressed="true"] { background: var(--accent-wash); }
+  .sigrow .cnt {
+    flex: none; min-width: 34px; text-align: right; font-weight: 700;
+    font-variant-numeric: tabular-nums; color: var(--ink);
+  }
+  .sigrow .sg { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .sigrow.rest .sg { font-family: inherit; font-style: italic; }
+
+  .triagebar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin: 0 0 12px; font-size: 13px; color: var(--ink-2);
+  }
+  .triagebar .bar {
+    flex: 0 0 160px; height: 6px; border-radius: 3px; background: var(--muted-wash); overflow: hidden;
+  }
+  .triagebar .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  .btn-ghost {
+    border: 1px solid var(--hairline-2); background: var(--surface); border-radius: 7px;
+    font-size: 12.5px; font-weight: 600; padding: 4px 12px; cursor: pointer; color: var(--ink-2);
+  }
+  .btn-ghost:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  .rowx {
+    display: grid;
+    grid-template-columns: 22px minmax(210px, 1.35fr) minmax(150px, 1fr) minmax(170px, 1fr) 22px;
+    gap: 4px 12px; align-items: center;
+    padding: 7px 16px; border-top: 1px solid var(--hairline); font-size: 13.5px;
+  }
+  .rowx:hover { background: var(--surface-2); }
+  .rowx.triaged .pkg a { color: var(--ink-3); text-decoration: line-through; }
+  .rowx input[type="checkbox"] { accent-color: var(--accent); margin: 0; cursor: pointer; }
+  .rowx .pkg { display: flex; align-items: baseline; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .rowx .pkg a { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+  .rowx .ver { color: var(--ink-3); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+  .rowx .vchange { color: var(--warning); font-size: 11.5px; font-weight: 600; }
+  .rowx .deps { color: var(--ink-3); font-size: 11.5px; white-space: nowrap; }
+  .rowx .side { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+  .rowx .side .dur { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .rowx .side .arr { color: var(--ink-3); font-size: 12px; }
+  .rowx .side .lg { font-size: 12px; }
+  .expand-btn {
+    border: none; background: none; cursor: pointer; color: var(--ink-3); padding: 2px;
+    line-height: 1; font-size: 11px;
+  }
+  .expand-btn:hover { color: var(--ink); }
+  .taildrawer {
+    grid-column: 1 / -1; background: var(--code-bg); border: 1px solid var(--hairline);
+    border-radius: 8px; margin: 2px 0 6px; overflow: hidden;
+  }
+  .taildrawer pre {
+    margin: 0; padding: 10px 14px; overflow: auto; max-height: 320px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.5;
+    color: var(--ink-2);
+  }
+  .taildrawer pre mark {
+    background: var(--warning-wash); color: var(--ink); border-radius: 3px;
+    padding: 0 2px; display: inline-block;
+  }
+  .taildrawer .note {
+    padding: 5px 14px; font-size: 11.5px; color: var(--ink-3);
+    border-top: 1px solid var(--hairline);
+  }
+  .taildrawer .actions {
+    display: flex; gap: 14px; padding: 7px 14px; border-top: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  @media (max-width: 800px) {
+    .row, .rowx { grid-template-columns: 1fr; }
+    .rowx { grid-template-columns: 22px 1fr 22px; }
+    .vs-card { grid-template-columns: 1fr; gap: 10px; }
+    .vs-mid { flex-direction: row; }
+  }
+
+  .more-btn {
+    width: 100%; border: none; border-top: 1px solid var(--hairline); background: var(--surface-2);
+    padding: 8px; font-size: 13px; font-weight: 600; color: var(--accent-ink); cursor: pointer;
+  }
+  .empty-note { padding: 14px 16px; color: var(--ink-3); font-size: 13.5px; }
+
+  .hist {
+    padding: 12px 16px 6px; border-top: 1px solid var(--hairline); background: var(--surface);
+  }
+  .hist .cap { font-size: 12.5px; color: var(--ink-2); margin-bottom: 6px; max-width: 72ch; }
+  .hist svg { display: block; width: 100%; height: auto; }
+  .hist .axis text { font: 10.5px system-ui, sans-serif; fill: var(--ink-3); }
+  .hist .blabel { font: 10.5px system-ui, sans-serif; fill: var(--ink-2); }
+  .hist rect.bar { fill: var(--chart-bar); }
+  .hist line.base { stroke: var(--hairline-2); stroke-width: 1; }
+
+  .slowtable { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .slowtable th {
+    text-align: left; font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--ink-3); padding: 8px 14px; border-bottom: 1px solid var(--hairline);
+  }
+  .slowtable td { padding: 6px 14px; border-bottom: 1px solid var(--hairline); }
+  .slowtable tr:last-child td { border-bottom: none; }
+  .slowtable tr:hover td { background: var(--surface-2); }
+  .slowtable .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  .slowtable .num .lg { font-size: 12px; margin-left: 5px; }
+  .slowtable .ratio { font-weight: 700; color: var(--serious); text-align: right; font-variant-numeric: tabular-nums; }
+  .slowtable .rbar { height: 5px; border-radius: 2.5px; background: var(--serious-dot); opacity: 0.85; }
+  .tablewrap { overflow-x: auto; }
+
+  .lookup-input {
+    width: 100%; max-width: 420px;
+    background: var(--surface); border: 1px solid var(--hairline-2); border-radius: 8px;
+    padding: 8px 14px; font: inherit; font-size: 14px; color: var(--ink);
+  }
+  #lookup-results { margin-top: 12px; }
+  #lookup-results .group { margin-bottom: 0; }
+
+  .load-state { padding: 60px 0; text-align: center; color: var(--ink-3); font-size: 14px; }
+
+  footer {
+    margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--hairline);
+    color: var(--ink-3); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 20px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <div class="brand"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span> PkgEval</div>
+    <div class="runid mono" id="runid"></div>
+    <span class="pill done" id="runstatus" hidden>done</span>
+  </header>
+  <div class="load-state" id="loadstate">Loading report data…</div>
+  <div id="app" hidden>
+    <div class="meta-line" id="metaline"></div>
+
+    <div class="vs-card" id="vscard"></div>
+
+    <div class="verdict" id="verdict"></div>
+    <div class="tiles" id="tiles"></div>
+    <div class="runfacts" id="runfacts"></div>
+
+    <section class="block" id="rerun-block">
+      <h2>Rerun the new failures</h2>
+      <p class="lede">Paste this on the pull request to re-evaluate every package that regressed, against the same baseline.</p>
+      <div class="rerun-box">
+        <button class="copy-btn" id="copy-rerun" type="button">Copy</button>
+        <pre id="rerun-cmd"></pre>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2 id="nf-title">New failures <span class="n" id="nf-count"></span></h2>
+      <p class="lede" id="nf-lede">Packages that failed on the primary build but passed on the baseline — grouped by why they failed, most severe first.</p>
+      <div class="sigpanel" id="sigpanel" hidden></div>
+      <div class="triagebar" id="triagebar">
+        <label><input type="checkbox" id="hide-triaged" style="accent-color: var(--accent); vertical-align: -2px;"> hide triaged</label>
+        <span class="bar" aria-hidden="true"><i id="triage-fill" style="width: 0%"></i></span>
+        <span id="triage-count"></span>
+        <button class="btn-ghost" id="copy-triage" type="button">Copy triage summary</button>
+      </div>
+      <div class="filterbar">
+        <input class="search" id="nf-search" type="search" placeholder="Filter packages…" aria-label="Filter new failures">
+        <span id="nf-chips"></span>
+      </div>
+      <div id="nf-groups"></div>
+    </section>
+
+    <section class="block" id="slow-block" hidden>
+      <h2>Performance signal</h2>
+      <p class="lede" id="slow-lede"></p>
+      <div class="group tablewrap" id="slow-table"></div>
+    </section>
+
+    <section class="block" id="other-block" hidden>
+      <h2>Other outcomes</h2>
+      <p class="lede">Changes in the other direction, and failures shared with the baseline.</p>
+      <div id="other-groups"></div>
+    </section>
+
+    <section class="block">
+      <h2>Look up a package</h2>
+      <p class="lede">Every evaluated package — search to see how any of them fared.</p>
+      <input class="lookup-input" id="lookup" type="search" placeholder="Package name…" aria-label="Look up a package">
+      <div id="lookup-results"></div>
+    </section>
+
+    <footer id="foot"></footer>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+(async function boot() {
+  let D;
+  try {
+    const resp = await fetch("report.json");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    D = await resp.json();
+  } catch (err) {
+    $("loadstate").textContent = "Could not load report.json (" + err.message + "). " +
+      "This page must be served next to its report.json.";
+    return;
+  }
+  $("loadstate").hidden = true;
+  $("app").hidden = false;
+  main(D);
+})();
+
+function main(D) {
+  // ---- vocabulary -------------------------------------------------------
+  const ST = {
+    t: { label: "pass",  icon: "✓", cls: "st-t" },
+    l: { label: "load",  icon: "~", cls: "st-l" },
+    f: { label: "fail",  icon: "✕", cls: "st-f" },
+    c: { label: "crash", icon: "❗", cls: "st-c" },
+    k: { label: "kill",  icon: "⏱", cls: "st-k" },
+    s: { label: "skip",  icon: "–", cls: "st-s" },
+    e: { label: "error", icon: "⚠", cls: "st-e" },
+  };
+  const OK = new Set(["t", "l"]);
+  // pkgs row layout: [name, version, ps, pr, pdur, as, ar, adur, aver-if-different, plogdir, alogdir]
+  const PSTAT = 2, PREASON = 3, PDUR = 4, ASTAT = 5, AREASON = 6, ADUR = 7, AVER = 8,
+        PLOG = 9, ALOG = 10;
+  const hasAgainst = !!D.run.against;
+
+  // severity order mirrors PkgEval.jl's reasons list (crash → fail → kill → skip)
+  const SEV_ORDER = ["abort", "codegen", "internal", "unreachable", "gc_corruption", "segfault",
+    "inference_overflow", "syntax", "uncompilable", "precompile", "method_overwriting",
+    "test_failures", "test_errors", "binary_dependency", "missing_dependency", "missing_package",
+    "network", "unknown", "inactivity", "time_limit", "log_limit", "resource_limit",
+    "untestable", "uninstallable", "unsupported", "blacklisted", "worker_exception"];
+  const reasonCode = (ri) => (ri >= 0 && D.reasons[ri] ? D.reasons[ri][0] : "");
+  const reasonMsg = (ri) => (ri >= 0 && D.reasons[ri] ? D.reasons[ri][1] : "no reason recorded");
+  const reasonSev = (ri) => {
+    const i = SEV_ORDER.indexOf(reasonCode(ri));
+    return ri < 0 ? 999 : (i < 0 ? 998 : i);
+  };
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  // log locations come from each job's log_key (via D.logdirs): a reused
+  // baseline's log lives under the donor run's prefix, not this run's
+  const logHref = (r, li) => (li >= 0 && D.logdirs[li]
+    ? `${D.run.bucket}/${D.logdirs[li]}/${encodeURIComponent(r[0])}.log` : null);
+  const plog = (r) => logHref(r, r[PLOG]);
+  const alog = (r) => logHref(r, r[ALOG]);
+  const fmtDur = (s) => {
+    if (s == null || s <= 0) return "";
+    if (s < 90) return `${Math.round(s)}s`;
+    const m = Math.floor(s / 60), sec = Math.round(s % 60);
+    if (m < 90) return `${m}m${sec ? " " + sec + "s" : ""}`;
+    return `${(s / 3600).toFixed(1)}h`;
+  };
+  const fmtInt = (n) => n.toLocaleString("en-US");
+  const fmtDeps = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+  const isSha = (s) => /^[0-9a-f]{7,40}$/.test(s || "");
+  const short = (s) => (isSha(s) ? s.slice(0, 10) : s);
+
+  // ---- classification ---------------------------------------------------
+  const newFails = [], nowPassing = [], stillFailing = [];
+  for (const r of D.pkgs) {
+    const ps = r[PSTAT], as = r[ASTAT];
+    if (!hasAgainst || !as) {
+      // no baseline result to compare with: only a single-config run
+      // classifies these (a comparison run leaves them unclassified)
+      if (!hasAgainst && !OK.has(ps) && ps !== "s") newFails.push(r);
+      continue;
+    }
+    if (!OK.has(ps) && ps !== "s" && OK.has(as)) newFails.push(r);
+    else if (OK.has(ps) && !OK.has(as) && as !== "s") nowPassing.push(r);
+    else if (!OK.has(ps) && !OK.has(as) && ps !== "s") stillFailing.push(r);
+  }
+  const passed = D.pkgs.filter((r) => OK.has(r[PSTAT])).length;
+  const skipped = D.pkgs.filter((r) => r[PSTAT] === "s").length;
+  const nNF = newFails.length;
+
+  // ---- header -----------------------------------------------------------
+  document.title = "PkgEval — " + D.run.id;
+  $("runid").textContent = D.run.id;
+  $("runstatus").hidden = false;
+  const wallMs = Date.parse(D.run.finished || "") - Date.parse(D.run.created || "");
+  const wall = isNaN(wallMs) ? "" : `${Math.floor(wallMs / 3600000)}h ${Math.round((wallMs % 3600000) / 60000)}m`;
+  $("metaline").innerHTML =
+    `<span>submitted by <strong>${esc(D.run.submitter || "?")}</strong></span>` +
+    (D.run.trigger_url ? `<span>triggered from <a href="${esc(D.run.trigger_url)}">${esc(D.run.trigger_label)}</a></span>` : "") +
+    `<span>started <strong>${esc((D.run.created || "?").replace("T", " ").replace("Z", " UTC"))}</strong></span>` +
+    (wall ? `<span>finished in <strong>${wall}</strong></span>` : "");
+
+  // ---- comparison strip -------------------------------------------------
+  const buildCard = (role, b, isPrimary) => {
+    const label = b.repo && isSha(b.sha) ? `${b.repo}#${short(b.sha)}` : (b.julia || "nightly");
+    const inner = b.repo && isSha(b.sha)
+      ? `<a href="https://github.com/${esc(b.repo)}/commit/${esc(b.sha)}">${esc(label)}</a>`
+      : `<span>${esc(label)}</span>`;
+    return `<div class="build ${isPrimary ? "primary" : ""}">
+      <div class="role">${role}</div>
+      <div class="sha mono">${inner}</div>
+      <div class="flags">${(b.flags || []).map((f) => `<span class="flag">${esc(f)}</span>`).join("")}</div>
+    </div>`;
+  };
+  if (hasAgainst) {
+    const cmp = D.run.primary.repo && D.run.against.repo &&
+                isSha(D.run.primary.sha) && isSha(D.run.against.sha)
+      ? `<a href="https://github.com/${esc(D.run.against.repo)}/compare/${esc(D.run.against.sha)}...${
+           D.run.primary.repo === D.run.against.repo ? "" : esc(D.run.primary.repo) + ":"}${esc(D.run.primary.sha)}">diff ↗</a>`
+      : "";
+    $("vscard").innerHTML =
+      buildCard("primary — the change being tested", D.run.primary, true) +
+      `<div class="vs-mid"><span class="vs">VS</span>${cmp}</div>` +
+      buildCard("against — the baseline", D.run.against, false);
+  } else {
+    $("vscard").classList.add("single");
+    $("vscard").innerHTML = buildCard("evaluated build", D.run.primary, true);
+  }
+
+  // ---- verdict + tiles --------------------------------------------------
+  const v = $("verdict");
+  if (nNF === 0) {
+    v.classList.add("ok");
+    v.innerHTML = `<span class="count">0</span><span class="what">${hasAgainst ? "new package failures" : "package failures"}
+      <span class="sub">${hasAgainst ? "nothing regressed relative to the baseline" : "every evaluated package passed or was skipped"}</span></span>`;
+  } else {
+    v.innerHTML = `<span class="count">${fmtInt(nNF)}</span><span class="what">possible ${hasAgainst ? "new " : ""}issue${nNF === 1 ? "" : "s"}
+      <span class="sub">${hasAgainst ? "packages that failed on primary but passed on the baseline" : "packages that failed on this build"}</span></span>`;
+  }
+  const tiles = hasAgainst ? [
+    { v: fmtInt(nNF), l: "new failures", cls: "crit", target: "nf-groups" },
+    { v: fmtInt(nowPassing.length), l: "now passing", cls: "good", target: "grp-nowpass" },
+    { v: fmtInt(stillFailing.length), l: "failed on both", cls: "", target: "grp-stillfail" },
+    { v: fmtInt(passed), l: "passed on primary", cls: "", target: null },
+    { v: fmtInt(skipped), l: "skipped", cls: "", target: null },
+  ] : [
+    { v: fmtInt(nNF), l: "failures", cls: "crit", target: "nf-groups" },
+    { v: fmtInt(passed), l: "passed", cls: "good", target: null },
+    { v: fmtInt(skipped), l: "skipped", cls: "", target: null },
+  ];
+  $("tiles").innerHTML = tiles.map((t) =>
+    `<button class="tile ${t.cls}" ${t.target ? `data-target="${t.target}"` : "disabled"}>
+       <span class="v">${t.v}</span><span class="l">${t.l}</span></button>`).join("");
+  $("tiles").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-target]");
+    if (!b) return;
+    const el = $(b.dataset.target);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  const costStr = D.run.cost > 0
+    ? (D.run.cost_partial ? `at least $${D.run.cost.toFixed(2)}` : `$${D.run.cost.toFixed(2)}`) : "";
+  $("runfacts").innerHTML =
+    `<span><b>${fmtInt(D.run.total_jobs)}</b> jobs on <b>${fmtInt(D.pkgs.length)}</b> packages</span>` +
+    (D.run.cpu_hours ? `<span><b>${fmtInt(Math.round(D.run.cpu_hours))}</b> h of CPU time${wall ? ` in <b>${wall}</b> wall clock` : ""}</span>` : "") +
+    (costStr ? `<span>estimated compute cost <b>${costStr}</b> (EC2 spot, job time only)</span>` : "");
+
+  // ---- rerun command ----------------------------------------------------
+  if (nNF > 0) {
+    const names = newFails.map((r) => `"${r[0]}"`).join(", ");
+    const vs = hasAgainst && isSha(D.run.against.sha) ? `, vs = "@${D.run.against.sha}"` : "";
+    const cmd = `@${D.run.bot || "pkgeval"} runtests([${names}]${vs})`;
+    $("rerun-cmd").textContent = cmd;
+    $("copy-rerun").addEventListener("click", () => {
+      navigator.clipboard.writeText(cmd).then(() => {
+        $("copy-rerun").textContent = "Copied";
+        setTimeout(() => { $("copy-rerun").textContent = "Copy"; }, 1600);
+      });
+    });
+  } else {
+    $("rerun-block").hidden = true;
+  }
+  if (!hasAgainst) {
+    $("nf-title").firstChild.textContent = "Failures ";
+    $("nf-lede").textContent = "Packages that failed on this build — grouped by why they failed, most severe first.";
+  }
+
+  // ---- rows + groups ----------------------------------------------------
+  const badge = (st, ri, withReason) => {
+    const s = ST[st] || { label: st, icon: "?", cls: "st-s" };
+    return `<span class="sbadge ${s.cls}" title="${esc(withReason && ri >= 0 ? reasonMsg(ri) : s.label)}">
+      <span class="ic">${s.icon}</span>${s.label}</span>`;
+  };
+  const rowHTML = (r) => {
+    const name = r[0], pl = plog(r), al = alog(r);
+    const pd = fmtDur(r[PDUR]), ad = fmtDur(r[ADUR]);
+    return `<div class="row">
+      <div class="pkg">${pl ? `<a href="${pl}" class="mono">${esc(name)}</a>` : `<span class="mono">${esc(name)}</span>`}
+        ${r[1] ? `<span class="ver">v${esc(r[1])}</span>` : ""}</div>
+      <div class="side">${badge(r[PSTAT], r[PREASON], true)}
+        ${pd ? `<span class="dur">${pd}</span>` : ""}
+        ${pl ? `<a class="lg" href="${pl}">log</a>` : ""}</div>
+      ${hasAgainst && r[ASTAT] ? `<div class="side"><span class="arr">baseline:</span> ${badge(r[ASTAT], r[AREASON], true)}
+        ${ad ? `<span class="dur">${ad}</span>` : ""}
+        ${al ? `<a class="lg" href="${al}">log</a>` : ""}</div>` : "<div></div>"}
+    </div>`;
+  };
+
+  // ---- triage state (persisted per run in this browser) -----------------
+  const TRIAGE_KEY = "pkgeval-triage-" + D.run.id;
+  let triaged;
+  try { triaged = new Set(JSON.parse(localStorage.getItem(TRIAGE_KEY) || "[]")); }
+  catch (e) { triaged = new Set(); }
+  const nfNames = new Set(newFails.map((r) => r[0]));
+  const saveTriage = () => {
+    try { localStorage.setItem(TRIAGE_KEY, JSON.stringify([...triaged])); } catch (e) {}
+    updateTriageBar();
+  };
+
+  const depsOf = (name) => (D.deps && D.deps[name]) || 0;
+  const richRowHTML = (r) => {
+    const name = r[0], pl = plog(r), al = alog(r);
+    const pd = fmtDur(r[PDUR]), ad = fmtDur(r[ADUR]);
+    const done = triaged.has(name);
+    const dt = depsOf(name);
+    return `<div class="rowx ${done ? "triaged" : ""}" data-pkg="${esc(name)}">
+      <input type="checkbox" ${done ? "checked" : ""} aria-label="Mark ${esc(name)} triaged">
+      <div class="pkg">${pl ? `<a href="${pl}" class="mono">${esc(name)}</a>` : `<span class="mono">${esc(name)}</span>`}
+        ${r[1] ? `<span class="ver">v${esc(r[1])}</span>` : ""}
+        ${r[AVER] ? `<span class="vchange" title="A different package version was evaluated on each build — the registry moved between jobs. The failure may come from the package release, not Julia.">⚠ v${esc(r[AVER])} on baseline</span>` : ""}
+        ${dt ? `<span class="deps" title="${fmtInt(dt)} transitive dependents in the registry">${fmtDeps(dt)} deps</span>` : ""}</div>
+      <div class="side">${badge(r[PSTAT], r[PREASON], true)}
+        ${pd ? `<span class="dur">${pd}</span>` : ""}
+        ${pl ? `<a class="lg" href="${pl}">log</a>` : ""}</div>
+      ${hasAgainst && r[ASTAT] ? `<div class="side"><span class="arr">baseline:</span> ${badge(r[ASTAT], r[AREASON], true)}
+        ${ad ? `<span class="dur">${ad}</span>` : ""}
+        ${al ? `<a class="lg" href="${al}">log</a>` : ""}</div>` : "<div></div>"}
+      <button class="expand-btn" type="button" aria-expanded="false" title="Show log tail">▼</button>
+    </div>`;
+  };
+
+  const CHUNK = 250;
+  const renderRows = (container, rows, from, renderer) => {
+    const rfn = renderer || rowHTML;
+    const upto = Math.min(rows.length, from + CHUNK);
+    const html = rows.slice(from, upto).map(rfn).join("");
+    const btn = container.querySelector(".more-btn");
+    if (btn) btn.remove();
+    container.insertAdjacentHTML("beforeend", html);
+    if (upto < rows.length) {
+      container.insertAdjacentHTML("beforeend",
+        `<button class="more-btn" type="button">Show ${fmtInt(Math.min(CHUNK, rows.length - upto))} more of ${fmtInt(rows.length - upto)}</button>`);
+      container.querySelector(".more-btn").addEventListener("click", () => renderRows(container, rows, upto, rfn));
+    }
+  };
+
+  // group rows by (status, reason) of one side, ordered by reason severity
+  const groupBy = (rows, statIdx, reasonIdx) => {
+    const m = new Map();
+    for (const r of rows) {
+      const key = r[statIdx] + ":" + r[reasonIdx];
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(r);
+    }
+    return [...m.entries()]
+      .map(([key, rs]) => {
+        const [st, ri] = [key.split(":")[0], parseInt(key.split(":")[1], 10)];
+        rs.sort((a, b) => a[0].localeCompare(b[0]));
+        return { st, ri, rows: rs };
+      })
+      .sort((a, b) => reasonSev(a.ri) - reasonSev(b.ri) || (b.rows.length - a.rows.length));
+  };
+
+  const groupHTML = (g, open) => {
+    const title = g.ri >= 0 ? reasonMsg(g.ri) : (OK.has(g.st) ? "passed" : "no reason recorded");
+    return `<details class="group" ${open ? "open" : ""}>
+      <summary>${badge(g.st, -1, false)} ${esc(title[0].toUpperCase() + title.slice(1))}
+        <span class="n">${fmtInt(g.rows.length)}</span></summary>
+      <div class="rows" data-pending="1"></div>
+    </details>`;
+  };
+
+  const wireGroup = (details, g, extraHTML, renderer) => {
+    const fill = () => {
+      const rc = details.querySelector(".rows");
+      if (!rc || !rc.dataset.pending) return;
+      delete rc.dataset.pending;
+      if (extraHTML) rc.insertAdjacentHTML("beforebegin", extraHTML);
+      renderRows(rc, g.rows, 0, renderer);
+    };
+    if (details.open) fill();
+    details.addEventListener("toggle", () => { if (details.open) fill(); });
+  };
+
+  // ---- new failures section --------------------------------------------
+  const nfGroups = groupBy(newFails, PSTAT, PREASON);
+  if (D.deps) {
+    for (const g of nfGroups)
+      g.rows.sort((a, b) => depsOf(b[0]) - depsOf(a[0]) || a[0].localeCompare(b[0]));
+  }
+  $("nf-count").textContent = fmtInt(nNF) + " packages";
+
+  // shared failure signatures: rendered only when the report pipeline
+  // provides them (optional post-processing step)
+  let nfSig = null;
+  const sigOf = (name) => (D.nfsig && name in D.nfsig ? D.nfsig[name] : -1);
+  if (D.sigs && D.sigs.length && D.nfsig) {
+    const hardFails = newFails.filter((r) => r[PSTAT] === "f" || r[PSTAT] === "c");
+    const nSingles = hardFails.filter((r) => sigOf(r[0]) === -1 ||
+      (D.sigs[sigOf(r[0])] && D.sigs[sigOf(r[0])].n === 1)).length;
+    const multi = D.sigs.map((s, i) => ({ ...s, i })).filter((s) => s.n > 1);
+    if (hardFails.length && multi.length) {
+      $("sigpanel").hidden = false;
+      $("sigpanel").innerHTML =
+        `<div class="sp-head">Shared failure signatures — the first meaningful error line of each failing log,
+          clustered across the ${fmtInt(hardFails.length)} hard failures. Click to filter.</div>` +
+        multi.map((s) =>
+          `<button class="sigrow" type="button" data-sig="${s.i}" aria-pressed="false">
+             <span class="cnt">${s.n}</span><span class="sg">${esc(s.label)}</span></button>`).join("") +
+        `<button class="sigrow rest" type="button" data-sig="-1" aria-pressed="false">
+           <span class="cnt">${nSingles}</span><span class="sg">package-specific failures — no error line shared with another package</span></button>`;
+      $("sigpanel").addEventListener("click", (e) => {
+        const b = e.target.closest(".sigrow");
+        if (!b) return;
+        const val = parseInt(b.dataset.sig, 10);
+        nfSig = nfSig === val ? null : val;
+        for (const el of $("sigpanel").querySelectorAll(".sigrow"))
+          el.setAttribute("aria-pressed", String(parseInt(el.dataset.sig, 10) === nfSig));
+        nfRender();
+      });
+    }
+  }
+  const sigMatches = (r) => {
+    if (nfSig === null) return true;
+    if (r[PSTAT] !== "f" && r[PSTAT] !== "c") return false;
+    const si = sigOf(r[0]);
+    if (nfSig === -1) return si === -1 || (D.sigs[si] && D.sigs[si].n === 1);
+    return si === nfSig;
+  };
+
+  const present = [...new Set(newFails.map((r) => r[PSTAT]))];
+  const chipOrder = ["c", "f", "k", "e"];
+  $("nf-chips").innerHTML = chipOrder.filter((s) => present.includes(s)).map((s) =>
+    `<button class="chip" type="button" aria-pressed="false" data-st="${s}">
+       <span class="dot ${ST[s].cls}" style="background: currentColor;"></span>${ST[s].label}
+       (${newFails.filter((r) => r[PSTAT] === s).length})</button>`).join(" ");
+
+  let nfQuery = "", nfStatus = null, hideTriaged = false;
+  const nfRender = () => {
+    const q = nfQuery.toLowerCase();
+    const host = $("nf-groups");
+    host.innerHTML = "";
+    let shown = 0;
+    nfGroups.forEach((g) => {
+      if (nfStatus && g.st !== nfStatus) return;
+      const rows = g.rows.filter((r) =>
+        (!q || r[0].toLowerCase().includes(q)) && sigMatches(r) &&
+        !(hideTriaged && triaged.has(r[0])));
+      if (!rows.length) return;
+      shown += rows.length;
+      const gg = { ...g, rows };
+      host.insertAdjacentHTML("beforeend", groupHTML(gg, true));
+      const details = host.lastElementChild;
+      let extra = "";
+      if (hasAgainst && g.ri >= 0 && reasonCode(g.ri) === "time_limit" && !q && nfSig === null)
+        extra = histogramHTML(rows);
+      wireGroup(details, gg, extra, richRowHTML);
+    });
+    if (!shown) host.innerHTML = `<div class="group"><div class="empty-note">No failures match.</div></div>`;
+  };
+  $("nf-search").addEventListener("input", (e) => { nfQuery = e.target.value.trim(); nfRender(); });
+  $("nf-chips").addEventListener("click", (e) => {
+    const c = e.target.closest(".chip");
+    if (!c) return;
+    nfStatus = nfStatus === c.dataset.st ? null : c.dataset.st;
+    for (const el of $("nf-chips").children) el.setAttribute("aria-pressed", String(el.dataset.st === nfStatus));
+    nfRender();
+  });
+
+  // triage interactions
+  const updateTriageBar = () => {
+    const n = [...triaged].filter((p) => nfNames.has(p)).length;
+    $("triage-count").textContent = `${n} of ${fmtInt(nNF)} triaged`;
+    $("triage-fill").style.width = (nNF ? (100 * n / nNF) : 0) + "%";
+  };
+  updateTriageBar();
+  $("hide-triaged").addEventListener("change", (e) => { hideTriaged = e.target.checked; nfRender(); });
+  $("nf-groups").addEventListener("change", (e) => {
+    if (e.target.type !== "checkbox") return;
+    const row = e.target.closest(".rowx");
+    if (!row) return;
+    if (e.target.checked) triaged.add(row.dataset.pkg); else triaged.delete(row.dataset.pkg);
+    row.classList.toggle("triaged", e.target.checked);
+    saveTriage();
+    if (hideTriaged && e.target.checked) setTimeout(nfRender, 150);
+  });
+
+  // log-tail drawer: fetched on demand from the bucket (same origin)
+  const ANSI = /\x1b\[[0-9;]*[A-Za-z]|\r/g;
+  const GENERIC = ["Some tests did not pass", "errored during testing", "/proc/self/stat",
+                   "failed process", "Test run finished", "ProcessExited"];
+  // the full (cleaned) tail plus the index of the first line worth jumping to
+  const analyzeTail = (text) => {
+    const lines = text.replace(ANSI, "").split("\n");
+    let hit = -1;
+    const prio = [/Assertion .* failed/, /Internal error:/, /Unreachable reached/, /GC error/,
+                  /ERROR: Method overwriting is not permitted/];
+    outer:
+    for (let i = 0; i < lines.length; i++) {
+      for (const rx of prio) if (rx.test(lines[i])) { hit = i; break outer; }
+    }
+    if (hit < 0) {
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i].trimStart();
+        if ((l.startsWith("ERROR: ") || l.startsWith("UNHANDLED TASK ERROR: ")) &&
+            !GENERIC.some((gskip) => l.includes(gskip))) { hit = i; break; }
+      }
+    }
+    if (hit < 0) hit = lines.findIndex((l) => l.includes("Test Failed at"));
+    return { lines, hit };
+  };
+  const issueURL = (name, r) => {
+    const p = D.run.primary, a = D.run.against;
+    const repo = (p.repo && p.repo.length) ? p.repo : "JuliaLang/julia";
+    const stLabel = (ST[r[PSTAT]] || { label: r[PSTAT] }).label;
+    const title = `[PkgEval] ${name}${r[1] ? " v" + r[1] : ""}: ${stLabel} on ${short(p.sha || p.julia || "primary")}`;
+    const body = [
+      `PkgEval run [${D.run.id}](${D.run.bucket}/runs/${D.run.id}/report/report.html): ` +
+        `**${name}** ${r[1] ? "v" + r[1] + " " : ""}${stLabel}s on primary` +
+        (hasAgainst ? ` but passed on the baseline.` : `.`),
+      ``, ...(plog(r) ? [`- [primary log](${plog(r)})`] : []),
+      ...(alog(r) ? [`- [baseline log](${alog(r)})`] : []),
+      ...(hasAgainst && p.repo && a.repo && isSha(p.sha) && isSha(a.sha)
+        ? [`- [commit range](https://github.com/${a.repo}/compare/${a.sha}...${
+             p.repo === a.repo ? "" : p.repo + ":"}${p.sha})`] : []),
+      ...(r[PREASON] >= 0 ? [``, `Reason: ${reasonMsg(r[PREASON])}`] : []),
+    ].join("\n");
+    return `https://github.com/${repo}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  };
+  $("nf-groups").addEventListener("click", async (e) => {
+    const btn = e.target.closest(".expand-btn");
+    if (!btn) return;
+    const row = btn.closest(".rowx");
+    const open = btn.getAttribute("aria-expanded") === "true";
+    btn.setAttribute("aria-expanded", String(!open));
+    btn.textContent = open ? "▼" : "▲";
+    if (open) {
+      const drawer = row.querySelector(".taildrawer");
+      if (drawer) drawer.remove();
+      return;
+    }
+    const name = row.dataset.pkg;
+    const r = D.pkgs.find((p) => p[0] === name);
+    row.insertAdjacentHTML("beforeend",
+      `<div class="taildrawer"><pre>fetching log tail…</pre>
+        <div class="actions">
+          ${plog(r) ? `<a href="${plog(r)}">full primary log ↗</a>` : ""}
+          ${alog(r) ? `<a href="${alog(r)}">baseline log ↗</a>` : ""}
+          <a href="${issueURL(name, r)}">file an issue ↗</a>
+        </div></div>`);
+    const pre = row.querySelector(".taildrawer pre");
+    if (!plog(r)) { pre.textContent = "(no log was recorded for this job)"; return; }
+    try {
+      let resp = await fetch(plog(r), { headers: { Range: "bytes=-65536" } });
+      // some hosts (unlike S3) reject suffix ranges past EOF; take the whole log
+      if (resp.status === 416) resp = await fetch(plog(r));
+      if (!resp.ok && resp.status !== 206) throw new Error("HTTP " + resp.status);
+      const partial = resp.status === 206;
+      const { lines, hit } = analyzeTail(await resp.text());
+      if (!lines.some((l) => l.trim())) { pre.textContent = "(log is empty)"; return; }
+      if (hit >= 0) {
+        pre.innerHTML = lines.map((l, i) => (i === hit ? `<mark>${esc(l)}</mark>` : esc(l))).join("\n");
+        const mark = pre.querySelector("mark");
+        if (mark) pre.scrollTop = Math.max(0, mark.offsetTop - pre.offsetTop - 80);
+      } else {
+        pre.textContent = lines.join("\n");
+        pre.scrollTop = pre.scrollHeight;
+      }
+      if (partial) pre.insertAdjacentHTML("afterend",
+        `<div class="note">last 64 KB of the log, scrolled to the first error — open the full log for everything</div>`);
+    } catch (err) {
+      pre.textContent = "(could not fetch the log tail here — use the full-log links below)";
+    }
+  });
+
+  // copy triage summary as markdown for the release-tracking issue
+  $("copy-triage").addEventListener("click", () => {
+    const lines = [`### PkgEval ${D.run.id} — new-failure triage`, ""];
+    for (const g of nfGroups) {
+      const title = g.ri >= 0 ? reasonMsg(g.ri) : "no reason recorded";
+      lines.push(`**${title[0].toUpperCase() + title.slice(1)} (${g.rows.length})**`);
+      for (const r of g.rows) {
+        const name = r[0];
+        lines.push(`- [${triaged.has(name) ? "x" : " "}] ${name}${r[1] ? " v" + r[1] : ""} — ` +
+          (plog(r) ? `[primary](${plog(r)})` : "no log") +
+          (alog(r) ? ` / [baseline](${alog(r)})` : ""));
+      }
+      lines.push("");
+    }
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      $("copy-triage").textContent = "Copied";
+      setTimeout(() => { $("copy-triage").textContent = "Copy triage summary"; }, 1600);
+    });
+  });
+
+  // ---- histogram of baseline durations for time-limit kills -------------
+  function histogramHTML(rows) {
+    const durs = rows.map((r) => r[ADUR]).filter((d) => d > 0);
+    if (durs.length < 5) return "";
+    const limit = D.run.time_limit || 2700;
+    const nbins = 9, w = 660, h = 110, padL = 6, padB = 18, padT = 14;
+    const bins = new Array(nbins).fill(0);
+    for (const dv of durs) bins[Math.min(nbins - 1, Math.floor(dv / (limit / nbins)))]++;
+    const max = Math.max(...bins);
+    const bw = (w - padL) / nbins;
+    let bars = "", labels = "";
+    bins.forEach((n, i) => {
+      const bh = max ? Math.round((h - padB - padT) * n / max) : 0;
+      const x = padL + i * bw, y = h - padB - bh;
+      const lo = Math.round(i * limit / nbins / 60), hi = Math.round((i + 1) * limit / nbins / 60);
+      bars += `<rect class="bar" x="${x + 1}" y="${y}" width="${bw - 3}" height="${bh}" rx="3">
+        <title>${n} package${n === 1 ? "" : "s"} ran ${lo}–${hi} min on the baseline</title></rect>`;
+      if (n > 0) labels += `<text class="blabel" x="${x + bw / 2 - 1}" y="${y - 4}" text-anchor="middle">${n}</text>`;
+    });
+    const nticks = 4;
+    const axis = Array.from({ length: nticks }, (_, i) => {
+      const frac = i / (nticks - 1), t = Math.round(frac * limit / 60);
+      const anchor = i === 0 ? "start" : i === nticks - 1 ? "end" : "middle";
+      return `<text x="${padL + frac * (w - padL) + (i === 0 ? 2 : i === nticks - 1 ? -2 : 0)}" y="${h - 4}"
+             text-anchor="${anchor}">${t} min</text>`;
+    }).join("");
+    return `<div class="hist">
+      <div class="cap">How long these packages ran on the <b>baseline</b> before the same tests hit the
+        ${Math.round(limit / 60)}-minute limit on primary — packages near the right edge were already close to timing out.</div>
+      <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Histogram of baseline test durations for packages killed by the time limit">
+        ${bars}<line class="base" x1="${padL}" y1="${h - padB}" x2="${w}" y2="${h - padB}"></line>
+        <g class="axis">${axis}</g>${labels}
+      </svg>
+    </div>`;
+  }
+
+  nfRender();
+
+  // ---- performance signal ----------------------------------------------
+  if (hasAgainst) {
+    let n = 0, ge2 = 0;
+    const top = [];
+    for (const r of D.pkgs) {
+      if (!OK.has(r[PSTAT]) || !OK.has(r[ASTAT])) continue;
+      const pd = r[PDUR], ad = r[ADUR];
+      if (ad >= 30 && pd > 0) {
+        n++;
+        const ratio = pd / ad;
+        if (ratio >= 2) ge2++;
+        if (ad >= 60 && ratio >= 1.5) top.push([r, ratio]);
+      }
+    }
+    if (top.length) {
+      top.sort((a, b) => b[1] - a[1]);
+      const rows = top.slice(0, 25);
+      $("slow-block").hidden = false;
+      $("slow-lede").innerHTML =
+        `Test-suite durations compared for packages that <b>passed on both builds</b> (baseline ≥ 30 s): ` +
+        `<b>${fmtInt(ge2)}</b> of ${fmtInt(n)} took over 2× longer on primary. The biggest slowdowns, by ratio:`;
+      const maxr = rows[0][1];
+      $("slow-table").innerHTML = `<table class="slowtable">
+        <thead><tr><th>Package</th><th style="text-align: right">baseline</th>
+          <th style="text-align: right">primary</th><th style="text-align: right">slowdown</th><th style="width: 30%"></th></tr></thead>
+        <tbody>` + rows.map(([r, ratio]) => {
+          const name = r[0], ver = r[1], pd = r[PDUR], ad = r[ADUR], pl = plog(r), al = alog(r);
+          return `<tr><td>${pl ? `<a class="mono" href="${pl}">${esc(name)}</a>` : `<span class="mono">${esc(name)}</span>`}
+               ${ver ? `<span class="ver" style="color: var(--ink-3); font-size: 12px"> v${esc(ver)}</span>` : ""}</td>
+           <td class="num">${fmtDur(ad)}${al ? `<a class="lg" href="${al}">log</a>` : ""}</td>
+           <td class="num">${fmtDur(pd)}${pl ? `<a class="lg" href="${pl}">log</a>` : ""}</td>
+           <td class="ratio">${ratio.toFixed(1)}×</td>
+           <td><div class="rbar" style="width: ${Math.max(3, Math.round(100 * ratio / maxr))}%"></div></td></tr>`;
+        }).join("") +
+        `</tbody></table>`;
+    }
+  }
+
+  // ---- other outcomes ---------------------------------------------------
+  if (hasAgainst && (nowPassing.length || stillFailing.length)) {
+    $("other-block").hidden = false;
+    const otherHost = $("other-groups");
+    const otherSections = [
+      { id: "grp-nowpass", title: "Now passing", n: nowPassing.length,
+        lede: "Passed on primary after failing on the baseline — grouped by why they failed before. " +
+              "Groups labelled “error” were baseline infrastructure problems, not real fixes.",
+        groups: groupBy(nowPassing, ASTAT, AREASON) },
+      { id: "grp-stillfail", title: "Failed on both builds", n: stillFailing.length,
+        lede: "Pre-existing breakage, not caused by this change — grouped by why they fail on primary.",
+        groups: groupBy(stillFailing, PSTAT, PREASON) },
+    ];
+    for (const s of otherSections) {
+      if (!s.n) continue;
+      otherHost.insertAdjacentHTML("beforeend",
+        `<h3 class="subhead" id="${s.id}">${esc(s.title)} <span class="n">${fmtInt(s.n)} packages</span></h3>
+         <p class="lede">${esc(s.lede)}</p>
+         <div id="${s.id}-groups"></div>`);
+      const host = document.getElementById(s.id + "-groups");
+      for (const g of s.groups) {
+        host.insertAdjacentHTML("beforeend", groupHTML(g, false));
+        wireGroup(host.lastElementChild, g, "");
+      }
+    }
+  }
+
+  // ---- lookup -----------------------------------------------------------
+  let lookupTimer = null;
+  $("lookup").addEventListener("input", (e) => {
+    clearTimeout(lookupTimer);
+    lookupTimer = setTimeout(() => {
+      const q = e.target.value.trim().toLowerCase();
+      const host = $("lookup-results");
+      if (q.length < 2) { host.innerHTML = ""; return; }
+      const hits = D.pkgs.filter((r) => r[0].toLowerCase().includes(q)).slice(0, 200);
+      if (!hits.length) { host.innerHTML = `<div class="group"><div class="empty-note">No package matches “${esc(q)}”.</div></div>`; return; }
+      host.innerHTML = `<div class="group"><div class="rows">${hits.map(rowHTML).join("")}</div></div>`;
+    }, 120);
+  });
+
+  // ---- footer -----------------------------------------------------------
+  $("foot").innerHTML =
+    `<span>run <span class="mono">${esc(D.run.id)}</span></span>` +
+    `<a href="report.md">report.md</a>` +
+    `<a href="db.json">db.json</a>` +
+    `<span>PkgEvalFarm — evaluates the Julia General registry against a Julia build</span>`;
+}
+</script>
+</body>
+</html>

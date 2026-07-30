@@ -209,6 +209,33 @@ try
         @test fetch_raw(PEF.report_key(RUN_ID, "report.md")) == report.markdown
         db = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "db.json")))
         @test length(db["jobs"]) == 6
+
+        # the interactive report: static page + compact dataset
+        html = fetch_raw(PEF.report_key(RUN_ID, "report.html"))
+        @test html == PEF.FarmBot.REPORT_HTML
+        @test occursin("PkgEval", html)
+        rj = JSON.parse(fetch_raw(PEF.report_key(RUN_ID, "report.json")))
+        @test rj["run"]["id"] == RUN_ID
+        @test rj["run"]["primary"]["repo"] == "JuliaLang/julia"
+        @test rj["run"]["primary"]["sha"] == "abc123"
+        @test rj["run"]["against"]["sha"] == "v1.12.0"  # not a repo#sha spec
+        @test rj["run"]["against"]["repo"] == ""
+        @test rj["run"]["total_jobs"] == 6
+        # rows: [name, ver, pstatus, preason, pdur, astatus, areason, adur, aver,
+        #        plogdir, alogdir]
+        rows = Dict(r[1] => r for r in rj["pkgs"])
+        @test length(rows) == 3
+        @test rows["JSON"][3] == "f" && rows["JSON"][6] == "t"      # the new failure
+        @test rows["JSON"][4] >= 0                                  # has a reason...
+        @test rj["reasons"][rows["JSON"][4] + 1][1] == "test_failures"
+        @test rows["Crayons"][3] == "c" && rows["Crayons"][6] == "c"  # fails on both
+        @test rows["Example"][3] == "t" && rows["Example"][6] == "t"
+        @test rows["Example"][2] == "1.2.3"
+        @test rows["Example"][9] == 0  # same version on both sides
+        @test rows["Example"][5] == 42  # duration in whole seconds
+        # log locations come from each job's log_key
+        @test rj["logdirs"][rows["JSON"][10] + 1] == "runs/$RUN_ID/logs/primary"
+        @test rj["logdirs"][rows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
     end
 
     @testset "worker error handling" begin
@@ -296,6 +323,20 @@ try
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
         @test run["completed_jobs"] == 4
+
+        # the report must point reused baseline logs at the donor run's prefix,
+        # and jobs recorded without a log get no location (-1)
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        PEF.FarmBot.generate_report(lite, run_id)
+        rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+            PEF.report_key(run_id, "report.json"),
+            Dict("return_raw" => true); aws_config=aws))))
+        rrows = Dict(r[1] => r for r in rj["pkgs"])
+        @test rj["logdirs"][rrows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
+        @test rrows["JSON"][10] == -1  # drained via JobResult without a log
     end
 
     @testset "fresh baseline opts out of reuse" begin
@@ -521,7 +562,7 @@ try
             @test edited[end].first == "700001"
             @test occursin("@keno: run `$run_id` finished", edited[end].second)
             @test occursin("no new package failures", edited[end].second)
-            @test occursin("report.md", edited[end].second)
+            @test occursin("report.html", edited[end].second)
 
             # 4. and does not double-report
             n_edited = length(edited)
