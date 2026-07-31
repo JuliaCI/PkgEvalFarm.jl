@@ -1625,6 +1625,11 @@ try
                 @test PEF.materialize_derivation_depot(artifacts, depot) == 2
                 @test read(joinpath(depot, "compiled", "v1.13", "Crayons", "Crayons_kk.ji"),
                            String) == "DEPJI"
+                # regression: zero artifacts (leaf package / deps in flight) must
+                # still create the depot — it becomes a bind-mount source
+                empty_depot = joinpath(mktempdir(), "depot")
+                @test PEF.materialize_derivation_depot([], empty_depot) == 0
+                @test isdir(empty_depot)
                 # a root that was never published is reported missing
                 _, _, missing2 = PEF.fetch_derivation_closure(sctx, ns, [(uuid, "12"^32)])
                 @test missing2 == ["12"^32]

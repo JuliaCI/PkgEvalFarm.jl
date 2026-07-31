@@ -232,6 +232,10 @@ end
 
 "Unpack fetched artifacts into a depot at the filenames their producers used."
 function materialize_derivation_depot(artifacts, depot::AbstractString)
+    # even with nothing to place (leaf package, or deps still in flight) the
+    # depot must exist: it becomes a bind-mount source, and mounting a
+    # nonexistent path crashed 162 derivations in the first fixed-pins run
+    mkpath(depot)
     n = 0
     for (meta, blob) in artifacts
         pair = unframe_pair(blob)
