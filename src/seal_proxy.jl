@@ -86,10 +86,16 @@ function get_kv(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
         nothing
     end
     body === nothing && return nothing
-    mkpath(dirname(local_path))
-    tmp = local_path * ".tmp.$(getpid()).$(objectid(current_task()))"
-    write(tmp, body)
-    mv(tmp, local_path; force=true)
+    try
+        mkpath(dirname(local_path))
+        tmp = local_path * ".tmp.$(getpid()).$(objectid(current_task()))"
+        write(tmp, body)
+        mv(tmp, local_path; force=true)
+    catch err
+        # the disk cache is an optimization; serving the fetched bytes is the
+        # job (seen live: an uncreatable cache dir turned every hit into a 500)
+        @warn "kv disk cache write failed; serving from memory" local_path err maxlog=1
+    end
     return body
 end
 
@@ -233,7 +239,17 @@ function start_seal_proxy!(ctx::FarmCtx)
     for attempt in 1:10
         port = rand(30001:40000)
         try
-            server = HTTP.serve!(handler, "127.0.0.1", port)
+            # a handler exception must degrade to a plain 500, not tear the
+            # connection down mid-request (clients treat both as misses, but
+            # 500s keep the failure visible and the connection reusable)
+            server = HTTP.serve!("127.0.0.1", port) do req
+                try
+                    handler(req)
+                catch err
+                    @warn "proxy request failed" target=req.target err
+                    HTTP.Response(500)
+                end
+            end
             break
         catch err
             attempt == 10 && rethrow()

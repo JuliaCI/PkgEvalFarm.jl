@@ -124,5 +124,23 @@ end
     @test !PEF.is_seal_job(PEF.JobRef("20260729-x", "primary", "Foo"))
     @test PEF.seal_id_of("seal-abc123") == "abc123"
 end
+@testset "derivation want pins" begin
+    # regression: want dep tuples have no `name` field (crashed 45 derivations
+    # live); pins must build from uuid+version alone, skipping unkeyables
+    want = PEF.parse_want_preimage(join(["v2", "julia=1+a", "name=X",
+        "uuid=aaaaaaaa-0000-0000-0000-000000000001", "version=1.0.0",
+        "tree=$("11"^20)", "flags=1", "prefs=0",
+        "dep=aaaaaaaa-0000-0000-0000-000000000002:1f:4.1.0:$("ab"^32)",
+        "dep=aaaaaaaa-0000-0000-0000-000000000003:2f:-:-"], "\n"))
+    pins = Dict{String,Any}("aaaaaaaa-0000-0000-0000-000000000004" =>
+        Dict("name" => "FromMeta", "uuid" => "aaaaaaaa-0000-0000-0000-000000000004",
+             "version" => "2.0.0"))
+    PEF.merge_want_pins!(pins, want)
+    @test length(pins) == 2                       # unkeyable "-" dep skipped
+    @test pins["aaaaaaaa-0000-0000-0000-000000000002"]["version"] == "4.1.0"
+    @test !haskey(pins["aaaaaaaa-0000-0000-0000-000000000002"], "name")
+    @test pins["aaaaaaaa-0000-0000-0000-000000000004"]["name"] == "FromMeta"
+end
 
 end # module
+

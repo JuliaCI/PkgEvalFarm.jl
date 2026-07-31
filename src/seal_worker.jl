@@ -275,16 +275,12 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                 roots = [(d.uuid, d.key) for d in want.deps]
                 artifacts, pins, missing_keys = fetch_derivation_closure(ctx, ns, roots)
                 # Not-yet-published deps are NOT a decline: the sandbox fetches
-                # them through the proxy, which holds each keyed GET while that
+                # them through the proxy, which holds each request while that
                 # key's derivation is in flight (dataflow ordering by blocking;
                 # the slot meanwhile donates, see maybe_donate!). Deps the want
                 # names still get version-pinned so resolution stays exact even
                 # before their artifacts land.
-                for d in want.deps
-                    (d.version == "-" || haskey(pins, d.uuid)) && continue
-                    pins[d.uuid] = Dict("name" => d.name, "uuid" => d.uuid,
-                                        "version" => d.version)
-                end
+                merge_want_pins!(pins, want)
                 isempty(missing_keys) ||
                     @info "deriving with deps in flight" key=first(job.package, 12) nmissing=length(missing_keys)
                 begin
@@ -359,6 +355,19 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         release_job(ctx, claimed)
     end
     return
+end
+
+"""
+Version-pin a want's direct deps into `pins` (uuid keyed). Want dep lines
+carry no package *name* — PackageSpec pins fine on uuid+version alone —
+and unkeyable deps (version "-": stdlibs, dev) are not pinnable.
+"""
+function merge_want_pins!(pins::AbstractDict, want)
+    for d in want.deps
+        (d.version == "-" || haskey(pins, d.uuid)) && continue
+        pins[d.uuid] = Dict("uuid" => d.uuid, "version" => d.version)
+    end
+    return pins
 end
 
 "The unit's produced key from a derivation/seal export, or `nothing`."

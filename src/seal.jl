@@ -221,10 +221,14 @@ function fetch_seal_index(ctx::FarmCtx, seal_id::AbstractString, package::Abstra
         end
         return nothing
     end
-    mkpath(dirname(path))
-    tmp = path * ".tmp.$(getpid())"
-    write(tmp, body)
-    mv(tmp, path; force=true)   # concurrent fetchers write identical content
+    try
+        mkpath(dirname(path))
+        tmp = path * ".tmp.$(getpid())"
+        write(tmp, body)
+        mv(tmp, path; force=true)   # concurrent fetchers write identical content
+    catch err
+        @warn "index disk cache write failed; parsing from memory" path err maxlog=1
+    end
     return JSON.parse(String(body))
 end
 

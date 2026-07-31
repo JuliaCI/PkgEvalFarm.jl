@@ -39,6 +39,12 @@ rm -rf /tmp/awscliv2.zip /tmp/aws
 
 useradd --create-home --shell /bin/bash worker
 
+# local sealed-artifact cache (PKGEVAL_SEAL_CACHE in the unit environment):
+# /var/cache is root-owned and the worker cannot create this itself — without
+# it every proxy fetch EACCESes while persisting (seen live: a zero-hit run
+# with every artifact present in S3)
+install -d -o worker -g worker /var/cache/pkgeval-seal
+
 # PkgEval drives containers with `crun --systemd-cgroup`, which for a rootless
 # container asks the *user's* systemd (over its session D-Bus) to create the
 # transient scope. A `User=` system service has neither, so every container --
