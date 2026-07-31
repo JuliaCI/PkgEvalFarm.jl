@@ -48,6 +48,26 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
+  # Applies stay manual (tofu apply from a checkout), so this is the only
+  # automated gate the terraform sees: formatting, provider-schema validation,
+  # and regression guards for apply-time API limits we've hit (user-data size).
+  terraform:
+    name: Terraform checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          # no wrapper: check_userdata_size.sh captures raw `tofu console` output
+          tofu_wrapper: false
+      - run: tofu fmt -check -recursive -diff
+      - run: tofu init -backend=false -input=false
+      - run: tofu validate -no-color
+      - run: ./check_userdata_size.sh
+
   # Fast canary (~20s, no checkout/tests/build): answers "does the OIDC trust
   # policy authorize this workflow?" without waiting on the pipeline. Lives in
   # this file deliberately, so its job_workflow_ref matches the deploy job's.

@@ -163,9 +163,9 @@ resource "aws_iam_role_policy" "debug" {
         # report, flipping a stuck counter). Previously this required SSM'ing a
         # live worker for its role, which stops working the moment the fleet
         # scales to zero.
-        Sid    = "FixupFarmState"
-        Effect = "Allow"
-        Action = "dynamodb:UpdateItem"
+        Sid      = "FixupFarmState"
+        Effect   = "Allow"
+        Action   = "dynamodb:UpdateItem"
         Resource = [aws_dynamodb_table.runs.arn, aws_dynamodb_table.jobs.arn]
       },
       {

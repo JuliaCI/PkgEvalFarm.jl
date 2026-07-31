@@ -125,8 +125,8 @@ resource "aws_lambda_function" "bot" {
   # real work is tens of seconds even at this size's fractional vCPU — the
   # historical timeout was the quadratic-hashing stall (see FarmLite.hexdigest),
   # not the workload
-  memory_size   = 1024
-  timeout       = 300
+  memory_size = 1024
+  timeout     = 300
 
   # the function URL is publicly invokable (webhook auth is HMAC inside); real
   # concurrency needs are minimal (stream: one batch per shard, schedule:
