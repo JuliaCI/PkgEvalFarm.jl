@@ -194,6 +194,15 @@ derivation releases every holder as a 404, at which point a local compile
 is correct rather than a compromise. Dead derivation items are re-armed by
 a fresh identical want rather than acting as tombstones.
 
+Derivation sandboxes are the one place the fetch hook is *not* installed
+(`PKGEVAL_CACHE_FETCH=0`; the client still loads to emit produced keys).
+Everything published is already materialized into the derivation's depot,
+so an in-sandbox fetch could only target unpublished keys — and holding on
+one deadlocks the derivation against the very publication it (or a donor
+sibling) is supposed to perform. Derivations compile missing deps locally;
+chains still converge because each hold-releasing publication triggers the
+requester's next want, dep-before-dependent.
+
 There is no global switch. Expansion decides the scheme per configuration —
 "protocol" iff the julia under test carries `Base.CACHE_FETCH_HOOK`, detected
 by running it *sandboxed* (never on the host: detection carries exactly the

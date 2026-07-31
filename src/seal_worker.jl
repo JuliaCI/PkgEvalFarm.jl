@@ -303,7 +303,13 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                             mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
                             env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT,
                                      "PKGEVAL_CACHE_SERVER" => proxy_url(),
-                                     "PKGEVAL_CACHE_NAMESPACE" => ns))
+                                     "PKGEVAL_CACHE_NAMESPACE" => ns,
+                                     # no fetch hook: everything published is
+                                     # already in the depot, and holding on an
+                                     # unpublished key deadlocks the derivation
+                                     # against itself (seen live: TestEnv derive
+                                     # + 5 test jobs all inactivity-killed)
+                                     "PKGEVAL_CACHE_FETCH" => "0"))
                     log = r.log === missing ? "" : String(r.log)
                     if String(r.status) == "derive"
                         unit_uuid = try
