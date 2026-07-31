@@ -228,7 +228,8 @@ resource "aws_launch_template" "ec2_worker" {
     }
   }
 
-  user_data = base64encode(templatefile("${path.module}/ec2_worker_userdata.sh.tpl", {
+  # gzipped: the 16KB user-data limit applies post-compression
+  user_data = base64gzip(templatefile("${path.module}/ec2_worker_userdata.sh.tpl", {
     region         = var.region
     queue_url      = aws_sqs_queue.jobs.url
     slow_queue_url = aws_sqs_queue.jobs_slow.url
