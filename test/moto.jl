@@ -284,13 +284,6 @@ try
         jobs = PEF.run_jobs(ctx, run_id)
         @test length(jobs) == 6
 
-        # the fan-out is published for the landing view's progress gauge; the
-        # 3 reused jobs never upload logs here, so the page needs the offset
-        expjson = JSON.parse(String(copy(S3.get_object(ctx.cfg.bucket,
-            PEF.report_key(run_id, "expand.json"), Dict("return_raw" => true);
-            aws_config=aws))))
-        @test expjson == Dict("total_jobs" => 6, "reused" => 3)
-
         # baseline reuse: the first run is `done` with an identical `against`
         # config (immutable spec v1.12.0), so its results transferred — those
         # jobs arrive pre-completed, pointing at the donor's logs, and only the
@@ -691,6 +684,32 @@ try
             n_edited6 = length(edited)
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
             @test length(posted) == 2 && length(edited) == n_edited6
+
+            # 6b. progress path: batched "active" counter bumps become the
+            #     public progress.json — last record per run wins; seal runs
+            #     and not-yet-expanded runs (total 0) write nothing
+            attr = PEF.FarmLite.attr
+            mkrec(id, done, total) = Dict("eventName" => "MODIFY",
+                "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(
+                    PEF.FarmLite.Item("run_id" => attr(id), "status" => attr("active"),
+                                      "completed_jobs" => attr(done),
+                                      "total_jobs" => attr(total))))))
+            progress_event = JSON.json(Dict("Records" => [
+                mkrec("gh-700777", 1, 6), mkrec("gh-700777", 2, 6),
+                mkrec("seal-abc123", 1, 3), mkrec("gh-700888", 0, 0)]))
+            @test JSON.parse(PEF.FarmBot.handle_event(progress_event, lite, gh))["ok"] == true
+            progjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key("gh-700777", "progress.json"), Dict("return_raw" => true);
+                aws_config=aws))))
+            @test progjson == Dict("done" => 2, "total" => 6)
+            no_object(key) = try
+                S3.get_object(cfg.bucket, key, Dict("return_raw" => true); aws_config=aws)
+                false
+            catch
+                true
+            end
+            @test no_object(PEF.report_key("seal-abc123", "progress.json"))
+            @test no_object(PEF.report_key("gh-700888", "progress.json"))
 
             # 7. an unrecognized event falls back to the scheduled poll
             notifications[] = "[]"

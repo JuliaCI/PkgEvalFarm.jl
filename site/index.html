@@ -582,7 +582,8 @@ async function recentRuns(bucket, params) {
       const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
       for (const p of xml.querySelectorAll("CommonPrefixes > Prefix")) {
         const m = /^runs\/([^/]+)\/$/.exec(p.textContent);
-        if (m) ids.push(m[1]);
+        // seal runs share the runs/ prefix but are internal machinery
+        if (m && !m[1].startsWith("seal-")) ids.push(m[1]);
       }
       token = xml.querySelector("IsTruncated")?.textContent === "true"
         ? xml.querySelector("NextContinuationToken")?.textContent : null;
@@ -613,7 +614,7 @@ async function recentRuns(bucket, params) {
   // probe the newest dozen: finished runs (report.json) get a verdict chip
   // and their outcome; unfinished ones carry a run.json instead (written at
   // submission, marked on failure), which moves live runs up into the
-  // in-progress section with a log-count progress gauge. Runs with neither
+  // in-progress section with a progress gauge. Runs with neither
   // stay bare — they predate run.json, or their submission's upload failed
   const runMeta = (run, id) => {
     const bits = [];
@@ -688,7 +689,7 @@ async function recentRuns(bucket, params) {
       .catch(() => rjson("run.json").then((run) => {
         if (run.failed) { renderFailed(id, run); return; }
         // live run: move its row up, gauge progress now, and each minute
-        // re-probe — first for a terminal state, else recount the logs
+        // re-probe — first for a terminal state, else refresh the gauge
         const row = metaEl(id).closest(".runidx-row");
         $("runidx-active-rows").appendChild(row);
         $("runidx-active").hidden = false;
@@ -716,42 +717,25 @@ const setChip = (id, cls, text) => {
   c.hidden = false;
 };
 
-// gauge an in-flight run's progress: count its uploaded logs (each finished
-// job writes one; reused baseline jobs never do, expand.json carries that
-// offset next to the fan-out total, which is absent while still expanding)
+// gauge an in-flight run's progress: the bot mirrors the run's job counters
+// into progress.json about once a minute (batched off the runs table's
+// stream), and the object's Last-Modified doubles as the activity clock
 async function liveProgress(bucket, id) {
-  const run = `${bucket}/runs/${encodeURIComponent(id)}`;
-  let logs = 0, latest = "";
-  let token = null;
-  do {
-    // no delimiter: all configs' logs in one (paginated) listing
-    const url = `${bucket}/?list-type=2&prefix=` +
-      encodeURIComponent(`runs/${id}/logs/`) +
-      (token ? `&continuation-token=${encodeURIComponent(token)}` : "");
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
-    for (const c of xml.querySelectorAll("Contents > LastModified")) {
-      logs++;
-      if (c.textContent > latest) latest = c.textContent;
-    }
-    token = xml.querySelector("IsTruncated")?.textContent === "true"
-      ? xml.querySelector("NextContinuationToken")?.textContent : null;
-  } while (token);
-  let done = logs, total = 0;
-  try {
-    const exp = await fetchJson(`${run}/report/expand.json`);
-    done += exp.reused || 0;
-    total = exp.total_jobs || 0;
-  } catch { /* still expanding */ }
+  const resp = await fetch(
+    `${bucket}/runs/${encodeURIComponent(id)}/report/progress.json`,
+    { cache: "no-cache" });
   const prog = document.querySelector(
     `.meta[data-run="${CSS.escape(id)}"] .runidx-prog`);
   if (!prog) return;
-  const ago = latest ? Math.round((Date.now() - Date.parse(latest)) / 60000) : null;
-  if (!total) {   // no expand.json yet: submitted, waiting for a worker
+  if (!resp.ok) {   // not written yet: submitted, waiting for a worker
     prog.querySelector(".n").textContent = "waiting for a worker to expand the run";
     return;
   }
+  const { done, total } = await resp.json();
+  const modified = resp.headers.get("Last-Modified");
+  const ago = modified
+    ? Math.round((Date.now() - Date.parse(modified)) / 60000) : null;
+  if (!total) return;
   setChip(id, "run", "running");
   prog.querySelector(".n").textContent = `${done} of ${total} jobs` +
     (ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`);

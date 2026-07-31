@@ -221,6 +221,30 @@ resource "aws_lambda_event_source_mapping" "bot_runs_stream" {
   depends_on = [aws_iam_role_policy.bot_stream]
 }
 
+# The dashboard's progress gauge: per-job counter bumps (status stays "active")
+# batched up to a minute become one public runs/<id>/report/progress.json write,
+# so live progress costs one farm-side PUT per minute of activity instead of
+# per-viewer S3 listings. Second consumer on the stream — DynamoDB supports two
+# per shard — so its batching window cannot delay the report path above.
+resource "aws_lambda_event_source_mapping" "bot_runs_progress" {
+  count             = local.bot_enabled
+  event_source_arn  = aws_dynamodb_table.runs.stream_arn
+  function_name     = aws_lambda_function.bot[0].arn
+  starting_position = "LATEST"
+  batch_size        = 10000
+  maximum_batching_window_in_seconds = 60
+
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        dynamodb = { NewImage = { status = { S = ["active"] } } }
+      })
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.bot_stream]
+}
+
 # --- Trigger 2b: the jobs DLQ ---------------------------------------------------
 # Messages the queue gave up on flow back into the bot, which records them as
 # error results (or fails the run, for expand messages) so runs still complete

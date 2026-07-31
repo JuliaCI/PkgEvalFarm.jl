@@ -1269,8 +1269,8 @@ report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_
 Public per-run submission record at `runs/<id>/report/run.json`: written at
 submission and rewritten with `failed_why` when the run fails, it is all the
 report page's landing view knows about a run that has no report.json yet
-(in flight, or failed before reporting). Workers add the job total next to it
-(expand.json, see `expand_run`) once the fan-out is known.
+(in flight, or failed before reporting). The job counters land next to it in
+progress.json (see `publish_progress`) once a worker expands the run.
 """
 function publish_run_json(ctx::LiteCtx, run_id::String, submitter::String,
                           created::String, context_json::String, configs_json::String;
@@ -1304,6 +1304,23 @@ publish_run_json(ctx::LiteCtx, run::Item; failed_why::Union{Nothing,String}=noth
     publish_run_json(ctx, str(run, "run_id"), str(run, "submitter", "?"),
                      str(run, "created_at", ""), str(run, "context", "{}"),
                      str(run, "configs", "[]"); failed_why)
+
+"""
+Mirror a live run's job counters to the public `progress.json` the dashboard's
+gauge reads (its Last-Modified doubles as the activity clock). Driven by the
+batched stream mapping on the runs table, so it refreshes about once a minute
+while jobs are completing and costs nothing when they aren't.
+"""
+function publish_progress(ctx::LiteCtx, run_id::String, run::Item)
+    # seal runs share the runs table but are internal: no dashboard entry
+    (isempty(run_id) || startswith(run_id, "seal-")) && return nothing
+    total = int(run, "total_jobs", 0)
+    total > 0 || return nothing   # not expanded yet
+    done = int(run, "completed_jobs", 0)
+    s3_put(ctx, report_key(run_id, "progress.json"),
+           "{\"done\":$done,\"total\":$total}"; content_type="application/json")
+    return nothing
+end
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1926,9 +1943,10 @@ end
 
 ## Lambda event dispatch
 #
-# One Lambda, three triggers:
+# One Lambda, several triggers:
 #   - Function URL: GitHub `issue_comment` webhooks (HMAC-verified) -> handle_command
-#   - DynamoDB stream on the runs table (filtered to status = "done") -> post report
+#   - DynamoDB stream on the runs table, twice: terminal statuses -> post report,
+#     batched "active" counter bumps -> refresh the dashboard's progress.json
 #   - EventBridge schedule (infrequent fallback) -> full notifications poll
 #
 # The webhook payload carries the comment/issue/repo inline, so the webhook path
@@ -2121,13 +2139,21 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         # runs that just reached a terminal state (the event source mapping
         # filters on status). Runs failed via mark_run_failed carry `reported`
         # already, so report_failed_run's claim quietly skips them here.
+        # "active" records are the other mapping's batched counter bumps: only
+        # the newest per run matters, and it becomes the public progress.json.
+        latest = Dict{String,Item}()
         for run in event.new_images
             status = str(run, "status", "")
             if status == "done"
                 report_finished_run(ctx, gh, run)
             elseif status == "failed"
                 report_failed_run(ctx, gh, run)
+            elseif status == "active"
+                latest[str(run, "run_id", "")] = run   # records arrive in stream order
             end
+        end
+        for (run_id, run) in latest
+            publish_progress(ctx, run_id, run)
         end
         return "{\"ok\":true}"
     elseif event.method !== nothing

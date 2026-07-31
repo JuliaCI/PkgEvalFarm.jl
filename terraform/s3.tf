@@ -48,19 +48,6 @@ locals {
             "s3:delimiter" = "/"
           }
         }
-      },
-      # ... and gauges an in-flight run's progress by counting its uploaded
-      # logs, so listing below a run's logs/ prefix is anonymous too (the log
-      # objects themselves are public above; nothing else becomes visible)
-      {
-        Sid       = "PublicListRunLogs"
-        Effect    = "Allow"
-        Principal = "*"
-        Action    = "s3:ListBucket"
-        Resource  = aws_s3_bucket.results.arn
-        Condition = {
-          StringLike = { "s3:prefix" = "runs/*/logs/*" }
-        }
       }
     ] : [],
     [

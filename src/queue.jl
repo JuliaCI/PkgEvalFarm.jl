@@ -366,20 +366,6 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
             rethrow()
         end
     end
-    # a public record of the fan-out for the report page's landing view, which
-    # gauges an in-flight run's progress by counting uploaded logs against
-    # total_jobs (reused baseline jobs never upload logs here, hence the
-    # offset). Create-only like every worker upload; a redelivered expand
-    # message finds it already written
-    try
-        S3.put_object(ctx.cfg.bucket, report_key(run_id, "expand.json"),
-            Dict("body" => "{\"total_jobs\":$(length(jobs)),\"reused\":$(length(reused))}",
-                 "headers" => Dict("Content-Type" => "application/json",
-                                   "If-None-Match" => "*"));
-            aws_config=ctx.aws)
-    catch err
-        is_precondition_failed(err) || rethrow()
-    end
     slow_jobs = [j for j in fresh if is_slow(j)]
     fast_jobs = [j for j in fresh if !is_slow(j)]
     isempty(slow_jobs) ||
@@ -566,21 +552,6 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                 is_precondition_failed(err) || rethrow()
                 stored_log = String(copy(S3.get_object(ctx.cfg.bucket, key,
                     Dict("return_raw" => true); aws_config=ctx.aws)))
-            end
-        end
-    else
-        # completion marker: the report page gauges an in-flight run's progress
-        # by counting objects under logs/, so a job that produced no log still
-        # leaves an empty one behind (log_key stays unset — nothing links to it)
-        aws_retry() do
-            try
-                S3.put_object(ctx.cfg.bucket, key,
-                    Dict("body" => "",
-                         "headers" => Dict("Content-Type" => "text/plain; charset=utf-8",
-                                           "If-None-Match" => "*"));
-                    aws_config=ctx.aws)
-            catch err
-                is_precondition_failed(err) || rethrow()
             end
         end
     end
