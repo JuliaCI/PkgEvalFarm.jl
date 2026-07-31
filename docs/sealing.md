@@ -184,11 +184,13 @@ has a derivation in flight is *held* by the proxy until the artifact lands
 widened for seal/derive goals to accommodate this), and the worker donates
 the held slot's capacity to seal-queue work — typically the very derivation
 being waited on. Wants are posted dep-before-dependent by the loader's
-bottom-up walk, so whole chains resolve within one pass. Holds are bounded
-(`PKGEVAL_PROXY_HOLD`, default 240 s — inside a test job's inactivity
-window) and time out to a local compile: liveness always wins. Dead
-derivation items are re-armed by a fresh identical want rather than acting
-as tombstones.
+bottom-up walk, so whole chains resolve within one pass. Holds have deliberately no timeout: releasing early would make the
+requester compile a private copy of what the rest of its job expects to
+share, silently breaking key convergence — failure is owned at the job
+level (evaluation time limits, heartbeat bounds), and a terminally-failed
+derivation releases every holder as a 404, at which point a local compile
+is correct rather than a compromise. Dead derivation items are re-armed by
+a fresh identical want rather than acting as tombstones.
 
 There is no global switch. Expansion decides the scheme per configuration —
 "protocol" iff the julia under test carries `Base.CACHE_FETCH_HOOK`, detected

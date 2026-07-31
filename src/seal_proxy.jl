@@ -103,14 +103,21 @@ const SEAL_PROXY = Ref{Any}(nothing)
 # windows so a stuck rung degrades to a local compile, never a killed job.
 const SEAL_DONOR = Ref{Any}(nothing)
 const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
-proxy_hold_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_PROXY_HOLD", "")), 240.0)
 
 maybe_donate!() = ((donor = SEAL_DONOR[]) === nothing || donor(); nothing)
 
 """
-Block a missed GET while `key`'s derivation is pending/running, polling the
-store until it publishes, the derivation goes terminal, or the hold limit
-passes. `nothing` = answer 404 (requester compiles locally; liveness wins).
+Block a missed GET while `key`'s derivation is pending/running, until the
+artifact publishes or the derivation goes terminal (404: canonical will never
+exist, so a local compile is then *correct*, not a compromise).
+
+Deliberately no timeout: releasing early would make the requester compile a
+private copy of something the rest of its job — and its own produced keys —
+expect to share, silently breaking the setup. Failure is owned at the job
+level (evaluation time limits, worker heartbeat bounds); a derivation that
+dies terminally releases every holder through the status check. The hard cap
+here is task-hygiene only — beyond any legitimate job lifetime, so a holder
+whose requester already died doesn't poll forever.
 """
 function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
                              key::AbstractString)
@@ -122,8 +129,8 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
     Threads.atomic_add!(ACTIVE_HOLDS, 1)
     try
         maybe_donate!()
-        deadline = time() + proxy_hold_limit()
-        while time() < deadline
+        hygiene_cap = time() + 4 * 3600
+        while time() < hygiene_cap
             sleep(3)
             body = get_kv(ctx, ns, uuid, key)
             body === nothing || return body
