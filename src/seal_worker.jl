@@ -274,15 +274,20 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             try
                 roots = [(d.uuid, d.key) for d in want.deps]
                 artifacts, pins, missing_keys = fetch_derivation_closure(ctx, ns, roots)
-                if !isempty(missing_keys)
-                    # a dep of the closure was never published (e.g. the
-                    # requester compiled it locally): decline rather than
-                    # produce an artifact that could not match the want
-                    JobResult(; status="unsealable", reason="missing_dependency",
-                              wall=time() - eval_started,
-                              log="derivation closure incomplete: missing " *
-                                  join(first.(missing_keys, 12), ", "))
-                else
+                # Not-yet-published deps are NOT a decline: the sandbox fetches
+                # them through the proxy, which holds each keyed GET while that
+                # key's derivation is in flight (dataflow ordering by blocking;
+                # the slot meanwhile donates, see maybe_donate!). Deps the want
+                # names still get version-pinned so resolution stays exact even
+                # before their artifacts land.
+                for d in want.deps
+                    (d.version == "-" || haskey(pins, d.uuid)) && continue
+                    pins[d.uuid] = Dict("name" => d.name, "uuid" => d.uuid,
+                                        "version" => d.version)
+                end
+                isempty(missing_keys) ||
+                    @info "deriving with deps in flight" key=first(job.package, 12) nmissing=length(missing_keys)
+                begin
                     depot = joinpath(scratch, "depot")
                     materialize_derivation_depot(artifacts, depot)
                     pins_file = joinpath(scratch, "derive_pins.toml")

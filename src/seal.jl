@@ -206,14 +206,16 @@ function fetch_seal_index(ctx::FarmCtx, seal_id::AbstractString, package::Abstra
         end
     end
     recently_absent && return nothing
-    body = try
-        resp = aws_retry() do
-            S3.get_object(ctx.cfg.bucket, seal_index_key(seal_id, package),
-                          Dict("return_raw" => true); aws_config=ctx.aws)
+    body = aws_retry() do
+        try
+            copy(S3.get_object(ctx.cfg.bucket, seal_index_key(seal_id, package),
+                               Dict("return_raw" => true); aws_config=ctx.aws))
+        catch err
+            # absence is an answer, not a retryable failure
+            is_not_found(err) ? nothing : rethrow()
         end
-        copy(resp)
-    catch err
-        is_not_found(err) || rethrow()
+    end
+    if body === nothing
         lock(ABSENT_LOCK) do
             ABSENT_INDEXES[(seal_id, package)] = time() + ABSENT_TTL
         end
@@ -235,16 +237,23 @@ function ensure_sealed_artifacts!(ctx::FarmCtx, seal_id::AbstractString, relpath
     asyncmap(missing_paths; ntasks=16) do rel
         dest = joinpath(root, rel)
         try
-            resp = aws_retry() do
-                S3.get_object(ctx.cfg.bucket, seal_artifact_key(seal_id, rel),
-                              Dict("return_raw" => true); aws_config=ctx.aws)
+            body = aws_retry() do
+                try
+                    copy(S3.get_object(ctx.cfg.bucket, seal_artifact_key(seal_id, rel),
+                                       Dict("return_raw" => true); aws_config=ctx.aws))
+                catch err
+                    # absence is an answer, not a retryable failure
+                    is_not_found(err) ? nothing : rethrow()
+                end
             end
-            mkpath(dirname(dest))
-            tmp = dest * ".tmp.$(getpid()).$(objectid(current_task()))"
-            write(tmp, copy(resp))
-            mv(tmp, dest; force=true)
+            if body !== nothing
+                mkpath(dirname(dest))
+                tmp = dest * ".tmp.$(getpid()).$(objectid(current_task()))"
+                write(tmp, body)
+                mv(tmp, dest; force=true)
+            end
         catch err
-            is_not_found(err) || @warn "failed to fetch sealed artifact" rel err
+            @warn "failed to fetch sealed artifact" rel err
         end
         nothing
     end

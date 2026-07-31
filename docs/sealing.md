@@ -172,13 +172,23 @@ published), materializes it, pins the *entire* environment
 (`/derive_pins.toml`), and runs `goal = :derive` — like `:seal` but without
 TestEnv, since the requester wanted the package as a dependency. The produced
 key is checked against the want; on mismatch (inexact environment
-reproduction) the artifact still publishes under its true key, which is a
-valid artifact some other context may want. Trust is unchanged: executing a
-derivation for D runs only code from D's closure, and publication still goes
-under the registry's uuid for D. There is deliberately no proxy-hold: the
-first requester compiles locally regardless — the win is every later
-consumer, starting with `test(X)` right behind the `seal(X)` that reported
-the want.
+reproduction) the artifact still publishes under its true key — which is
+exactly the canonical-chain key later bottom-up consumers compute, so keys
+converge across passes. Trust is unchanged: executing a derivation for D
+runs only code from D's closure, and publication still goes under the
+registry's uuid for D.
+
+Ordering among derivations is dataflow by blocking: a GET whose exact key
+has a derivation in flight is *held* by the proxy until the artifact lands
+(the suspended sandbox idles at zero CPU; PkgEval's inactivity windows are
+widened for seal/derive goals to accommodate this), and the worker donates
+the held slot's capacity to seal-queue work — typically the very derivation
+being waited on. Wants are posted dep-before-dependent by the loader's
+bottom-up walk, so whole chains resolve within one pass. Holds are bounded
+(`PKGEVAL_PROXY_HOLD`, default 240 s — inside a test job's inactivity
+window) and time out to a local compile: liveness always wins. Dead
+derivation items are re-armed by a fresh identical want rather than acting
+as tombstones.
 
 There is no global switch. Expansion decides the scheme per configuration —
 "protocol" iff the julia under test carries `Base.CACHE_FETCH_HOOK`, detected

@@ -71,15 +71,21 @@ function get_kv(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
     isfile(local_path) && return read(local_path)
     s3key = kv_object_key(ns, uuid, key) * suffix
     body = try
-        resp = aws_retry() do
-            S3.get_object(ctx.cfg.bucket, s3key, Dict("return_raw" => true);
-                          aws_config=ctx.aws)
+        aws_retry() do
+            try
+                copy(S3.get_object(ctx.cfg.bucket, s3key, Dict("return_raw" => true);
+                                   aws_config=ctx.aws))
+            catch err
+                # absence is an answer, not a retryable failure — retrying a
+                # NoSuchKey burns ~8-30s of backoff per miss
+                is_not_found(err) ? nothing : rethrow()
+            end
         end
-        copy(resp)
     catch err
-        is_not_found(err) || @warn "kv fetch failed" s3key err
-        return nothing
+        @warn "kv fetch failed" s3key err
+        nothing
     end
+    body === nothing && return nothing
     mkpath(dirname(local_path))
     tmp = local_path * ".tmp.$(getpid()).$(objectid(current_task()))"
     write(tmp, body)
@@ -88,6 +94,51 @@ function get_kv(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
 end
 
 const SEAL_PROXY = Ref{Any}(nothing)
+
+# Holds: a GET whose exact key has a derivation in flight blocks until the
+# artifact lands (dataflow ordering by blocking — the sandbox idles at zero
+# CPU). While holds are active the worker donates slots to seal-queue work
+# (typically the very derivations being waited on): run_worker registers the
+# donor closure, and holds are bounded well inside PkgEval's inactivity
+# windows so a stuck rung degrades to a local compile, never a killed job.
+const SEAL_DONOR = Ref{Any}(nothing)
+const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
+proxy_hold_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_PROXY_HOLD", "")), 240.0)
+
+maybe_donate!() = ((donor = SEAL_DONOR[]) === nothing || donor(); nothing)
+
+"""
+Block a missed GET while `key`'s derivation is pending/running, polling the
+store until it publishes, the derivation goes terminal, or the hold limit
+passes. `nothing` = answer 404 (requester compiles locally; liveness wins).
+"""
+function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
+                             key::AbstractString)
+    job = JobRef(deriv_run_id(ns), "deriv", key)
+    item = get_seal_item(ctx, job)
+    item === nothing && return nothing
+    status = String(get(item, "status", ""))
+    status in ("pending", "running") || return nothing
+    Threads.atomic_add!(ACTIVE_HOLDS, 1)
+    try
+        maybe_donate!()
+        deadline = time() + proxy_hold_limit()
+        while time() < deadline
+            sleep(3)
+            body = get_kv(ctx, ns, uuid, key)
+            body === nothing || return body
+            item = get_seal_item(ctx, job)
+            terminal = item === nothing ||
+                       seal_terminal(String(get(item, "status", "sealed")))
+            # one last store look after a terminal flip (publish precedes the
+            # status write, but be safe about interleavings)
+            terminal && return get_kv(ctx, ns, uuid, key)
+        end
+        return nothing
+    finally
+        Threads.atomic_sub!(ACTIVE_HOLDS, 1)
+    end
+end
 const PROXY_PATH_RE = r"^/cache/v1/([0-9a-z-]{1,64})/([0-9a-f-]{36})/([0-9a-f]{64})$"
 const WANT_PATH_RE = r"^/want/v2/([0-9a-z-]{1,64})$"
 
@@ -115,7 +166,9 @@ function start_seal_proxy!(ctx::FarmCtx)
     handler = function (req::HTTP.Request)
         target = req.target
         if req.method == "GET" && (m = match(PROXY_PATH_RE, target)) !== nothing
-            body = fetch_kv(String(m[1]), String(m[2]), String(m[3]))
+            ns, uuid, key = String(m[1]), String(m[2]), String(m[3])
+            body = fetch_kv(ns, uuid, key)
+            body === nothing && (body = hold_for_derivation(ctx, ns, uuid, key))
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
         elseif req.method == "POST" && (m = match(WANT_PATH_RE, target)) !== nothing
@@ -250,12 +303,35 @@ function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
                 "preimage" => String(body),
                 "status" => "pending",
                 "attempts" => 0,
+                "blocked" => 0,
                 "created_at" => isodate())), ctx.cfg.jobs_table,
             Dict("ConditionExpression" => "attribute_not_exists(run_id)");
             aws_config=ctx.aws)
     catch err
         is_conditional_failure(err) || rethrow()
-        return nothing   # already wanted (possibly already produced)
+        # a dead earlier derivation of the same context must not tombstone the
+        # want forever: a fresh want re-arms it (its missing rungs may exist
+        # by now). In-flight/succeeded items stay untouched. Note: re-running
+        # a previously-counted job drifts the deriv run's completion counters,
+        # which are observability-only.
+        try
+            Dynamodb.update_item(
+                ddb_item(Dict("run_id" => run_id, "job_key" => job_key("deriv", key))),
+                ctx.cfg.jobs_table,
+                Dict("ConditionExpression" => "#s IN (:uns, :err)",
+                     "UpdateExpression" => "SET #s = :pending, attempts = :zero, blocked = :zero",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(
+                         ":uns" => "unsealable", ":err" => "error",
+                         ":pending" => "pending", ":zero" => 0)));
+                aws_config=ctx.aws)
+        catch takeover_err
+            is_conditional_failure(takeover_err) || rethrow()
+            return nothing   # pending/running/sealed: already handled
+        end
+        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
+        @info "re-armed dead derivation" ns want.name key=first(key, 12)
+        return key
     end
     Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
         Dict("UpdateExpression" => "SET #s = :active REMOVE finished_at ADD total_jobs :one",

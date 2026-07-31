@@ -41,6 +41,29 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     run_cache = Dict{String,Dict{String,Any}}()    # run_id -> parsed run item
     run_cache_lock = ReentrantLock()
 
+    # Donation: when the proxy holds a fetch (a sandbox suspended, zero CPU,
+    # waiting on a derivation), its slot's capacity is free — spawn a bounded
+    # donor that runs one piece of seal-queue work, typically the very
+    # derivation being waited on. CPU pinning is shared with a blocked
+    # process, so oversubscription is nominal.
+    donors = Threads.Atomic{Int}(0)
+    SEAL_DONOR[] = function ()
+        donors[] >= ninstances && return
+        draining[] && return
+        Threads.atomic_add!(donors, 1)
+        errormonitor(@async try
+            donated = claim_seal_job(ctx)
+            donated isa ClaimedJob &&
+                process_job(ctx, donated, rand(0:max(ninstances - 1, 0)),
+                            run_cache, run_cache_lock)
+        catch err
+            @warn "donor slot failed" err
+        finally
+            Threads.atomic_sub!(donors, 1)
+        end)
+        return
+    end
+
     # One receiver owns the only SQS long poll; slots take claimed work from the
     # channel. A message is claimed *only* once a slot is free (the semaphore),
     # so nothing sits claimed-but-unheartbeated waiting for capacity.
@@ -147,6 +170,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
             rethrow()
         end
     finally
+        SEAL_DONOR[] = nothing
         stop_seal_proxy!()
     end
 end

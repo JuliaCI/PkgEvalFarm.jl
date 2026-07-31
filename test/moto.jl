@@ -1656,6 +1656,45 @@ try
                 PEF.record_result(sctx, c2, PEF.JobResult(; status="unsealable",
                                                           reason="missing_dependency",
                                                           duration=0.1))
+
+                # a dead derivation is not a tombstone: the same want re-arms
+                # it (missing rungs may have landed since) and re-enqueues
+                @test PEF.ingest_want(sctx, "otherns", preimage) !== nothing
+                c3 = PEF.claim_job(sctx; wait=1)
+                @test c3 isa PEF.ClaimedJob && c3.job.run_id == "deriv-otherns"
+                item3 = PEF.get_seal_item(sctx, c3.job)
+                @test item3["status"] == "running" && item3["blocked"] == 0
+
+                # in-flight derivations make the proxy HOLD a matching GET
+                # until the artifact lands (dataflow ordering by blocking);
+                # a donor is summoned for the held slot's capacity
+                donations = Ref(0)
+                PEF.SEAL_DONOR[] = () -> (donations[] += 1)
+                want_uuid = "aaaaaaaa-0000-0000-0000-000000000003"
+                held_key = c3.job.package     # its item is `running` right now
+                ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("66"^32)";
+                              status_exception=false)   # warm the connection
+                publisher = @async begin
+                    sleep(6)
+                    PEF.put_sealed_object(sctx,
+                        PEF.kv_object_key("otherns", want_uuid, held_key),
+                        Vector{UInt8}(b"HELD-FRAME"))
+                end
+                t0 = time()
+                resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$held_key";
+                                     status_exception=false)
+                wait(publisher)
+                @test resp.status == 200
+                @test String(resp.body) == "HELD-FRAME"
+                @test time() - t0 >= 4.0          # it actually held
+                @test donations[] >= 1
+                PEF.SEAL_DONOR[] = nothing
+                PEF.record_result(sctx, c3, PEF.JobResult(; status="sealed", duration=0.1))
+
+                # no derivation in flight for a key -> 404 without holding
+                resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("77"^32)";
+                                     status_exception=false)
+                @test resp.status == 404
             finally
                 PEF.stop_seal_proxy!()
             end
