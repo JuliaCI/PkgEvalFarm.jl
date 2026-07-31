@@ -148,6 +148,7 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
 end
 const PROXY_PATH_RE = r"^/cache/v1/([0-9a-z-]{1,64})/([0-9a-f-]{36})/([0-9a-f]{64})$"
 const WANT_PATH_RE = r"^/want/v2/([0-9a-z-]{1,64})$"
+const ENSURE_PATH_RE = r"^/ensure/v2/([0-9a-z-]{1,64})$"
 
 """
 Start the loopback proxy. GETs are served from the local kv cache, then S3
@@ -176,6 +177,31 @@ function start_seal_proxy!(ctx::FarmCtx)
             ns, uuid, key = String(m[1]), String(m[2]), String(m[3])
             body = fetch_kv(ns, uuid, key)
             body === nothing && (body = hold_for_derivation(ctx, ns, uuid, key))
+            body === nothing && return HTTP.Response(404)
+            return HTTP.Response(200, body)
+        elseif req.method == "POST" && (m = match(ENSURE_PATH_RE, target)) !== nothing
+            # the request IS the preimage: serve the artifact, or create its
+            # derivation and hold this very request until it terminates —
+            # every requester (including the context's first) waits for the
+            # canonical artifact; 404 = terminally underivable, compile
+            # locally with a clear conscience
+            preimage = String(req.body)
+            want = parse_want_preimage(preimage)
+            want === nothing && return HTTP.Response(400)
+            ns = String(m[1])
+            key = bytes2hex(SHA.sha256(codeunits(preimage)))
+            lock(wants_lock) do
+                length(wants) < 10_000 && push!(wants, preimage)
+            end
+            body = fetch_kv(ns, want.uuid, key)
+            if body === nothing
+                try
+                    ingest_want(ctx, ns, preimage)
+                catch err
+                    @warn "ensure ingestion failed" err
+                end
+                body = hold_for_derivation(ctx, ns, want.uuid, key)
+            end
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
         elseif req.method == "POST" && (m = match(WANT_PATH_RE, target)) !== nothing

@@ -17,6 +17,7 @@ using Test
 using JSON
 using TOML
 import HTTP
+import SHA
 
 hook_julia = get(ENV, "PKGEVAL_HOOK_JULIA", "")
 client_jl = normpath(joinpath(@__DIR__, "..", "..", "PkgEval.jl", "scripts", "cache_client.jl"))
@@ -119,17 +120,19 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
             vcat(reinterpret(UInt8, [htol(UInt64(length(ji)))]), ji,
                  reinterpret(UInt8, [htol(UInt64(length(so)))]), so)
         end
-        frames = Dict("/cache/v1/e2e/$(UUID_S)/$(unit["key"])" => frame_of(unit),
-                      "/cache/v1/e2e/$(DEP_UUID)/$(dep["key"])" => frame_of(dep))
+        frames = Dict(unit["key"] => frame_of(unit), dep["key"] => frame_of(dep))
 
-        # stub proxy: serve exactly the producer's keys, collect wants
+        # stub proxy speaking /ensure: hash the preimage, serve known keys,
+        # collect the preimages of unknown ones (the derivation requests)
         wants = String[]
         handler = req -> begin
-            if req.method == "GET" && haskey(frames, req.target)
-                return HTTP.Response(200, frames[req.target])
-            elseif req.method == "POST" && startswith(req.target, "/want/v2/")
-                push!(wants, String(req.body))
-                return HTTP.Response(202)
+            if req.method == "POST" && startswith(req.target, "/ensure/v2/")
+                body = String(req.body)
+                key = bytes2hex(SHA.sha256(codeunits(body)))
+                startswith(req.target, "/ensure/v2/e2e") && haskey(frames, key) &&
+                    return HTTP.Response(200, frames[key])
+                push!(wants, body)   # derivation requests, any namespace
+                return HTTP.Response(404)
             end
             return HTTP.Response(404)
         end
@@ -177,7 +180,7 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
                 @assert ProtoPkg.answer() == 42
                 @assert PkgEvalCacheClient.HITS[] == 0
                 println("MISS_OK")
-                """; namespace="other")
+                """; namespace="other")   # stub only answers /ensure/v2/e2e
             @test ok || error(out)
             @test occursin("MISS_OK", out)
             @test !isempty(wants)

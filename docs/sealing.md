@@ -148,11 +148,13 @@ it by moving demand to a loader hook with full resolution context:
 - The julia-under-test carries `Base.CACHE_FETCH_HOOK` (the
   `cache-fetch-hook` branch); PkgEval's `scripts/cache_client.jl` installs a
   client in the driver processes when `PKGEVAL_CACHE_SERVER` is set. On a
-  compilecache miss it computes a key over the *entire* build context —
-  julia build, uuid, version, tree hash, cache flags, prefs, and the exact
-  `(dep_uuid, build_id)` pairs — GETs a loopback proxy the worker runs, and
-  reports misses (`/want`) with the full context, the forward hook for
-  derivation scheduling.
+  compilecache miss it computes the full build context — julia build, uuid,
+  version, tree hash, cache flags, prefs, and per direct dep its build_id,
+  version and own context key — and POSTs the whole preimage to the
+  worker's loopback proxy (`/ensure`): one request that serves the
+  artifact, or creates its derivation and holds until it terminates. Asks
+  are inherently bottom-up (a preimage needs its deps' build_ids, which
+  exist only once the deps materialized), which the loader's walk provides.
 - Publication is worker-side and namespaced: only the sealed unit's own
   cachefile pair, only under the uuid the *registry* (never the sandbox)
   resolves for it. A malicious seal job can poison nothing but its own

@@ -1695,6 +1695,49 @@ try
                 resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("77"^32)";
                                      status_exception=false)
                 @test resp.status == 404
+
+                # --- /ensure: one preimage-carrying request ------------------
+                # already-published context: served immediately
+                pre_pub = join(["v2", "julia=1+a", "name=JSON", "uuid=$want_uuid",
+                                "version=1.1.0", "tree=$("22"^20)", "flags=1", "prefs=0"], "
+")
+                key_pub = bytes2hex(PEF.SHA.sha256(codeunits(pre_pub)))
+                PEF.put_sealed_object(sctx, PEF.kv_object_key("otherns", want_uuid, key_pub),
+                                      Vector{UInt8}(b"ENSURED"))
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_pub,
+                                      status_exception=false)
+                @test resp.status == 200
+                @test String(resp.body) == "ENSURED"
+
+                # novel context: the request *creates* the derivation and holds
+                # on it; terminal failure releases as 404 (local compile is
+                # then correct). The first requester no longer races its own
+                # want.
+                pre_new = join(["v2", "julia=1+a", "name=JSON", "uuid=$want_uuid",
+                                "version=1.2.0", "tree=$("33"^20)", "flags=1", "prefs=0"], "
+")
+                key_new = bytes2hex(PEF.SHA.sha256(codeunits(pre_new)))
+                failer = @async begin
+                    sleep(3)
+                    cd_ = PEF.claim_job(sctx; wait=2)
+                    cd_ isa PEF.ClaimedJob || return
+                    PEF.record_result(sctx, cd_, PEF.JobResult(; status="unsealable",
+                                                               reason="precompile",
+                                                               duration=0.1))
+                end
+                t0 = time()
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_new,
+                                      status_exception=false)
+                wait(failer)
+                @test resp.status == 404
+                @test time() - t0 >= 2.0     # it held until the terminal flip
+                item_new = PEF.get_seal_item(sctx, PEF.JobRef("deriv-otherns", "deriv", key_new))
+                @test item_new !== nothing   # the ensure created the derivation
+                @test item_new["status"] == "unsealable"
+
+                # malformed preimages are rejected outright
+                @test ProxyHTTP.post("$base/ensure/v2/otherns"; body="v1\ngarbage",
+                                     status_exception=false).status == 400
             finally
                 PEF.stop_seal_proxy!()
             end
