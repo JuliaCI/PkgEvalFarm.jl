@@ -294,6 +294,13 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                         sleep(3)
                     end
                     if m === nothing
+                        lastlog = try
+                            String(S3.get_object(cfg.bucket,
+                                "runs/$run2/logs/primary/$pkg.log"; aws_config=aws))
+                        catch err
+                            "(fetch failed: $err)"
+                        end
+                        @error "no second-pass summary" pkg nbytes=length(lastlog) tail=last(lastlog, 500)
                         # only killed jobs legitimately leave no summary
                         @test get(jobs2[pkg], "status", "") == "kill"
                         continue
