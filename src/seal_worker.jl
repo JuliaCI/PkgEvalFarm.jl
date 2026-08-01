@@ -39,8 +39,14 @@ function sealed_depot_kwargs(ctx::FarmCtx, seal_id::AbstractString, packages;
         # expansion-side detection guarantees this julia carries the hook
         proxy = SEAL_PROXY[]
         proxy === nothing && return (;), Returns(nothing)
-        return (; env=Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
-                           "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))), Returns(nothing)
+        env = Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
+                   "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
+        # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
+        # rejection reasons in job logs when chasing convergence bugs
+        dbg = get(ENV, "PKGEVAL_JULIA_DEBUG", "")
+        isempty(dbg) || (env["JULIA_DEBUG"] = dbg)
+        haskey(ENV, "JULIA_CACHE_HOOK_TRACE") && (env["JULIA_CACHE_HOOK_TRACE"] = "1")
+        return (; env), Returns(nothing)
     end
     depot = mktempdir(prefix="pkgeval_sealed_depot_")
     try
@@ -218,7 +224,12 @@ function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
         end
         push!(artifacts, (meta, blob))
         version = String(get(meta, "version", "-"))
-        if version != "-"
+        # extensions materialize into the depot but are never Pkg-addable:
+        # pinning one fails resolution outright ("expected package to be
+        # registered"); their meta carries the parent's version, so the
+        # version check alone does not exclude them
+        is_ext_meta = !isempty(String(get(meta, "ext_of", "")))
+        if version != "-" && !is_ext_meta
             pins[uuid] = Dict("name" => String(meta["name"]), "uuid" => uuid,
                               "version" => version)
         end
