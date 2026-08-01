@@ -89,7 +89,7 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         configs = [PkgEval.Configuration(; name="primary", julia=sim_julia,
                                          # keep the sim lean and deterministic
                                          rr=PkgEval.RRDisabled)]
-        packages = ["Example"]
+        packages = split(get(ENV, "PKGEVAL_SIM_PACKAGES", "Example"), ",")
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
                                 submitter="sim", reuse=false)
         @info "sim run created" run_id
@@ -117,7 +117,8 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
             end)
             return
         end
-        slots = map(1:4) do i
+        nslots = parse(Int, get(ENV, "PKGEVAL_SIM_SLOTS", "4"))
+        slots = map(1:nslots) do i
             errormonitor(@async while !done[]
                 claimed = PEF.claim_seal_job(ctx)
                 claimed === nothing && (claimed = PEF.claim_job(ctx; wait=1))
@@ -161,8 +162,15 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         @test final !== nothing
 
         if final !== nothing
+            # the sim asserts *infrastructure* health: packages may fail their
+            # own tests ("fail") or hit their time limit ("kill"/time_limit),
+            # but infra failures surface as skip/uninstallable or inactivity
             jobs = Dict(j["package"] => j for j in PEF.run_jobs(ctx, run_id))
-            @test jobs["Example"]["status"] == "test"
+            for pkg in packages
+                @test jobs[pkg]["status"] in ("test", "fail", "kill")
+                @test get(jobs[pkg], "reason", nothing) != "inactivity"
+                @info "job outcome" pkg status=jobs[pkg]["status"] reason=get(jobs[pkg], "reason", nothing)
+            end
 
             seal_runs = get(final, "seal_runs", Dict())
             @test haskey(seal_runs, "primary")
@@ -170,17 +178,29 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
             scheme = PEF.seal_run_scheme(PEF.get_run(ctx, sr))
             @info "sim results" scheme donations=donations[]
             seal_jobs = Dict(j["package"] => j for j in PEF.run_jobs(ctx, sr))
-            @test seal_jobs["Example"]["status"] == "sealed"
+            for pkg in packages
+                # sealing precompiles; it succeeds even where tests fail
+                @test seal_jobs[pkg]["status"] == "sealed"
+            end
 
             if scheme == "protocol"
-                # the julia carries the hook: the consumer must actually hit
-                log = String(PEF.S3.get_object(cfg.bucket,
-                    "runs/$run_id/logs/primary/Example.log"; aws_config=aws))
-                m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
-                @test m !== nothing
-                if m !== nothing
-                    @info "consumer cache traffic" hits=m[1] misses=m[2]
-                    @test parse(Int, m[1]) > 0
+                # every consumer that exited cleanly must have hit and never
+                # compiled what the run shares (a kill leaves no summary)
+                for pkg in packages
+                    log = try
+                        String(S3.get_object(cfg.bucket,
+                            "runs/$run_id/logs/primary/$pkg.log"; aws_config=aws))
+                    catch
+                        ""
+                    end
+                    m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
+                    if m === nothing
+                        @info "no cache summary (killed job leaves none)" pkg
+                        @test jobs[pkg]["status"] == "kill"
+                    else
+                        @info "consumer cache traffic" pkg hits=m[1] misses=m[2]
+                        @test parse(Int, m[1]) > 0
+                    end
                 end
             end
         end
