@@ -536,6 +536,10 @@ function _publish_entry!(ctx::FarmCtx, seal_id::AbstractString, export_dir::Abst
     end
     meta = Dict("name" => unit, "uuid" => lowercase(unit_uuid),
                 "ext_of" => lowercase(String(get(entry, "ext_of", ""))),
+                # the exact preimage this artifact was produced under: purely
+                # diagnostic (keys already bind it), but it makes an inexact
+                # reproduction diffable line-by-line against the wanted one
+                "preimage" => String(get(entry, "preimage", "")),
                 "version" => String(get(entry, "version", "-")),
                 "vdir" => rel[1], "ji" => basename(ji_path),
                 "so" => so_path === nothing ? "" : basename(so_path),

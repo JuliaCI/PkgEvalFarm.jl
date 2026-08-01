@@ -227,14 +227,26 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                                 endswith(k, ".meta") || continue
                                 meta = JSON.parse(String(PEF.get_kv(ctx, ns, uuid,
                                     String(chopsuffix(basename(k), ".meta")); meta=true)))
-                                push!(produced, "key=$(first(basename(k), 12)) version=$(get(meta, "version", "?")) deps=" *
-                                    join(["$(get(d, "name", "?")):$(get(d, "version", "?")):$(first(String(get(d, "key", "?")), 8))"
-                                          for d in get(meta, "deps", [])], ","))
+                                header = "key=$(first(basename(k), 12)) version=$(get(meta, "version", "?"))"
+                                pm = String(get(meta, "preimage", ""))
+                                if isempty(pm)
+                                    push!(produced, header * " (no preimage in meta)")
+                                else
+                                    wl, pl = split(wanted, '\n'), split(pm, '\n')
+                                    diffs = ["-$a  =>  +$b" for (a, b) in zip(wl, pl) if a != b]
+                                    length(wl) != length(pl) &&
+                                        push!(diffs, "(line counts differ: $(length(wl)) vs $(length(pl)))")
+                                    push!(produced, header * (isempty(diffs) ? " (identical?!)" :
+                                                              "\n  " * join(diffs, "\n  ")))
+                                end
                             end
                         catch err
                             push!(produced, "(listing failed: $err)")
                         end
-                        @info "miss post-mortem" unit wanted produced
+                        @info "miss post-mortem" unit nproduced=length(produced)
+                        # @info elides long strings; the full diff goes to stdout
+                        println("=== post-mortem $unit\n--- wanted\n$wanted\n--- produced")
+                        foreach(println, produced)
                     end
                 end
             end
