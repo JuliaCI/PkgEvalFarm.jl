@@ -21,6 +21,7 @@ module SimTests
 
 using Test
 using Dates
+using JSON
 import PkgEval
 import HTTP
 using PkgEvalFarm
