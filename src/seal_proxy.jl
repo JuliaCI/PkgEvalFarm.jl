@@ -131,7 +131,12 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
     item = get_seal_item(ctx, job)
     item === nothing && return nothing
     status = String(get(item, "status", ""))
-    status in ("pending", "running") || return nothing
+    # already terminal on arrival: one authoritative store look, exactly like
+    # the in-loop terminal branch. The caller's fetch_kv may have answered
+    # from the 30s negative cache, poisoned by a *previous* requester's miss
+    # whose derivation has since published — returning nothing here 404'd a
+    # published artifact (seen in sim: a sealed TestEnv counted as a miss)
+    status in ("pending", "running") || return get_kv(ctx, ns, uuid, key)
     Threads.atomic_add!(ACTIVE_HOLDS, 1)
     try
         maybe_donate!()

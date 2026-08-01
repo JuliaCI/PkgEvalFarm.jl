@@ -1761,6 +1761,25 @@ try
                 @test item_new !== nothing   # the ensure created the derivation
                 @test item_new["status"] == "unsealable"
 
+                # negative-cache race: the artifact publishes and the item goes
+                # terminal while the key sits in the 30s negative cache (poisoned
+                # by the pre-publication miss above) — a fresh request must still
+                # serve it via the hold path's terminal store look, not 404
+                PEF.put_sealed_object(sctx, PEF.kv_object_key("otherns", want_uuid, key_new),
+                                      PEF.frame_pair(Vector{UInt8}(codeunits("RACEJI")), nothing))
+                Dynamodb.update_item(
+                    PEF.ddb_item(Dict("run_id" => "deriv-otherns",
+                                      "job_key" => PEF.job_key("deriv", key_new))),
+                    "pkgeval-jobs",
+                    Dict("UpdateExpression" => "SET #s = :sealed",
+                         "ExpressionAttributeNames" => Dict("#s" => "status"),
+                         "ExpressionAttributeValues" => PEF.ddb_item(Dict(":sealed" => "sealed")));
+                    aws_config=aws)
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_new,
+                                      status_exception=false)
+                @test resp.status == 200
+                @test occursin("RACEJI", String(resp.body))
+
                 # malformed preimages are rejected outright
                 @test ProxyHTTP.post("$base/ensure/v2/otherns"; body="v1\ngarbage",
                                      status_exception=false).status == 400
