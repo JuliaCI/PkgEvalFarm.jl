@@ -279,15 +279,25 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
             end
             @test final2 !== nothing
             if final2 !== nothing
+                jobs2 = Dict(j["package"] => j for j in PEF.run_jobs(ctx, run2))
                 for pkg in packages
-                    log = try
-                        String(S3.get_object(cfg.bucket,
-                            "runs/$run2/logs/primary/$pkg.log"; aws_config=aws))
-                    catch
-                        ""
+                    m = nothing
+                    for _ in 1:10   # the log upload may trail the status flip
+                        log = try
+                            String(S3.get_object(cfg.bucket,
+                                "runs/$run2/logs/primary/$pkg.log"; aws_config=aws))
+                        catch
+                            ""
+                        end
+                        m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
+                        m === nothing || break
+                        sleep(3)
                     end
-                    m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
-                    m === nothing && continue   # killed jobs leave no summary
+                    if m === nothing
+                        # only killed jobs legitimately leave no summary
+                        @test get(jobs2[pkg], "status", "") == "kill"
+                        continue
+                    end
                     @info "second-pass cache traffic" pkg hits=m[1] misses=m[2]
                     @test parse(Int, m[2]) == 0
                 end
