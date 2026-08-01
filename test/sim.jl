@@ -201,10 +201,39 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                         @info "consumer cache traffic" pkg hits=m[1] misses=m[2]
                         @test parse(Int, m[1]) > 0
                     end
-                    # surface the classified tail while moto still holds the logs
+                    # surface the classified tail while moto still holds the logs,
+                    # and for each miss diff the wanted context against whatever
+                    # the derivation actually produced under the same uuid
+                    ns = PEF.seal_id_of(sr)
                     for l in eachline(IOBuffer(log))
-                        occursin(r"\[cache_client\] (miss|unkeyable)", l) &&
-                            @info "cache tail" pkg event=strip(l)
+                        occursin(r"\[cache_client\] (miss|unkeyable)", l) || continue
+                        @info "cache tail" pkg event=strip(l)
+                        m2 = match(r"miss: (\S+) uuid=(\S+) key=([0-9a-f]{64})", l)
+                        m2 === nothing && continue
+                        unit, uuid, key = String(m2[1]), String(m2[2]), String(m2[3])
+                        item = PEF.get_seal_item(ctx, PEF.JobRef("deriv-$ns", "deriv", key))
+                        wanted = item === nothing ? "(no derivation item)" :
+                                 String(get(item, "preimage", "(no preimage)"))
+                        produced = String[]
+                        try
+                            prefix = "compilecache/$ns/kv/$uuid/"
+                            listing = S3.list_objects_v2(cfg.bucket,
+                                Dict("prefix" => prefix); aws_config=aws)
+                            contents = get(listing, "Contents", [])
+                            contents isa AbstractVector || (contents = [contents])
+                            for obj in contents
+                                k = String(obj["Key"])
+                                endswith(k, ".meta") || continue
+                                meta = JSON.parse(String(PEF.get_kv(ctx, ns, uuid,
+                                    String(chopsuffix(basename(k), ".meta")); meta=true)))
+                                push!(produced, "key=$(first(basename(k), 12)) version=$(get(meta, "version", "?")) deps=" *
+                                    join(["$(get(d, "name", "?")):$(get(d, "version", "?")):$(first(String(get(d, "key", "?")), 8))"
+                                          for d in get(meta, "deps", [])], ","))
+                            end
+                        catch err
+                            push!(produced, "(listing failed: $err)")
+                        end
+                        @info "miss post-mortem" unit wanted produced
                     end
                 end
             end
