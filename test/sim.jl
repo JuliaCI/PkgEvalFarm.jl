@@ -140,18 +140,13 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         # first runs download rootfs/registry/packages; generous but bounded
         deadline = time() + parse(Float64, get(ENV, "PKGEVAL_SIM_BUDGET", "1800"))
         final = nothing
-        try
-            while time() < deadline
-                run = PEF.get_run(ctx, run_id)
-                if run !== nothing && get(run, "status", "") == "done"
-                    final = run
-                    break
-                end
-                sleep(5)
+        while time() < deadline
+            run = PEF.get_run(ctx, run_id)
+            if run !== nothing && get(run, "status", "") == "done"
+                final = run
+                break
             end
-        finally
-            done[] = true
-            PEF.SEAL_DONOR[] = nothing
+            sleep(5)
         end
         if final === nothing
             # dump state before failing: this is the sim's whole point
@@ -265,6 +260,42 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                 end
             end
         end
+        # PKGEVAL_SIM_PASSES=2: resubmit the identical run against the warm
+        # namespace — re-armed tombstones must converge, consumers must not
+        # miss at all (first-pass inexact chains become exact hits)
+        if final !== nothing && get(ENV, "PKGEVAL_SIM_PASSES", "1") == "2"
+            run2 = PEF.create_run(ctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
+                                  submitter="sim-pass2", reuse=false)
+            @info "second pass" run2
+            final2 = nothing
+            deadline2 = time() + parse(Float64, get(ENV, "PKGEVAL_SIM_BUDGET", "1800"))
+            while time() < deadline2
+                r2 = PEF.get_run(ctx, run2)
+                if r2 !== nothing && get(r2, "status", "") == "done"
+                    final2 = r2
+                    break
+                end
+                sleep(5)
+            end
+            @test final2 !== nothing
+            if final2 !== nothing
+                for pkg in packages
+                    log = try
+                        String(S3.get_object(cfg.bucket,
+                            "runs/$run2/logs/primary/$pkg.log"; aws_config=aws))
+                    catch
+                        ""
+                    end
+                    m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
+                    m === nothing && continue   # killed jobs leave no summary
+                    @info "second-pass cache traffic" pkg hits=m[1] misses=m[2]
+                    @test parse(Int, m[2]) == 0
+                end
+            end
+        end
+
+        done[] = true
+        PEF.SEAL_DONOR[] = nothing
     end
 end
 
