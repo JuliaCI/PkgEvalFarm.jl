@@ -194,6 +194,9 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                     catch
                         ""
                     end
+                    # probe support: keep the full log on the host
+                    dumpdir = get(ENV, "PKGEVAL_SIM_LOGDUMP", "")
+                    isempty(dumpdir) || (mkpath(dumpdir); write(joinpath(dumpdir, pkg * ".log"), log))
                     m = match(r"\[cache_client\] hits=(\d+) misses=(\d+)", log)
                     if m === nothing
                         @info "no cache summary (killed job leaves none)" pkg
@@ -242,6 +245,17 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                             end
                         catch err
                             push!(produced, "(listing failed: $err)")
+                        end
+                        # keep the failed derivation's own log for the post-mortem
+                        if !isempty(dumpdir) && item !== nothing
+                            dlog = try
+                                String(S3.get_object(cfg.bucket,
+                                    "runs/deriv-$ns/logs/deriv/$key.log"; aws_config=aws))
+                            catch
+                                ""
+                            end
+                            isempty(dlog) ||
+                                write(joinpath(dumpdir, "deriv-$unit-$(first(key, 8)).log"), dlog)
                         end
                         @info "miss post-mortem" unit nproduced=length(produced)
                         # @info elides long strings; the full diff goes to stdout
