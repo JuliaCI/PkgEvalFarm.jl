@@ -407,6 +407,10 @@ function merge_want_pins!(pins::AbstractDict, want; include_unversioned::Bool=fa
         haskey(pins, d.uuid) && continue
         if d.version == "-"
             include_unversioned || continue
+            # implied-extension dep lines are unversioned like stdlib triggers
+            # but are never Pkg-addable; their uuid5 shape tells them apart
+            # (they reach the derive env via depot materialization instead)
+            is_uuid5_shaped(d.uuid) && continue
             pins[d.uuid] = Dict("uuid" => d.uuid)
         else
             pins[d.uuid] = Dict("uuid" => d.uuid, "version" => d.version)
