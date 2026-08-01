@@ -201,6 +201,11 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                         @info "consumer cache traffic" pkg hits=m[1] misses=m[2]
                         @test parse(Int, m[1]) > 0
                     end
+                    # surface the classified tail while moto still holds the logs
+                    for l in eachline(IOBuffer(log))
+                        occursin(r"\[cache_client\] (miss|unkeyable)", l) &&
+                            @info "cache tail" pkg event=strip(l)
+                    end
                 end
             end
         end
