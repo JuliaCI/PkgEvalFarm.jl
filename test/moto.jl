@@ -9,6 +9,7 @@ using Dates
 using JSON
 using PkgEvalFarm
 using Sockets
+using UUIDs: UUID, uuid5
 import PkgEval
 
 using ..BrokerTests: FarmBroker, with_env
@@ -1506,6 +1507,50 @@ try
                             """)
                     end
                     @test !PEF.publish_protocol!(sctx, ns, export_dir, "JSON", uuid)
+                end
+
+                # the unit's extensions publish under uuid5-derived authority;
+                # a free-floating ext uuid claim is skipped, not published
+                ext_uuid = string(uuid5(UUID(uuid), "JSONFooExt"))
+                ext_key, bad_key = "ee"^32, "ff"^32
+                mktempdir() do export_dir
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "JSON"))
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "JSONFooExt"))
+                    mkpath(joinpath(export_dir, "compiled", "v1.13", "JSONBadExt"))
+                    write(joinpath(export_dir, "compiled", "v1.13", "JSON", "JSON_k.ji"), "JI")
+                    write(joinpath(export_dir, "compiled", "v1.13", "JSONFooExt", "JSONFooExt_k.ji"), "EXTJI")
+                    write(joinpath(export_dir, "compiled", "v1.13", "JSONBadExt", "JSONBadExt_k.ji"), "BADJI")
+                    open(joinpath(export_dir, "seal_keys.toml"), "w") do io
+                        println(io, """
+                            [JSON]
+                            uuid = "$uuid"
+                            key = "$key"
+                            preimage = "v1"
+                            ji = "v1.13/JSON/JSON_k.ji"
+                            so = ""
+
+                            [JSONFooExt]
+                            uuid = "$ext_uuid"
+                            ext_of = "$uuid"
+                            key = "$ext_key"
+                            preimage = "v3"
+                            ji = "v1.13/JSONFooExt/JSONFooExt_k.ji"
+                            so = ""
+
+                            [JSONBadExt]
+                            uuid = "cccccccc-0000-0000-0000-000000000001"
+                            ext_of = "$uuid"
+                            key = "$bad_key"
+                            preimage = "v3"
+                            ji = "v1.13/JSONBadExt/JSONBadExt_k.ji"
+                            so = ""
+                            """)
+                    end
+                    @test PEF.publish_protocol!(sctx, ns, export_dir, "JSON", uuid)
+                    @test PEF.get_kv(sctx, ns, ext_uuid, ext_key) !== nothing
+                    ext_meta = JSON.parse(String(PEF.get_kv(sctx, ns, ext_uuid, ext_key; meta=true)))
+                    @test ext_meta["ext_of"] == uuid
+                    @test PEF.get_kv(sctx, ns, "cccccccc-0000-0000-0000-000000000001", bad_key) === nothing
                 end
 
                 # the proxy serves the framed pair (S3-backed, then local cache)

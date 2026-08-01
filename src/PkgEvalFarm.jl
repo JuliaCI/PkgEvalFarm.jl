@@ -9,6 +9,7 @@ using Logging
 using Random
 import SHA
 using TOML
+using UUIDs: UUID, uuid5
 
 using AWS: @service
 @service Dynamodb

@@ -284,7 +284,8 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                 # the slot meanwhile donates, see maybe_donate!). Deps the want
                 # names still get version-pinned so resolution stays exact even
                 # before their artifacts land.
-                merge_want_pins!(pins, want)
+                is_ext = want.ext_of !== nothing
+                merge_want_pins!(pins, want; include_unversioned=is_ext)
                 isempty(missing_keys) ||
                     @info "deriving with deps in flight" key=first(job.package, 12) nmissing=length(missing_keys)
                 begin
@@ -298,6 +299,7 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                     mkpath(export_dir)
                     r = PkgEval.evaluate_derive(config,
                             PkgEval.Package(; name=want.name,
+                                            uuid=UUID(want.uuid),
                                             version=VersionNumber(want.version));
                             use_cache=claimed.attempts <= 1, export_dir, pins_file,
                             mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
@@ -309,14 +311,28 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                                      # unpublished key deadlocks the derivation
                                      # against itself (seen live: TestEnv derive
                                      # + 5 test jobs all inactivity-killed)
-                                     "PKGEVAL_CACHE_FETCH" => "0"))
+                                     "PKGEVAL_CACHE_FETCH" => "0",
+                                     # extension unit: install pins only; the
+                                     # ext compiles once parent+triggers land
+                                     "PKGEVAL_DERIVE_EXT" => is_ext ? "1" : "0"))
                     log = r.log === missing ? "" : String(r.log)
                     if String(r.status) == "derive"
-                        unit_uuid = try
-                            registry_uuid(seal_registry_dir(config), want.name)
-                        catch err
-                            @warn "could not resolve unit uuid" want.name err
-                            nothing
+                        unit_uuid = if is_ext
+                            # the loader's uuid5 varies with the julia's hash,
+                            # so the host can't recompute it: authority is the
+                            # key binding the full preimage, guarded by parse's
+                            # shape check plus (here) a registry parent and no
+                            # collision with any registry package's namespace
+                            reg = seal_registry_dir(config)
+                            registry_has_uuid(reg, want.ext_of) &&
+                                !registry_has_uuid(reg, want.uuid) ? want.uuid : nothing
+                        else
+                            try
+                                registry_uuid(seal_registry_dir(config), want.name)
+                            catch err
+                                @warn "could not resolve unit uuid" want.name err
+                                nothing
+                            end
                         end
                         produced = produced_key(export_dir, want.name)
                         published = unit_uuid !== nothing &&
@@ -370,12 +386,20 @@ end
 """
 Version-pin a want's direct deps into `pins` (uuid keyed). Want dep lines
 carry no package *name* — PackageSpec pins fine on uuid+version alone —
-and unkeyable deps (version "-": stdlibs, dev) are not pinnable.
+and unkeyable deps (version "-": stdlibs, dev) are not pinnable. For an
+extension want they are still *required* (a stdlib trigger must be a direct
+dep for the extension to build), so `include_unversioned` records them as
+uuid-only entries.
 """
-function merge_want_pins!(pins::AbstractDict, want)
+function merge_want_pins!(pins::AbstractDict, want; include_unversioned::Bool=false)
     for d in want.deps
-        (d.version == "-" || haskey(pins, d.uuid)) && continue
-        pins[d.uuid] = Dict("uuid" => d.uuid, "version" => d.version)
+        haskey(pins, d.uuid) && continue
+        if d.version == "-"
+            include_unversioned || continue
+            pins[d.uuid] = Dict("uuid" => d.uuid)
+        else
+            pins[d.uuid] = Dict("uuid" => d.uuid, "version" => d.version)
+        end
     end
     return pins
 end

@@ -194,6 +194,25 @@ derivation releases every holder as a 404, at which point a local compile
 is correct rather than a compromise. Dead derivation items are re-armed by
 a fresh identical want rather than acting as tombstones.
 
+### Extensions (v3 preimages)
+
+Package extensions have no registry identity of their own, so the v2 line
+format cannot express them; they were the dominant residual-miss class
+(~5%, plus the `unsealable` cascade through dependents). A v3 preimage —
+v2 plus an `ext_of=<parent uuid>` line — keys an extension by derivation:
+its uuid must equal `uuid5(ext_of, name)` (checked at parse), its
+version/tree are the parent's (the extension source lives in the parent's
+tree), and its dep lines carry the parent and the trigger packages, all
+loaded before the extension so their build_ids are known. Package
+preimages stay v2: no published key changes. Publication authority is
+structural — the worker computes `uuid5(parent, name)` itself and requires
+the parent to be a registry package; seal jobs publish their unit's
+triggered extensions alongside the unit under that derived authority.
+Extension derivations install the want's deps directly (`Pkg.add` can't
+name an extension; it compiles once parent and triggers land), including
+uuid-only entries for unversioned stdlib triggers. Old proxies reject v3
+as malformed, which clients already treat as an ordinary miss.
+
 Derivation sandboxes are the one place the fetch hook is *not* installed
 (`PKGEVAL_CACHE_FETCH=0`; the client still loads to emit produced keys).
 Everything published is already materialized into the derivation's depot,

@@ -6,6 +6,7 @@ module SealTests
 using Test
 using PkgEvalFarm
 using TOML
+using UUIDs: UUID, uuid5
 
 const PEF = PkgEvalFarm
 
@@ -59,6 +60,11 @@ end
         @test graph["JSON"] == ["Crayons", "Example"]   # Unicode not in the run set
         @test graph["Crayons"] == String[]              # no Deps.toml
         @test graph["Example"] == String[]              # not even a package dir
+
+        # uuid membership (the extension-parent trust check)
+        @test PEF.registry_has_uuid(reg, "aaaaaaaa-0000-0000-0000-000000000001")
+        @test PEF.registry_has_uuid(reg, "AAAAAAAA-0000-0000-0000-000000000001")
+        @test !PEF.registry_has_uuid(reg, "aaaaaaaa-0000-0000-0000-00000000dead")
 
         # learned edges merge in (and are clipped to the run set)
         merged = PEF.seal_dep_graph(reg, sort(collect(wanted)),
@@ -124,6 +130,42 @@ end
     @test !PEF.is_seal_job(PEF.JobRef("20260729-x", "primary", "Foo"))
     @test PEF.seal_id_of("seal-abc123") == "abc123"
 end
+@testset "v3 extension preimages" begin
+    parent = "aaaaaaaa-0000-0000-0000-000000000001"
+    ext_uuid = string(uuid5(UUID(parent), "FooBarExt"))
+    lines(u) = join(["v3", "julia=1+a", "name=FooBarExt", "uuid=$u",
+                     "ext_of=$parent", "version=1.0.0", "tree=$("11"^20)",
+                     "flags=1", "prefs=0",
+                     "dep=$parent:1f:1.0.0:$("ab"^32)",
+                     "dep=aaaaaaaa-0000-0000-0000-000000000002:2f:-:-"], "\n")
+    want = PEF.parse_want_preimage(lines(ext_uuid))
+    @test want !== nothing
+    @test want.ext_of == parent
+    @test want.name == "FooBarExt"
+    # the uuid must carry uuid5's forced version/variant bits (the exact value
+    # is only computable by the deriving julia — its internal hash varies)
+    @test PEF.parse_want_preimage(lines("aaaaaaaa-0000-0000-0000-00000000dead")) === nothing
+    @test PEF.is_uuid5_shaped(ext_uuid)
+    @test !PEF.is_uuid5_shaped("aaaaaaaa-0000-0000-0000-000000000001")  # v0 bits
+    @test !PEF.is_uuid5_shaped("not-a-uuid")
+    # v2 packages parse as before, with no ext_of
+    v2 = PEF.parse_want_preimage(join(["v2", "julia=1+a", "name=Foo",
+        "uuid=$parent", "version=1.0.0", "tree=$("11"^20)",
+        "flags=1", "prefs=0"], "\n"))
+    @test v2 !== nothing && v2.ext_of === nothing
+
+    # extension pins carry unversioned (stdlib) triggers as uuid-only directs
+    pins = Dict{String,Any}()
+    PEF.merge_want_pins!(pins, want; include_unversioned=true)
+    @test pins[parent]["version"] == "1.0.0"
+    @test pins["aaaaaaaa-0000-0000-0000-000000000002"] ==
+          Dict("uuid" => "aaaaaaaa-0000-0000-0000-000000000002")
+    # ...but never for package derivations (the default)
+    pins2 = Dict{String,Any}()
+    PEF.merge_want_pins!(pins2, want)
+    @test !haskey(pins2, "aaaaaaaa-0000-0000-0000-000000000002")
+end
+
 @testset "derivation want pins" begin
     # regression: want dep tuples have no `name` field (crashed 45 derivations
     # live); pins must build from uuid+version alone, skipping unkeyables

@@ -18,6 +18,7 @@ using JSON
 using TOML
 import HTTP
 import SHA
+import UUIDs
 
 hook_julia = get(ENV, "PKGEVAL_HOOK_JULIA", "")
 client_jl = normpath(joinpath(@__DIR__, "..", "..", "PkgEval.jl", "scripts", "cache_client.jl"))
@@ -30,24 +31,49 @@ const UUID_S = "c0ffee00-1234-4321-abcd-0123456789ab"
 const TREE = "1111111111111111111111111111111111111111"
 const DEP_UUID = "c0ffee00-1234-4321-abcd-0123456789ac"
 const DEP_TREE = "2222222222222222222222222222222222222222"
+const TRIG_UUID = "c0ffee00-1234-4321-abcd-0123456789ad"
+const TRIG_TREE = "3333333333333333333333333333333333333333"
+const EXT_NAME = "ProtoTrigExt"
 
 function setup_depot(dir)
     # compute the package-store slugs with the julia under test, so layout
     # matches what its loader expects for registry-installed packages
     slug(u, t) = readchomp(`$hook_julia --startup-file=no -e "print(Base.version_slug(Base.UUID(\"$u\"), Base.SHA1(\"$t\")))"`)
     depot = joinpath(dir, "depot")
-    src = joinpath(depot, "packages", "ProtoPkg", slug(UUID_S, TREE), "src")
-    mkpath(src)
-    write(joinpath(src, "ProtoPkg.jl"),
+    root = joinpath(depot, "packages", "ProtoPkg", slug(UUID_S, TREE))
+    mkpath(joinpath(root, "src"))
+    mkpath(joinpath(root, "ext"))
+    write(joinpath(root, "src", "ProtoPkg.jl"),
           "module ProtoPkg\nusing DepPkg\nanswer() = DepPkg.base() + 1\nend\n")
+    # a weak-dep-triggered extension: identity derives from the parent
+    write(joinpath(root, "Project.toml"), """
+        name = "ProtoPkg"
+        uuid = "$UUID_S"
+        version = "0.1.0"
+
+        [deps]
+        DepPkg = "$DEP_UUID"
+
+        [weakdeps]
+        TrigPkg = "$TRIG_UUID"
+
+        [extensions]
+        $EXT_NAME = "TrigPkg"
+        """)
+    write(joinpath(root, "ext", "$EXT_NAME.jl"),
+          "module $EXT_NAME\nusing ProtoPkg, TrigPkg\nend\n")
     dep_src = joinpath(depot, "packages", "DepPkg", slug(DEP_UUID, DEP_TREE), "src")
     mkpath(dep_src)
     write(joinpath(dep_src, "DepPkg.jl"), "module DepPkg\nbase() = 41\nend\n")
+    trig_src = joinpath(depot, "packages", "TrigPkg", slug(TRIG_UUID, TRIG_TREE), "src")
+    mkpath(trig_src)
+    write(joinpath(trig_src, "TrigPkg.jl"), "module TrigPkg\ntval() = 10\nend\n")
     proj = joinpath(dir, "proj")
     mkpath(proj)
     write(joinpath(proj, "Project.toml"), """
         [deps]
         ProtoPkg = "$UUID_S"
+        TrigPkg = "$TRIG_UUID"
         """)
     write(joinpath(proj, "Manifest.toml"), """
         julia_version = "1.14.0"
@@ -55,14 +81,23 @@ function setup_depot(dir)
 
         [[deps.ProtoPkg]]
         deps = ["DepPkg"]
+        weakdeps = ["TrigPkg"]
         git-tree-sha1 = "$TREE"
         uuid = "$UUID_S"
         version = "0.1.0"
+
+            [deps.ProtoPkg.extensions]
+            $EXT_NAME = "TrigPkg"
 
         [[deps.DepPkg]]
         git-tree-sha1 = "$DEP_TREE"
         uuid = "$DEP_UUID"
         version = "0.2.0"
+
+        [[deps.TrigPkg]]
+        git-tree-sha1 = "$TRIG_TREE"
+        uuid = "$TRIG_UUID"
+        version = "0.3.0"
         """)
     return depot, proj
 end
@@ -74,6 +109,7 @@ function run_client(depot, proj, server, script; namespace="e2e")
         """)`
     env = ["JULIA_DEPOT_PATH" => depot * ":",
            "PKGEVAL_CACHE_SERVER" => server,
+           "PKGEVAL_CACHE_DEBUG" => get(ENV, "PKGEVAL_CACHE_DEBUG", "0"),
            "PKGEVAL_CACHE_NAMESPACE" => namespace]
     out = IOBuffer()
     ok = success(pipeline(addenv(cmd, env...); stdout=out, stderr=out))
@@ -86,18 +122,24 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
     mktempdir() do dir
         depot_a, proj = setup_depot(dir)
 
-        # producer: compile cold, then emit context keys for both units
+        # producer: compile cold, then emit context keys — the unit emit
+        # covers its triggered extension too (the seal-job path)
         keys_unit = joinpath(dir, "keys_unit.toml")
         keys_dep = joinpath(dir, "keys_dep.toml")
+        keys_trig = joinpath(dir, "keys_trig.toml")
         ok, out = run_client(depot_a, proj, "http://127.0.0.1:1", """
-            using ProtoPkg
+            using ProtoPkg, TrigPkg
             @assert ProtoPkg.answer() == 42
-            PkgEvalCacheClient.emit_produced_keys("ProtoPkg", $(repr(keys_unit)))
+            @assert Base.get_extension(ProtoPkg, :$EXT_NAME) !== nothing
+            PkgEvalCacheClient.emit_produced_keys_with_extensions("ProtoPkg", $(repr(keys_unit)))
             PkgEvalCacheClient.emit_produced_keys("DepPkg", $(repr(keys_dep)))
+            PkgEvalCacheClient.emit_produced_keys("TrigPkg", $(repr(keys_trig)))
             """)
         @test ok || error(out)
         unit = parse_keys(keys_unit, "ProtoPkg")
+        ext = parse_keys(keys_unit, EXT_NAME)
         dep = parse_keys(keys_dep, "DepPkg")
+        trig = parse_keys(keys_trig, "TrigPkg")
         @test unit["uuid"] == UUID_S && dep["uuid"] == DEP_UUID
         @test occursin(r"^[0-9a-f]{64}$", unit["key"])
         @test occursin(r"^[0-9a-f]{64}$", dep["key"])
@@ -111,6 +153,16 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
         unit_deps = unit["deps"]
         @test any(d -> d["uuid"] == DEP_UUID && d["key"] == dep["key"] &&
                        d["version"] == "0.2.0", unit_deps)
+        # the extension entry: derived uuid, v3 preimage binding parent + trigger.
+        # Base's (internal, non-RFC) uuid5 depends on the julia's hash, so the
+        # expectation must come from the julia under test, not this host
+        expected_ext_uuid = readchomp(`$hook_julia --startup-file=no -e "print(Base.uuid5(Base.UUID(\"$UUID_S\"), \"$EXT_NAME\"))"`)
+        @test ext["uuid"] == expected_ext_uuid
+        @test ext["ext_of"] == UUID_S
+        @test startswith(ext["preimage"], "v3\n")
+        @test occursin("ext_of=$UUID_S", ext["preimage"])
+        @test occursin(":0.1.0:$(unit["key"])", ext["preimage"])   # parent pinned
+        @test occursin(":0.3.0:$(trig["key"])", ext["preimage"])   # trigger pinned
 
         # frame both produced pairs the way the worker's publisher does
         compiled_a = joinpath(depot_a, "compiled")
@@ -120,7 +172,8 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
             vcat(reinterpret(UInt8, [htol(UInt64(length(ji)))]), ji,
                  reinterpret(UInt8, [htol(UInt64(length(so)))]), so)
         end
-        frames = Dict(unit["key"] => frame_of(unit), dep["key"] => frame_of(dep))
+        frames = Dict(unit["key"] => frame_of(unit), dep["key"] => frame_of(dep),
+                      trig["key"] => frame_of(trig), ext["key"] => frame_of(ext))
 
         # stub proxy speaking /ensure: hash the preimage, serve known keys,
         # collect the preimages of unknown ones (the derivation requests)
@@ -155,10 +208,13 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
             cp(joinpath(depot_a, "packages"), joinpath(depot_b, "packages"))
             ok, out = run_client(depot_b, proj, base, """
                 PkgEvalCacheClient.install!()
-                using ProtoPkg
+                using ProtoPkg, TrigPkg
                 @assert ProtoPkg.answer() == 42
-                @assert PkgEvalCacheClient.HITS[] == 2   # DepPkg, then ProtoPkg
-                for (name, uuid) in (("ProtoPkg", "$UUID_S"), ("DepPkg", "$DEP_UUID"))
+                @assert Base.get_extension(ProtoPkg, :$EXT_NAME) !== nothing
+                # DepPkg, ProtoPkg, TrigPkg, and the extension — zero compiles
+                @assert PkgEvalCacheClient.HITS[] == 4
+                for (name, uuid) in (("ProtoPkg", "$UUID_S"), ("DepPkg", "$DEP_UUID"),
+                                     ("TrigPkg", "$TRIG_UUID"), ("$EXT_NAME", "$(ext["uuid"])"))
                     id = Base.PkgId(Base.UUID(uuid), name)
                     cachefile = only(Base.find_all_in_cache_path(id))
                     @assert occursin("_fetched", basename(cachefile))
@@ -176,7 +232,7 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
             empty!(wants)
             ok, out = run_client(depot_c, proj, base, """
                 PkgEvalCacheClient.install!()
-                using ProtoPkg
+                using ProtoPkg, TrigPkg
                 @assert ProtoPkg.answer() == 42
                 @assert PkgEvalCacheClient.HITS[] == 0
                 println("MISS_OK")
@@ -185,7 +241,12 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
             @test occursin("MISS_OK", out)
             @test !isempty(wants)
             @test any(w -> occursin("uuid=$UUID_S", w) && occursin("tree=$TREE", w), wants)
-            @test all(w -> startswith(w, "v2\n"), wants)
+            @test all(w -> startswith(w, "v2\n") || startswith(w, "v3\n"), wants)
+            # the extension misses as a v3 want binding its parent
+            v3_ext_want = any(w -> startswith(w, "v3\n") && occursin("name=$EXT_NAME", w) &&
+                                   occursin("ext_of=$UUID_S", w), wants)
+            v3_ext_want || @error "no v3 ext want" firstlines=[join(first(split(w, "\n"), 5), " | ") for w in wants]
+            @test v3_ext_want
         finally
             close(server)
         end

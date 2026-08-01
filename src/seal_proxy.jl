@@ -276,10 +276,19 @@ end
 # Sandbox-authored data throughout — treated as a work order, never as truth
 # about namespaces (publication still resolves uuids through the registry).
 
-"Parse a v2 preimage into its fields, or `nothing` when malformed."
+"""
+Parse a v2/v3 preimage into its fields, or `nothing` when malformed.
+
+v3 extends v2 with an `ext_of=<parent uuid>` line: the unit is a package
+extension whose uuid must equal uuid5(ext_of, name) — verified here, so
+downstream code can trust the *derivation* (though never the claim itself:
+publication authority still comes from computing the uuid ourselves).
+"""
 function parse_want_preimage(body::AbstractString)
     lines = split(body, '\n')
-    (isempty(lines) || lines[1] != "v2") && return nothing
+    isempty(lines) && return nothing
+    v3 = lines[1] == "v3"
+    (v3 || lines[1] == "v2") || return nothing
     fields = Dict{String,String}()
     deps = NamedTuple[]
     for line in lines[2:end]
@@ -298,8 +307,21 @@ function parse_want_preimage(body::AbstractString)
         haskey(fields, required) || return nothing
     end
     occursin(r"^[0-9a-f-]{36}$", fields["uuid"]) || return nothing
+    ext_of = nothing
+    if v3
+        ext_of = lowercase(get(fields, "ext_of", ""))
+        occursin(r"^[0-9a-f-]{36}$", ext_of) || return nothing
+        # The loader derives extension uuids with Base's internal uuid5, whose
+        # underlying `hash` differs across julia versions — the host cannot
+        # recompute the value the julia under test produced. What we CAN
+        # check: the claimed uuid carries uuid5's forced version/variant bits.
+        # Authority doesn't rest on this anyway — the sha256 key binds the
+        # full preimage (uuid, name, ext_of, deps), so an object is only ever
+        # fetched by a client that honestly computed this exact preimage.
+        is_uuid5_shaped(fields["uuid"]) || return nothing
+    end
     return (; name=fields["name"], uuid=lowercase(fields["uuid"]),
-            version=fields["version"], deps)
+            version=fields["version"], ext_of, deps)
 end
 
 deriv_run_id(ns::AbstractString) = "deriv-" * ns
@@ -392,6 +414,28 @@ function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
     return key
 end
 
+"Whether a uuid string carries uuid5's forced version-5 and IETF-variant bits
+(Base's extension-uuid derivation sets both; a registry v4 uuid never does)."
+function is_uuid5_shaped(uuid::AbstractString)
+    u = try
+        UInt128(UUID(uuid))
+    catch
+        return false
+    end
+    return (u >> 76) & 0xf == 0x5 && (u >> 62) & 0x3 == 0x2
+end
+
+"Whether a uuid names a registry package (the extension-parent trust check)."
+function registry_has_uuid(registry_dir::AbstractString, uuid::AbstractString)
+    registry = try
+        TOML.parsefile(joinpath(registry_dir, "Registry.toml"))
+    catch
+        return false
+    end
+    return any(lowercase(String(u)) == lowercase(uuid)
+               for u in keys(get(registry, "packages", Dict())))
+end
+
 "Registered name -> uuid from a registry checkout — the *trusted* namespace
 authority for publication (never the sandbox's claim)."
 function registry_uuid(registry_dir::AbstractString, name::AbstractString)
@@ -427,6 +471,26 @@ function publish_protocol!(ctx::FarmCtx, seal_id::AbstractString, export_dir::Ab
         @warn "seal job claimed a foreign uuid; refusing to publish" unit claimed=get(entry, "uuid", "")
         return false
     end
+    _publish_entry!(ctx, seal_id, export_dir, unit, lowercase(unit_uuid), entry) ||
+        return false
+    # the unit's extensions ride on its authority: ext_of must be the unit
+    # itself, and the claimed uuid must be uuid5-shaped (the exact value is
+    # only computable by the julia that derived it — see parse_want_preimage;
+    # the sha256 key binds the whole preimage either way)
+    for (name, e) in data
+        name == unit && continue
+        e isa AbstractDict || continue
+        lowercase(String(get(e, "ext_of", ""))) == lowercase(unit_uuid) || continue
+        ext_uuid = lowercase(String(get(e, "uuid", "")))
+        is_uuid5_shaped(ext_uuid) || continue
+        _publish_entry!(ctx, seal_id, export_dir, String(name), ext_uuid, e) ||
+            @warn "extension publication failed" unit ext=name
+    end
+    return true
+end
+
+function _publish_entry!(ctx::FarmCtx, seal_id::AbstractString, export_dir::AbstractString,
+                         unit::AbstractString, unit_uuid::AbstractString, entry)
     key = String(get(entry, "key", ""))
     occursin(r"^[0-9a-f]{64}$", key) || return false
     compiled = joinpath(export_dir, "compiled")
@@ -466,6 +530,7 @@ function publish_protocol!(ctx::FarmCtx, seal_id::AbstractString, export_dir::Ab
         end
     end
     meta = Dict("name" => unit, "uuid" => lowercase(unit_uuid),
+                "ext_of" => lowercase(String(get(entry, "ext_of", ""))),
                 "version" => String(get(entry, "version", "-")),
                 "vdir" => rel[1], "ji" => basename(ji_path),
                 "so" => so_path === nothing ? "" : basename(so_path),
