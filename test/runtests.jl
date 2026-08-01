@@ -7,6 +7,13 @@ import PkgEval
 
 const PEF = PkgEvalFarm
 
+# PKGEVAL_TEST_ONLY=<name> runs a single expensive suite (seal, e2e, broker,
+# moto, sim) for fast iteration; the cheap inline testsets always run.
+const TEST_ONLY = get(ENV, "PKGEVAL_TEST_ONLY", "")
+want(name) = isempty(TEST_ONLY) || TEST_ONLY == name
+
+include("motohelpers.jl")
+
 @testset "PkgEvalFarm" begin
 
 @testset "schema" begin
@@ -225,20 +232,25 @@ end
     end
 end
 
-@testset "seal unit tests" begin
+want("seal") && @testset "seal unit tests" begin
     include("seal.jl")
 end
 
-@testset "cache-protocol e2e" begin
+want("e2e") && @testset "cache-protocol e2e" begin
     include("protocol_e2e.jl")
 end
 
-@testset "broker unit tests" begin
+# moto.jl reuses BrokerTests fixtures, so broker comes along with it
+(want("broker") || want("moto")) && @testset "broker unit tests" begin
     include("broker.jl")
 end
 
-@testset "moto integration" begin
+want("moto") && @testset "moto integration" begin
     include("moto.jl")
+end
+
+want("sim") && @testset "farm simulation" begin
+    include("sim.jl")
 end
 
 end
