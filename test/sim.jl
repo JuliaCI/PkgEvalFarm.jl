@@ -264,6 +264,16 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         # namespace — re-armed tombstones must converge, consumers must not
         # miss at all (first-pass inexact chains become exact hits)
         if final !== nothing && get(ENV, "PKGEVAL_SIM_PASSES", "1") == "2"
+            # pass 1 populated PkgEval's machine-local shared compilecache, which
+            # sits above the farm cache and would satisfy every pass-2 consumer
+            # locally (hits=0 misses=0). Empty it so pass 2 exercises the farm.
+            lock(PkgEval.compiled_lock) do
+                for dir in values(PkgEval.compiled_cache)
+                    isdir(dir) || continue
+                    foreach(p -> rm(p; recursive=true, force=true),
+                            readdir(dir; join=true))
+                end
+            end
             run2 = PEF.create_run(ctx, PEF.RunSpec(configs, packages, Dict{String,Any}());
                                   submitter="sim-pass2", reuse=false)
             @info "second pass" run2
