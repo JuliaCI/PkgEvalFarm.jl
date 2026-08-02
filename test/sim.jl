@@ -292,6 +292,7 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                 jobs2 = Dict(j["package"] => j for j in PEF.run_jobs(ctx, run2))
                 for pkg in packages
                     m = nothing
+                    log = ""
                     for _ in 1:10   # the log upload may trail the status flip
                         log = try
                             String(S3.get_object(cfg.bucket,
@@ -304,13 +305,7 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                         sleep(3)
                     end
                     if m === nothing
-                        lastlog = try
-                            String(S3.get_object(cfg.bucket,
-                                "runs/$run2/logs/primary/$pkg.log"; aws_config=aws))
-                        catch err
-                            "(fetch failed: $err)"
-                        end
-                        @error "no second-pass summary" pkg nbytes=length(lastlog) tail=last(lastlog, 500)
+                        @error "no second-pass summary" pkg nbytes=length(log) tail=last(log, 500)
                         # only killed jobs legitimately leave no summary
                         @test get(jobs2[pkg], "status", "") == "kill"
                         continue
