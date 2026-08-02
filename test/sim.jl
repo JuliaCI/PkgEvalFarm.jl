@@ -316,6 +316,12 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
                         continue
                     end
                     @info "second-pass cache traffic" pkg hits=m[1] misses=m[2]
+                    if parse(Int, m[2]) != 0
+                        for l in eachline(IOBuffer(log))
+                            occursin(r"\[cache_client\] (miss|unkeyable)", l) || continue
+                            @info "second-pass cache tail" pkg event=strip(l)
+                        end
+                    end
                     @test parse(Int, m[2]) == 0
                 end
             end
