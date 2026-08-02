@@ -1780,6 +1780,28 @@ try
                 @test resp.status == 200
                 @test occursin("RACEJI", String(resp.body))
 
+                # nohold probe (derivations): published contexts serve even
+                # while the key sits in the negative cache (poisoned by the
+                # pre-publication miss above); novel contexts 404 immediately
+                # without creating a derivation
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_new,
+                                      headers=["X-Nohold" => "1"],
+                                      status_exception=false)
+                @test resp.status == 200
+                @test occursin("RACEJI", String(resp.body))
+                pre_probe = join(["v2", "julia=1+a", "name=JSON", "uuid=$want_uuid",
+                                  "version=1.3.0", "tree=$("44"^20)", "flags=1", "prefs=0"], "
+")
+                key_probe = bytes2hex(PEF.SHA.sha256(codeunits(pre_probe)))
+                t0 = time()
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_probe,
+                                      headers=["X-Nohold" => "1"],
+                                      status_exception=false)
+                @test resp.status == 404
+                @test time() - t0 < 2.0      # no hold
+                @test PEF.get_seal_item(sctx, PEF.JobRef("deriv-otherns", "deriv",
+                                                         key_probe)) === nothing
+
                 # malformed preimages are rejected outright
                 @test ProxyHTTP.post("$base/ensure/v2/otherns"; body="v1\ngarbage",
                                      status_exception=false).status == 400

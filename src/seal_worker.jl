@@ -317,12 +317,18 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                             env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT,
                                      "PKGEVAL_CACHE_SERVER" => proxy_url(),
                                      "PKGEVAL_CACHE_NAMESPACE" => ns,
-                                     # no fetch hook: everything published is
-                                     # already in the depot, and holding on an
-                                     # unpublished key deadlocks the derivation
-                                     # against itself (seen live: TestEnv derive
-                                     # + 5 test jobs all inactivity-killed)
-                                     "PKGEVAL_CACHE_FETCH" => "0",
+                                     # probe-only fetch: canonical deps come
+                                     # from the store (so the produced preimage
+                                     # carries the build_ids consumers want —
+                                     # the sealed-depot mount alone fails the
+                                     # @depot source-path check and recompiles
+                                     # privately, wedging units like TimeZones
+                                     # in a permanent-miss state), but nothing
+                                     # ever holds: holding on an unpublished
+                                     # key deadlocks the derivation against
+                                     # itself (seen live: TestEnv derive + 5
+                                     # test jobs all inactivity-killed)
+                                     "PKGEVAL_CACHE_NOHOLD" => "1",
                                      # extension unit: install pins only; the
                                      # ext compiles once parent+triggers land
                                      "PKGEVAL_DERIVE_EXT" => is_ext ? "1" : "0"))

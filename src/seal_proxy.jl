@@ -206,12 +206,20 @@ function start_seal_proxy!(ctx::FarmCtx)
             end
             body = fetch_kv(ns, want.uuid, key)
             if body === nothing
-                try
-                    ingest_want(ctx, ns, preimage)
-                catch err
-                    @warn "ensure ingestion failed" err
+                if HTTP.header(req, "X-Nohold", "") == "1"
+                    # probe from a derivation: answer from the store without
+                    # holding or enqueuing (the consumer's own wants already
+                    # schedule the chain); authoritative look because the
+                    # negative cache may postdate a sibling's publish
+                    body = get_kv(ctx, ns, want.uuid, key)
+                else
+                    try
+                        ingest_want(ctx, ns, preimage)
+                    catch err
+                        @warn "ensure ingestion failed" err
+                    end
+                    body = hold_for_derivation(ctx, ns, want.uuid, key)
                 end
-                body = hold_for_derivation(ctx, ns, want.uuid, key)
             end
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
