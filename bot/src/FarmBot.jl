@@ -397,10 +397,9 @@ could strand a run whose first submission crashed between put and send.
 function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
                     packages::Vector{String}, context_json::String, submitter::String,
                     reuse::Bool=true)
-    created_at = isodate()
     item = Item(
         "run_id" => attr(run_id),
-        "created_at" => attr(created_at),
+        "created_at" => attr(isodate()),
         "submitter" => attr(submitter),
         "status" => attr("expanding"),
         "configs" => attr(configs_json),
@@ -426,13 +425,6 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
     end
     sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}";
                      queue_url=FarmLite.slow_queue(ctx))
-    # best-effort: the landing view just won't know about this run until its
-    # report lands, so a hiccup here must not fail the submission
-    try
-        publish_run_json(ctx, run_id, submitter, created_at, context_json, configs_json)
-    catch err
-        @error "failed to publish run.json" run_id msg=error_message(err)
-    end
     return created
 end
 
@@ -927,11 +919,6 @@ function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::Strin
     @info "run marked failed" run_id why
     # the stream filter only fires on "done", so failure is reported here
     run = get_run(ctx, run_id)
-    try
-        publish_run_json(ctx, run; failed_why=why)
-    catch err
-        @error "failed to publish failed run.json" run_id msg=error_message(err)
-    end
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
@@ -1033,14 +1020,9 @@ function report_failed_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
         rethrow()
     end
 
-    why = str(run, "failure_reason", "unspecified failure")
-    try
-        publish_run_json(ctx, run; failed_why=why)
-    catch err
-        @error "failed to publish failed run.json" run_id msg=error_message(err)
-    end
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
+    why = str(run, "failure_reason", "unspecified failure")
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
     deliver_final(gh, something(context.repo), something(context.issue), run,
                   mention * "run `" * run_id * "` **failed** — " * why * ".")
@@ -1264,63 +1246,6 @@ s3_public_url(ctx::LiteCtx, key::String) =
 # their data and the link just carries the run id
 report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://pkgeval-reports.julialang.org/")
 report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
-
-"""
-Public per-run submission record at `runs/<id>/report/run.json`: written at
-submission and rewritten with `failed_why` when the run fails, it is all the
-report page's landing view knows about a run that has no report.json yet
-(in flight, or failed before reporting). The job counters land next to it in
-progress.json (see `publish_progress`) once a worker expands the run.
-"""
-function publish_run_json(ctx::LiteCtx, run_id::String, submitter::String,
-                          created::String, context_json::String, configs_json::String;
-                          failed_why::Union{Nothing,String}=nothing)
-    io = IOBuffer()
-    print(io, "{\"id\":", JSON.json(run_id))
-    print(io, ",\"submitter\":", JSON.json(submitter))
-    print(io, ",\"created\":", JSON.json(created))
-    context = parse_json(context_json, RunContext)
-    if context.repo !== nothing && context.issue !== nothing
-        repo, issue = something(context.repo), something(context.issue)
-        print(io, ",\"trigger_url\":", JSON.json(trigger_link(repo, issue, context.comment)),
-              ",\"trigger_label\":", JSON.json("$repo#$issue"))
-    end
-    print(io, ",\"configs\":[")
-    for (i, c) in enumerate(parse_json(configs_json, Vector{ConfigInfo}))
-        i > 1 && print(io, ",")
-        print(io, "{\"name\":", JSON.json(something(c.name, "?")),
-              ",\"julia\":", JSON.json(something(c.julia, "nightly")), "}")
-    end
-    print(io, "]")
-    failed_why === nothing ||
-        print(io, ",\"failed\":true,\"why\":", JSON.json(something(failed_why)))
-    print(io, "}")
-    s3_put(ctx, report_key(run_id, "run.json"), String(take!(io));
-           content_type="application/json")
-    return nothing
-end
-
-publish_run_json(ctx::LiteCtx, run::Item; failed_why::Union{Nothing,String}=nothing) =
-    publish_run_json(ctx, str(run, "run_id"), str(run, "submitter", "?"),
-                     str(run, "created_at", ""), str(run, "context", "{}"),
-                     str(run, "configs", "[]"); failed_why)
-
-"""
-Mirror a live run's job counters to the public `progress.json` the dashboard's
-gauge reads (its Last-Modified doubles as the activity clock). Driven by the
-batched stream mapping on the runs table, so it refreshes about once a minute
-while jobs are completing and costs nothing when they aren't.
-"""
-function publish_progress(ctx::LiteCtx, run_id::String, run::Item)
-    # seal runs share the runs table but are internal: no dashboard entry
-    (isempty(run_id) || startswith(run_id, "seal-")) && return nothing
-    total = int(run, "total_jobs", 0)
-    total > 0 || return nothing   # not expanded yet
-    done = int(run, "completed_jobs", 0)
-    s3_put(ctx, report_key(run_id, "progress.json"),
-           "{\"done\":$done,\"total\":$total}"; content_type="application/json")
-    return nothing
-end
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1943,10 +1868,9 @@ end
 
 ## Lambda event dispatch
 #
-# One Lambda, several triggers:
+# One Lambda, three triggers:
 #   - Function URL: GitHub `issue_comment` webhooks (HMAC-verified) -> handle_command
-#   - DynamoDB stream on the runs table, twice: terminal statuses -> post report,
-#     batched "active" counter bumps -> refresh the dashboard's progress.json
+#   - DynamoDB stream on the runs table (filtered to status = "done") -> post report
 #   - EventBridge schedule (infrequent fallback) -> full notifications poll
 #
 # The webhook payload carries the comment/issue/repo inline, so the webhook path
@@ -2139,21 +2063,13 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         # runs that just reached a terminal state (the event source mapping
         # filters on status). Runs failed via mark_run_failed carry `reported`
         # already, so report_failed_run's claim quietly skips them here.
-        # "active" records are the other mapping's batched counter bumps: only
-        # the newest per run matters, and it becomes the public progress.json.
-        latest = Dict{String,Item}()
         for run in event.new_images
             status = str(run, "status", "")
             if status == "done"
                 report_finished_run(ctx, gh, run)
             elseif status == "failed"
                 report_failed_run(ctx, gh, run)
-            elseif status == "active"
-                latest[str(run, "run_id", "")] = run   # records arrive in stream order
             end
-        end
-        for (run_id, run) in latest
-            publish_progress(ctx, run_id, run)
         end
         return "{\"ok\":true}"
     elseif event.method !== nothing

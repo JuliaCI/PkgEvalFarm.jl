@@ -50,10 +50,9 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
     SEAL_CONFIG_NAME in config_names &&
         error("configuration name \"$SEAL_CONFIG_NAME\" is reserved for seal jobs")
 
-    created_at = isodate()
     Dynamodb.put_item(ddb_item(Dict(
             "run_id" => run_id,
-            "created_at" => created_at,
+            "created_at" => isodate(),
             "submitter" => String(submitter),
             "status" => "expanding",
             "configs" => JSON.json(config_to_dict.(spec.configs)),
@@ -71,30 +70,6 @@ function create_run(ctx::FarmCtx, spec::RunSpec; submitter::AbstractString,
     aws_retry() do
         SQS.send_message(JSON.json(Dict("run_id" => run_id, "expand" => true)),
                          slow_queue(ctx.cfg); aws_config=ctx.aws)
-    end
-
-    # public submission record for the report page's landing view (the bot's
-    # own LiteCtx create_run publishes the same shape); best-effort, a run
-    # without it just stays undecorated on the dashboard until its report
-    try
-        record = Dict{String,Any}(
-            "id" => String(run_id), "submitter" => String(submitter),
-            "created" => created_at,
-            "configs" => [Dict("name" => c.name, "julia" => c.julia)
-                          for c in spec.configs])
-        repo, issue = get(spec.context, "repo", nothing), get(spec.context, "issue", nothing)
-        if repo !== nothing && issue !== nothing
-            comment = get(spec.context, "comment", nothing)
-            record["trigger_url"] = "https://github.com/$repo/pull/$issue" *
-                (comment === nothing ? "" : "#issuecomment-$comment")
-            record["trigger_label"] = "$repo#$issue"
-        end
-        S3.put_object(ctx.cfg.bucket, report_key(run_id, "run.json"),
-            Dict("body" => JSON.json(record),
-                 "headers" => Dict("Content-Type" => "application/json"));
-            aws_config=ctx.aws)
-    catch err
-        @error "failed to publish run.json" run_id err
     end
     return run_id
 end
@@ -349,11 +324,12 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
         Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
             Dict("ConditionExpression" => "#s = :expanding",
                  "UpdateExpression" => "SET #s = :active, total_jobs = :total, " *
-                                       "completed_jobs = :reused",
+                                       "completed_jobs = :reused, updated_at = :now",
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":expanding" => "expanding", ":active" => "active",
-                     ":total" => length(jobs), ":reused" => length(reused))));
+                     ":total" => length(jobs), ":reused" => length(reused),
+                     ":now" => isodate())));
             aws_config=ctx.aws)
     catch err
         if is_conditional_failure(err)
@@ -602,8 +578,11 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),
-                 "UpdateExpression" => "ADD completed_jobs :one",
-                 "ExpressionAttributeValues" => ddb_item(Dict(":one" => 1))))];
+                 # updated_at is the dashboard's activity clock: when this run
+                 # last made progress, as opposed to created_at/finished_at
+                 "UpdateExpression" => "SET updated_at = :now ADD completed_jobs :one",
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":one" => 1, ":now" => isodate()))))];
             aws_config=ctx.aws)
     end
 

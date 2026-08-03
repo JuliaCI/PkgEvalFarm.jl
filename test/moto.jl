@@ -527,20 +527,10 @@ try
             @test run["packages"] == ["Example"]
             @test run["context"]["repo"] == "JuliaLang/julia"
             @test run["submitter"] == "keno via @pkgeval"
-            # the submission is published for the report page's landing view
-            runjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
-                PEF.report_key(run_id, "run.json"), Dict("return_raw" => true);
-                aws_config=aws))))
-            @test runjson["id"] == run_id
-            @test runjson["submitter"] == "keno via @pkgeval"
-            @test runjson["trigger_label"] == "JuliaLang/julia#12345"
-            # the trigger links straight to the comment that started the run
-            # (whose id is also the comment-derived run id's suffix)
-            @test runjson["trigger_url"] ==
-                  "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
-                  chopprefix(run_id, "gh-")
-            @test runjson["configs"][1]["name"] == "primary"
-            @test !haskey(runjson, "failed")
+            # the triggering comment is recorded (its id is also the
+            # comment-derived run id's suffix) so the report links straight
+            # to the comment that started the run
+            @test run["context"]["comment"] == parse(Int, chopprefix(run_id, "gh-"))
             @test run["configs"][1]["name"] == "primary"
             @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
             @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
@@ -568,6 +558,8 @@ try
                                                         duration=1.0, log="ok"))
             end
             @test PEF.get_run(ctx, run_id)["status"] == "done"
+            # the counter bumps stamped the dashboard's activity clock
+            @test haskey(PEF.get_run(ctx, run_id), "updated_at")
 
             # 3. next poll edits the report into the submission comment
             PEF.FarmBot.handle_invocation(lite, gh)
@@ -575,6 +567,14 @@ try
             @test edited[end].first == "700001"
             @test occursin("@keno: run `$run_id` finished", edited[end].second)
             @test occursin("no new package failures", edited[end].second)
+            # the published report anchors its trigger link on the comment
+            rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key(run_id, "report.json"), Dict("return_raw" => true);
+                aws_config=aws))))
+            @test rj["trigger_label"] == "JuliaLang/julia#12345"
+            @test rj["trigger_url"] ==
+                  "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
+                  chopprefix(run_id, "gh-")
             @test occursin("?run=$run_id", edited[end].second)
 
             # 4. and does not double-report
@@ -684,32 +684,6 @@ try
             n_edited6 = length(edited)
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
             @test length(posted) == 2 && length(edited) == n_edited6
-
-            # 6b. progress path: batched "active" counter bumps become the
-            #     public progress.json — last record per run wins; seal runs
-            #     and not-yet-expanded runs (total 0) write nothing
-            attr = PEF.FarmLite.attr
-            mkrec(id, done, total) = Dict("eventName" => "MODIFY",
-                "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(
-                    PEF.FarmLite.Item("run_id" => attr(id), "status" => attr("active"),
-                                      "completed_jobs" => attr(done),
-                                      "total_jobs" => attr(total))))))
-            progress_event = JSON.json(Dict("Records" => [
-                mkrec("gh-700777", 1, 6), mkrec("gh-700777", 2, 6),
-                mkrec("seal-abc123", 1, 3), mkrec("gh-700888", 0, 0)]))
-            @test JSON.parse(PEF.FarmBot.handle_event(progress_event, lite, gh))["ok"] == true
-            progjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
-                PEF.report_key("gh-700777", "progress.json"), Dict("return_raw" => true);
-                aws_config=aws))))
-            @test progjson == Dict("done" => 2, "total" => 6)
-            no_object(key) = try
-                S3.get_object(cfg.bucket, key, Dict("return_raw" => true); aws_config=aws)
-                false
-            catch
-                true
-            end
-            @test no_object(PEF.report_key("seal-abc123", "progress.json"))
-            @test no_object(PEF.report_key("gh-700888", "progress.json"))
 
             # 7. an unrecognized event falls back to the scheduled poll
             notifications[] = "[]"
@@ -851,20 +825,6 @@ try
         # terminal: a later failure path racing this one loses quietly
         PEF.fail_run(ctx, run_id, "another reason")
         @test PEF.get_run(ctx, run_id)["failure_reason"] == "the Julia build failed: http://bk/9"
-        # the bot's failure report rewrites the public run.json with why (this
-        # run has no GitHub context, so the stub is never contacted)
-        lfail = PEF.FarmLite.LiteCtx(; region="us-east-1",
-                    creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
-                    queue_url, slow_queue_url, runs_table="pkgeval-runs",
-                    jobs_table="pkgeval-jobs", bucket="pkgeval-results",
-                    endpoint="http://127.0.0.1:$port")
-        PEF.FarmBot.check_failed_runs(lfail,
-            PEF.FarmLite.GitHubCtx("unused", "http://127.0.0.1:1"))
-        failjson = JSON.parse(String(copy(S3.get_object(cfg.bucket,
-            PEF.report_key(run_id, "run.json"), Dict("return_raw" => true);
-            aws_config=aws))))
-        @test failjson["failed"] == true
-        @test failjson["why"] == "the Julia build failed: http://bk/9"
         # retire the run's stray expand message so later testsets don't claim it
         while (c = PEF.claim_job(ctx; wait=1)) !== nothing
             SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)

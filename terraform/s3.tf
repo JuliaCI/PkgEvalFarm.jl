@@ -31,23 +31,6 @@ locals {
           "${aws_s3_bucket.results.arn}/runs/*/report/*",
           "${aws_s3_bucket.results.arn}/runs/*/logs/*",
         ]
-      },
-      # The report page's landing view lists recent runs. Anonymous listing
-      # is allowed only with exactly this prefix and delimiter, so the only
-      # thing enumerable is the set of top-level run ids — whose reports and
-      # logs are public above anyway — never object keys.
-      {
-        Sid       = "PublicListRunIds"
-        Effect    = "Allow"
-        Principal = "*"
-        Action    = "s3:ListBucket"
-        Resource  = aws_s3_bucket.results.arn
-        Condition = {
-          StringEquals = {
-            "s3:prefix"    = "runs/"
-            "s3:delimiter" = "/"
-          }
-        }
       }
     ] : [],
     [

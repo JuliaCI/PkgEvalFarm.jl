@@ -533,28 +533,26 @@ const linkify = (s) =>   // escape first, then turn bare URLs into links
   // report.json is fetched straight from the results bucket; without ?run=
   // the page is the farm dashboard. ?bucket= overrides the bucket URL for
   // other deployments, or for local testing against a static file tree
-  // (?bucket=http://localhost:8000 with runs/<id>/report/report.json in it).
+  // (?bucket=http://localhost:8000 with runs/<id>/report/report.json in it);
+  // ?ddb= points the dashboard's live-state reads at a local DynamoDB.
   const params = new URLSearchParams(location.search);
   const runId = params.get("run");
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
-  if (!runId) return recentRuns(bucket, params);
+  if (!runId) return dashboard(bucket, params);
   try {
     D = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`);
   } catch (err) {
-    // no report — an unfinished (or failed) run still has its submission
-    // record to explain itself with
+    // no report — the runs table still explains an unfinished or failed run
     let run = null;
-    try {
-      run = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/run.json`);
-    } catch { /* nothing recorded at all */ }
+    try { run = await ddbClient(params).getRun(runId); } catch { /* stay bare */ }
     const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
     $("loadstate").innerHTML = run === null
       ? `Could not load the report for run <span class="mono">${escHtml(runId)}</span> ` +
         `(${escHtml(err.message)}).` + back
-      : run.failed
+      : run.status === "failed"
       ? `Run <span class="mono">${escHtml(runId)}</span> failed — ` +
-        linkify(run.why || "unspecified failure") + "." + back
+        linkify(run.failure_reason || "unspecified failure") + "." + back
       : `Run <span class="mono">${escHtml(runId)}</span> is still in progress — ` +
         "its report will appear here once it finishes." + back;
     return;
@@ -564,72 +562,156 @@ const linkify = (s) =>   // escape first, then turn bare URLs into links
   main(D);
 })();
 
-// ---- landing page: recent runs from the bucket listing --------------------
-// The bucket allows anonymous listing only of the top-level run prefixes
-// (exactly prefix=runs/&delimiter=/, see terraform/s3.tf); run ids embed
-// their creation time (YYYYMMDD-HHMMSS-...), so lexicographic order is
-// chronological and the newest runs are the tail of the listing.
-async function recentRuns(bucket, params) {
-  const esc = escHtml;
-  const ids = [];
-  try {
-    let token = null;
-    do {
-      const url = `${bucket}/?list-type=2&prefix=runs%2F&delimiter=%2F` +
-        (token ? `&continuation-token=${encodeURIComponent(token)}` : "");
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      const xml = new DOMParser().parseFromString(await resp.text(), "text/xml");
-      for (const p of xml.querySelectorAll("CommonPrefixes > Prefix")) {
-        const m = /^runs\/([^/]+)\/$/.exec(p.textContent);
-        // seal runs share the runs/ prefix but are internal machinery
-        if (m && !m[1].startsWith("seal-")) ids.push(m[1]);
-      }
-      token = xml.querySelector("IsTruncated")?.textContent === "true"
-        ? xml.querySelector("NextContinuationToken")?.textContent : null;
-    } while (token);
-    if (!ids.length) throw new Error("listing came back empty");
-  } catch (err) {
-    $("loadstate").textContent = `Could not list runs (${err.message}). ` +
-      "Open a report directly with ?run=<run id>.";
-    return;
-  }
-  ids.sort().reverse();
-  const shown = ids.slice(0, 30);
-  const when = (id) => {
-    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})/.exec(id);
-    return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]} UTC` : "";
+// ---- anonymous runs-table reads -------------------------------------------
+// The dashboard's live state is the runs table itself, read with short-lived
+// credentials from a Cognito identity pool that allows unauthenticated
+// identities (terraform/dashboard.tf) — their role can only read that table.
+// DynamoDB speaks SigV4, so the page carries a minimal signer (crypto.subtle).
+const AWS_REGION = "us-east-2";
+const RUNS_TABLE = "pkgeval-runs";
+const IDENTITY_POOL = "us-east-2:REPLACE-WITH-DASHBOARD-IDENTITY-POOL";
+
+function ddbClient(params) {
+  const enc = new TextEncoder();
+  const hex = (buf) => [...new Uint8Array(buf)]
+    .map((b) => b.toString(16).padStart(2, "0")).join("");
+  const sha256 = async (s) => hex(await crypto.subtle.digest("SHA-256", enc.encode(s)));
+  const hmac = async (key, msg) => {
+    const k = await crypto.subtle.importKey("raw",
+      typeof key === "string" ? enc.encode(key) : key,
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
   };
+
+  // ?ddb= points at a local DynamoDB (moto): it checks the signature's shape,
+  // not its value, so fixed dummy credentials do
+  const local = params.get("ddb");
+  const endpoint = (local || `https://dynamodb.${AWS_REGION}.amazonaws.com`)
+    .replace(/\/+$/, "") + "/";
+
+  let creds = null;
+  const cognito = async (target, body) => {
+    const resp = await fetch(`https://cognito-identity.${AWS_REGION}.amazonaws.com/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-amz-json-1.1",
+                 "X-Amz-Target": "AWSCognitoIdentityService." + target },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(target + ": HTTP " + resp.status);
+    return resp.json();
+  };
+  const getCreds = async () => {
+    if (local) return { key: "testing", secret: "testing", token: null };
+    if (creds && Date.now() < creds.until) return creds;
+    // reuse the identity across visits (minting one per load is pure churn);
+    // a cleared, expired, or deleted identity is simply re-minted
+    let id = null, got = null;
+    try { id = localStorage.getItem("pkgeval-identity"); } catch { /* private mode */ }
+    if (id) {
+      try { got = await cognito("GetCredentialsForIdentity", { IdentityId: id }); }
+      catch { /* re-mint below */ }
+    }
+    if (!got) {
+      id = (await cognito("GetId", { IdentityPoolId: IDENTITY_POOL })).IdentityId;
+      got = await cognito("GetCredentialsForIdentity", { IdentityId: id });
+      try { localStorage.setItem("pkgeval-identity", id); } catch { /* private mode */ }
+    }
+    const c = got.Credentials;
+    creds = { key: c.AccessKeyId, secret: c.SecretKey, token: c.SessionToken,
+              until: c.Expiration * 1000 - 5 * 60_000 };
+    return creds;
+  };
+
+  const call = async (action, body) => {
+    const { key, secret, token } = await getCreds();
+    const payload = JSON.stringify(body);
+    const now = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const date = now.slice(0, 8);
+    const headers = {
+      "content-type": "application/x-amz-json-1.0",
+      "host": new URL(endpoint).host,
+      "x-amz-date": now,
+      "x-amz-target": "DynamoDB_20120810." + action,
+    };
+    if (token) headers["x-amz-security-token"] = token;
+    const names = Object.keys(headers).sort();
+    const canonical = ["POST", "/", "", ...names.map((h) => h + ":" + headers[h]), "",
+                       names.join(";"), await sha256(payload)].join("\n");
+    const scope = `${date}/${AWS_REGION}/dynamodb/aws4_request`;
+    const toSign = ["AWS4-HMAC-SHA256", now, scope, await sha256(canonical)].join("\n");
+    let k = enc.encode("AWS4" + secret);
+    for (const part of [date, AWS_REGION, "dynamodb", "aws4_request"])
+      k = await hmac(k, part);
+    delete headers.host;   // fetch sets it; it lives only in the signature
+    headers.authorization = `AWS4-HMAC-SHA256 Credential=${key}/${scope}, ` +
+      `SignedHeaders=${names.join(";")}, Signature=${hex(await hmac(k, toSign))}`;
+    const resp = await fetch(endpoint, { method: "POST", headers, body: payload });
+    if (!resp.ok) throw new Error(action + ": HTTP " + resp.status);
+    return resp.json();
+  };
+
+  const unwrap = (av) => {
+    const t = Object.keys(av)[0], v = av[t];
+    return t === "S" ? v : t === "N" ? Number(v) : t === "NULL" ? null :
+           t === "L" ? v.map(unwrap) :
+           t === "M" ? Object.fromEntries(
+             Object.entries(v).map(([k2, x]) => [k2, unwrap(x)])) : v;
+  };
+  const unwrapItem = (item) =>
+    Object.fromEntries(Object.entries(item).map(([k2, v]) => [k2, unwrap(v)]));
+
+  return {
+    async scanRuns() {
+      const items = [];
+      let start = undefined;
+      do {
+        const r = await call("Scan", { TableName: RUNS_TABLE,
+          ...(start ? { ExclusiveStartKey: start } : {}) });
+        for (const it of r.Items || []) items.push(unwrapItem(it));
+        start = r.LastEvaluatedKey;
+      } while (start);
+      return items;
+    },
+    async getRun(id) {
+      const r = await call("GetItem",
+        { TableName: RUNS_TABLE, Key: { run_id: { S: id } } });
+      return r.Item ? unwrapItem(r.Item) : null;
+    },
+  };
+}
+
+// ---- landing page: the farm dashboard -------------------------------------
+// One Scan per minute renders every run's live truth — queued (expanding),
+// running (with the counters the workers bump transactionally, and the
+// updated_at those bumps stamp as an activity clock), failed with its reason,
+// or done. Finished runs get their verdict chip from the already-public
+// report.json (probed only for the newest dozen, cached across refreshes).
+async function dashboard(bucket, params) {
+  const esc = escHtml;
+  const ddb = ddbClient(params);
+  const reports = new Map();   // run id -> report.json (successes only)
+
+  const when = (iso) => iso
+    ? iso.replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC") : "";
   const href = (id) => "?run=" + encodeURIComponent(id) +
     (params.get("bucket") ? "&bucket=" + encodeURIComponent(params.get("bucket")) : "");
-  $("runidx-n").textContent = `(${shown.length} of ${ids.length})`;
-  $("runidx-rows").innerHTML = shown.map((id) => `
-    <div class="runidx-row">
-      <span class="rid"><a class="mono" target="_self" href="${esc(href(id))}">${esc(id)}</a
-        ><span class="runidx-chip" data-chip="${esc(id)}" hidden></span></span>
-      <span class="meta" data-run="${esc(id)}">${esc(when(id))}</span>
-    </div>`).join("");
-  $("loadstate").hidden = true;
-  $("runindex").hidden = false;
-  // probe the newest dozen: finished runs (report.json) get a verdict chip
-  // and their outcome; unfinished ones carry a run.json instead (written at
-  // submission, marked on failure), which moves live runs up into the
-  // in-progress section with a progress gauge. Runs with neither
-  // stay bare — they predate run.json, or their submission's upload failed
-  const runMeta = (run, id) => {
+  const jparse = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
+  const runMeta = (r) => {
     const bits = [];
-    if (run.trigger_url && run.trigger_label)
-      bits.push(`<a href="${esc(run.trigger_url)}">${esc(run.trigger_label)}</a>`);
-    else if (run.primary)   // untriggered (CLI) runs: say what was tested
-      bits.push(esc(run.primary.sha.slice(0, 10) +
-                    (run.against ? " vs " + run.against.sha.slice(0, 10) : "")));
-    else if (run.configs && run.configs.length)   // ditto, from a run.json
-      bits.push(esc(run.configs.map((c) => {
+    const ctx = jparse(r.context, {});
+    if (ctx.repo && ctx.issue) {   // triggered runs link to their comment/PR
+      const url = `https://github.com/${ctx.repo}/pull/${ctx.issue}` +
+        (ctx.comment ? `#issuecomment-${ctx.comment}` : "");
+      bits.push(`<a href="${esc(url)}">${esc(`${ctx.repo}#${ctx.issue}`)}</a>`);
+    } else {   // untriggered (CLI) runs: say what was tested
+      const configs = jparse(r.configs, []);
+      if (configs.length) bits.push(esc(configs.map((c) => {
         const h = (c.julia || "nightly").split("#").pop();
         return /^[0-9a-f]{7,40}$/.test(h) ? h.slice(0, 10) : h;
       }).join(" vs ")));
-    if (run.submitter && run.submitter !== "?") bits.push(esc(run.submitter));
-    if (run.total_jobs) bits.push(`${run.total_jobs} jobs`);
+    }
+    if (r.submitter && r.submitter !== "?") bits.push(esc(r.submitter));
+    if (r.total_jobs) bits.push(`${r.total_jobs} jobs`);
     return bits;
   };
   const elapsed = (a, b) => {
@@ -648,65 +730,95 @@ async function recentRuns(bucket, params) {
     }
     return n;
   };
-  const renderFinished = (id, D) => {
-    const n = countNewFails(D);
-    setChip(id, n ? "bad" : "ok",
-            n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
-    const bits = runMeta(D.run, id);
-    const took = D.run.finished && elapsed(D.run.created, D.run.finished);
-    if (took) bits.push(took);
-    if (D.run.cost > 0) bits.push(`$${D.run.cost.toFixed(2)}`);
-    bits.push(esc(when(id)));
-    metaEl(id).innerHTML = bits.join(" · ");
-  };
-  const renderFailed = (id, run) => {
-    setChip(id, "bad", "failed");
-    metaEl(id).innerHTML = [...runMeta(run, id), esc(when(id))].join(" · ");
-    // the (often long) reason gets its own line so the meta column — and its
-    // trigger links — stays aligned with every other row
-    const row = metaEl(id).closest(".runidx-row");
-    let fl = row.querySelector(".flr-line");
-    if (!fl) {
-      fl = document.createElement("div");
-      fl.className = "flr-line";
-      row.appendChild(fl);
+
+  const row = (r, chip, meta, extra) => `
+    <div class="runidx-row">
+      <span class="rid"><a class="mono" target="_self" href="${esc(href(r.run_id))}">${esc(r.run_id)}</a
+        ><span class="runidx-chip${chip ? " " + chip[0] : ""}" data-chip="${esc(r.run_id)}"${
+          chip ? "" : " hidden"}>${chip ? esc(chip[1]) : ""}</span></span>
+      <span class="meta" data-run="${esc(r.run_id)}">${meta}</span>${extra || ""}
+    </div>`;
+
+  const render = async () => {
+    // seal runs share the runs table but are internal machinery
+    const runs = (await ddb.scanRuns()).filter((r) => !r.run_id.startsWith("seal-"));
+    runs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || "") ||
+                        (a.run_id < b.run_id ? 1 : -1));
+    const shown = runs.slice(0, 30);
+    $("runidx-n").textContent = `(${shown.length} of ${runs.length})`;
+    const finished = [], active = [];
+    for (const r of shown) {
+      const bits = [...runMeta(r)];
+      if (r.status === "done") {
+        const took = r.finished_at && elapsed(r.created_at, r.finished_at);
+        if (took) bits.push(esc(took));
+        bits.push(esc(when(r.created_at)));
+        // verdict chip and cost arrive with the report probe below
+        finished.push(row(r, null, bits.join(" · ")));
+      } else if (r.status === "failed") {
+        bits.push(esc(when(r.created_at)));
+        // the (often long) reason gets its own line so the meta column — and
+        // its trigger links — stays aligned with every other row
+        finished.push(row(r, ["bad", "failed"], bits.join(" · "),
+          `<div class="flr-line"><span class="flr">${
+            linkify(r.failure_reason || "unspecified failure")}</span></div>`));
+      } else {   // expanding | active: the in-progress section
+        bits.push(esc(when(r.created_at)));
+        let gauge, chip;
+        if (r.status === "active" && r.total_jobs > 0) {
+          chip = ["run", "running"];
+          const done = r.completed_jobs || 0, total = r.total_jobs;
+          const ago = r.updated_at
+            ? Math.round((Date.now() - Date.parse(r.updated_at)) / 60000) : null;
+          gauge = `<span class="n">${done} of ${total} jobs${esc(
+              ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
+            }</span><span class="bar"><i style="width:${
+              Math.min(100, Math.round(done / total * 100))}%"></i></span>`;
+        } else {
+          chip = ["q", "queued"];
+          gauge = '<span class="n">waiting for a worker to expand the run</span>';
+        }
+        active.push(row(r, chip,
+          bits.join(" · ") + ` · <span class="runidx-prog">${gauge}</span>`));
+      }
     }
-    fl.innerHTML = `<span class="flr">${linkify(run.why || "unspecified failure")}</span>`;
+    $("runidx-rows").innerHTML = finished.join("");
+    $("runidx-active-rows").innerHTML = active.join("");
+    $("runidx-active").hidden = !active.length;
+    // verdict chips for the newest dozen finished runs; a just-finished run
+    // whose report is still being posted stays bare until the next refresh
+    await Promise.all(shown.slice(0, 12)
+      .filter((r) => r.status === "done").map(async (r) => {
+        const id = r.run_id;
+        let D = reports.get(id);
+        if (!D) {
+          try {
+            D = await fetchJson(`${bucket}/runs/${encodeURIComponent(id)}/report/report.json`);
+          } catch { return; }
+          reports.set(id, D);
+        }
+        const n = countNewFails(D);
+        setChip(id, n ? "bad" : "ok",
+                n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
+        const bits = [...runMeta(r)];
+        const took = r.finished_at && elapsed(r.created_at, r.finished_at);
+        if (took) bits.push(esc(took));
+        if (D.run.cost > 0) bits.push(`$${D.run.cost.toFixed(2)}`);
+        bits.push(esc(when(r.created_at)));
+        metaEl(id).innerHTML = bits.join(" · ");
+      }));
   };
-  // a live run that reached a terminal state moves back among the finished,
-  // newest first; the in-progress section folds away once it empties
-  const demote = (row, id) => {
-    const next = [...$("runidx-rows").children].find((r) =>
-      r.querySelector(".runidx-chip").dataset.chip < id);
-    $("runidx-rows").insertBefore(row, next || null);
-    if (!$("runidx-active-rows").children.length) $("runidx-active").hidden = true;
-  };
-  for (const id of shown.slice(0, 12)) {
-    const rjson = (name) =>
-      fetchJson(`${bucket}/runs/${encodeURIComponent(id)}/report/${name}`);
-    rjson("report.json")
-      .then((D) => renderFinished(id, D))
-      .catch(() => rjson("run.json").then((run) => {
-        if (run.failed) { renderFailed(id, run); return; }
-        // live run: move its row up, gauge progress now, and each minute
-        // re-probe — first for a terminal state, else refresh the gauge
-        const row = metaEl(id).closest(".runidx-row");
-        $("runidx-active-rows").appendChild(row);
-        $("runidx-active").hidden = false;
-        setChip(id, "q", "queued");
-        metaEl(id).innerHTML = [...runMeta(run, id), esc(when(id))].join(" · ") +
-          ' · <span class="runidx-prog"><span class="n"></span>' +
-          '<span class="bar" hidden><i style="width:0"></i></span></span>';
-        const tick = () => rjson("report.json")
-          .then((D) => { renderFinished(id, D); demote(row, id); clearInterval(iv); })
-          .catch(() => rjson("run.json").then((now) => {
-            if (now.failed) { renderFailed(id, now); demote(row, id); clearInterval(iv); }
-            else return liveProgress(bucket, id);
-          }).catch(() => {}));
-        const iv = setInterval(tick, 60_000);
-        liveProgress(bucket, id).catch(() => {});
-      }).catch(() => {}));
+
+  try {
+    await render();
+  } catch (err) {
+    $("loadstate").textContent = `Could not load runs (${err.message}). ` +
+      "Open a report directly with ?run=<run id>.";
+    return;
   }
+  $("loadstate").hidden = true;
+  $("runindex").hidden = false;
+  setInterval(() => render().catch(() => {}), 60_000);
 }
 
 const metaEl = (id) => document.querySelector(`.meta[data-run="${CSS.escape(id)}"]`);
@@ -716,34 +828,6 @@ const setChip = (id, cls, text) => {
   c.textContent = text;
   c.hidden = false;
 };
-
-// gauge an in-flight run's progress: the bot mirrors the run's job counters
-// into progress.json about once a minute (batched off the runs table's
-// stream), and the object's Last-Modified doubles as the activity clock
-async function liveProgress(bucket, id) {
-  const resp = await fetch(
-    `${bucket}/runs/${encodeURIComponent(id)}/report/progress.json`,
-    { cache: "no-cache" });
-  const prog = document.querySelector(
-    `.meta[data-run="${CSS.escape(id)}"] .runidx-prog`);
-  if (!prog) return;
-  if (!resp.ok) {   // not written yet: submitted, waiting for a worker
-    prog.querySelector(".n").textContent = "waiting for a worker to expand the run";
-    return;
-  }
-  const { done, total } = await resp.json();
-  const modified = resp.headers.get("Last-Modified");
-  const ago = modified
-    ? Math.round((Date.now() - Date.parse(modified)) / 60000) : null;
-  if (!total) return;
-  setChip(id, "run", "running");
-  prog.querySelector(".n").textContent = `${done} of ${total} jobs` +
-    (ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`);
-  const bar = prog.querySelector(".bar");
-  bar.hidden = false;
-  bar.querySelector("i").style.width =
-    `${Math.min(100, Math.round(done / total * 100))}%`;
-}
 
 function main(D) {
   // ---- vocabulary -------------------------------------------------------
