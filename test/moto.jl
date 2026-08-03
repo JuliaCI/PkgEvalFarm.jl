@@ -571,8 +571,8 @@ try
             rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
                 PEF.report_key(run_id, "report.json"), Dict("return_raw" => true);
                 aws_config=aws))))
-            @test rj["trigger_label"] == "JuliaLang/julia#12345"
-            @test rj["trigger_url"] ==
+            @test rj["run"]["trigger_label"] == "JuliaLang/julia#12345"
+            @test rj["run"]["trigger_url"] ==
                   "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
                   chopprefix(run_id, "gh-")
             @test occursin("?run=$run_id", edited[end].second)
