@@ -1,11 +1,12 @@
-# The cache-protocol scheme: a loopback proxy sandboxes fetch compile caches
+# The cache protocol: a loopback proxy sandboxes fetch compile caches
 # through, plus namespaced verified publication.
 #
-# There is deliberately no global switch. The scheme is decided per seal run
-# at expansion — "protocol" iff the julia under test carries
-# Base.CACHE_FETCH_HOOK (detected by running it *sandboxed*), "depot"
-# otherwise — and recorded on the seal run item, so a run can never straddle
-# schemes and hookless julias behave exactly as before the protocol existed.
+# Sealing requires the julia under test to carry Base.CACHE_FETCH_HOOK
+# (detected by running it *sandboxed* at expansion); hookless julias simply
+# run unsealed, exactly as before sealing existed. The scheme is recorded on
+# the seal run item so gates can recognize runs from retired schemes (the
+# pre-hook "depot" scheme) and run cold against them instead of misreading
+# them.
 #
 # Trust: the sandbox only ever GETs (the loader revalidates whatever it
 # fetched) and POSTs miss reports. Publication happens worker-side, and only
@@ -13,27 +14,26 @@
 # a malicious seal job can therefore only ever poison its own package's
 # namespace, which is the package a consumer had already decided to run.
 
-"Scheme recorded on a seal run item; absent (pre-scheme runs) means depot."
-seal_run_scheme(run::AbstractDict) = String(get(run, "scheme", "depot"))
+"Scheme recorded on a seal run item; anything but \"protocol\" (retired
+schemes, pre-scheme runs) gates nothing — consumers run cold."
+seal_run_scheme(run::AbstractDict) = String(get(run, "scheme", ""))
 
 # detection runs a sandboxed julia, so memoize per fingerprint per process;
 # tests (which have no sandbox) pin the answer via the override
-const SCHEME_CACHE = Dict{String,String}()
+const SEAL_SUPPORT_CACHE = Dict{String,Bool}()
 const SCHEME_LOCK = ReentrantLock()
-const SEAL_SCHEME_OVERRIDE = Ref{Union{Nothing,String}}(nothing)
+const SEAL_SUPPORT_OVERRIDE = Ref{Union{Nothing,Bool}}(nothing)
 
 """
-The sealing scheme for a configuration: "protocol" iff its julia carries the
-cache-fetch hook. Detection failures (and PkgEval forks without the detector)
-fall back to "depot" — the pre-protocol behavior, suboptimal but never a
-mixed state.
+Whether a configuration's julia carries the cache-fetch hook. Detection
+failures (and PkgEval forks without the detector) mean no sealing.
 """
-function detect_seal_scheme(config::PkgEval.Configuration, fingerprint::AbstractString)
-    SEAL_SCHEME_OVERRIDE[] === nothing || return something(SEAL_SCHEME_OVERRIDE[])
+function detect_seal_support(config::PkgEval.Configuration, fingerprint::AbstractString)
+    SEAL_SUPPORT_OVERRIDE[] === nothing || return something(SEAL_SUPPORT_OVERRIDE[])
     lock(SCHEME_LOCK) do
-        get!(SCHEME_CACHE, String(fingerprint)) do
+        get!(SEAL_SUPPORT_CACHE, String(fingerprint)) do
             isdefined(PkgEval, :julia_supports_cache_hook) &&
-                PkgEval.julia_supports_cache_hook(config) ? "protocol" : "depot"
+                PkgEval.julia_supports_cache_hook(config)
         end
     end
 end

@@ -582,7 +582,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         config = PkgEval.Configuration(config; cpus=[cpu])
         # redeliveries skip the package cache: cache interactions are the most likely
         # source of irreproducible failures (mirrors evaluate()'s retry behavior).
-        # The sealed depot and its gate are skipped too, for the same reason.
+        # The seal gate and cache protocol are skipped too, for the same reason.
         use_cache = claimed.attempts <= 1
         gated_seal_run = ""
         if use_cache
@@ -595,20 +595,17 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         # test all occupy it (the seal-gate wait above deliberately does not —
         # that time went to other jobs, which bill themselves)
         eval_started = time()
-        sealed_kwargs, sealed_cleanup = if isempty(gated_seal_run)
-            (;), Returns(nothing)
+        sealed_kwargs = if isempty(gated_seal_run)
+            (;)
         else
             seal_run = job_run(ctx, JobRef(gated_seal_run, SEAL_CONFIG_NAME, ""),
                                run_cache, run_cache_lock)
-            sealed_depot_kwargs(ctx, seal_id_of(gated_seal_run), [job.package];
-                                scheme=seal_run_scheme(seal_run))
+            # a seal run from a retired scheme gates nothing: run cold
+            seal_run_scheme(seal_run) == "protocol" ?
+                seal_protocol_kwargs(seal_id_of(gated_seal_run)) : (;)
         end
-        r = try
-            PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
+        r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
                                  use_cache, sealed_kwargs...)
-        finally
-            sealed_cleanup()
-        end
         JobResult(; status=String(r.status),
                   reason=r.reason === missing ? nothing : String(r.reason),
                   version=r.version === missing ? nothing : string(r.version),

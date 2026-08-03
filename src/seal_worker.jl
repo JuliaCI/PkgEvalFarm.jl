@@ -1,5 +1,5 @@
 # Worker-side sealing (docs/sealing.md): executing seal jobs, gating test jobs
-# on them (hold-and-fill), and materializing sealed depots.
+# on them (hold-and-fill), and executing derivations.
 #
 # There is deliberately no on-demand (filesystem-level) artifact layer: a
 # cache-dir miss carries no resolution context — no version, dep build_ids or
@@ -19,45 +19,23 @@ running cold. Cold is soft — whatever sealed by then is still consumed — so
 this trades duplicate compilation against latency, nothing more."
 seal_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_WAIT", "")), 20.0 * 60)
 
-"In-sandbox mount point of the materialized sealed depot. A constant: it
-appears in JULIA_DEPOT_PATH inside sandboxes."
-const SEALED_DEPOT_MOUNT = "/opt/pkgeval-sealed"
-
 """
-Prepare the evaluation kwargs that give a job read-only access to sealed
-artifacts: a per-job plain directory (hardlinks into the local cache) with the
-package's published closure, mounted read-only and appended to the sandbox
-depot path (via PKGEVAL_EXTRA_DEPOTS, understood by the PkgEval fork).
-
-Returns `(kwargs, cleanup)`; call `cleanup()` after the evaluation.
+Evaluation kwargs pointing a job's sandbox at the cache protocol: the loopback
+proxy address and its namespace. Empty when the proxy isn't running.
 """
-function sealed_depot_kwargs(ctx::FarmCtx, seal_id::AbstractString, packages;
-                             scheme::AbstractString="depot")
-    pkgeval_supports_seal() || return (;), Returns(nothing)
-    if scheme == "protocol"
-        # the sandbox fetches through the loopback proxy on demand; the
-        # expansion-side detection guarantees this julia carries the hook
-        proxy = SEAL_PROXY[]
-        proxy === nothing && return (;), Returns(nothing)
-        env = Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
-                   "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
-        # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
-        # rejection reasons in job logs when chasing convergence bugs
-        dbg = get(ENV, "PKGEVAL_JULIA_DEBUG", "")
-        isempty(dbg) || (env["JULIA_DEBUG"] = dbg)
-        haskey(ENV, "JULIA_CACHE_HOOK_TRACE") && (env["JULIA_CACHE_HOOK_TRACE"] = "1")
-        return (; env), Returns(nothing)
-    end
-    depot = mktempdir(prefix="pkgeval_sealed_depot_")
-    try
-        files, _ = sealed_closure!(ctx, seal_id, packages)
-        materialize_sealed_depot(seal_id, files, depot)
-    catch err
-        @warn "failed to materialize sealed depot; evaluating cold" seal_id err
-    end
-    kwargs = (; mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
-              env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT))
-    return kwargs, () -> rm(depot; recursive=true, force=true)
+function seal_protocol_kwargs(seal_id::AbstractString)
+    pkgeval_supports_seal() || return (;)
+    # the expansion-side detection guarantees this julia carries the hook
+    proxy = SEAL_PROXY[]
+    proxy === nothing && return (;)
+    env = Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
+               "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
+    # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
+    # rejection reasons in job logs when chasing convergence bugs
+    dbg = get(ENV, "PKGEVAL_JULIA_DEBUG", "")
+    isempty(dbg) || (env["JULIA_DEBUG"] = dbg)
+    haskey(ENV, "JULIA_CACHE_HOOK_TRACE") && (env["JULIA_CACHE_HOOK_TRACE"] = "1")
+    return (; env)
 end
 
 
@@ -71,72 +49,35 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     stop_heartbeat = start_heartbeat(ctx, claimed, "seal $(job.package)")
 
     result = try
-        seal_run = job_run(ctx, job, run_cache, run_cache_lock)
-        scheme = seal_run_scheme(seal_run)
-        protocol = scheme == "protocol"
         config = job_config(ctx, job, run_cache, run_cache_lock)
         # rr instruments test execution; sealing has none, so always disable it
         config = PkgEval.Configuration(config; cpus=[cpu], goal=:seal, rr=PkgEval.RRDisabled)
-        item = get_seal_item(ctx, job)
-        deps = item === nothing ? String[] : String.(get(item, "deps", String[]))
 
         eval_started = time()
         scratch = mktempdir(prefix="pkgeval_seal_")
         try
             export_dir = joinpath(scratch, "export")
             mkpath(export_dir)
-            indexes = Dict{String,Any}()
-            eval_kwargs = if protocol
-                # deps arrive on demand through the proxy; publication happens
-                # below, namespaced by the registry
-                kwargs, _ = sealed_depot_kwargs(ctx, seal_id, deps; scheme)
-                kwargs
-            else
-                # pull-before-compile: canonical dep artifacts in a read-only
-                # depot mean the produced cachefiles link against the
-                # published files
-                depot = joinpath(scratch, "depot")
-                indexes = try
-                    # all_versions: X's compat may resolve deps to versions
-                    # other than the ones their own seal jobs sealed; any
-                    # published variant is canonical and reusable
-                    files, indexes = sealed_closure!(ctx, seal_id, deps; all_versions=true)
-                    materialize_sealed_depot(seal_id, files, depot)
-                    indexes
-                catch err
-                    @warn "dep closure fetch failed; sealing cold" job.package err
-                    Dict{String,Any}()
-                end
-                (; mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
-                   env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT))
-            end
+            # deps arrive on demand through the proxy; publication happens
+            # below, namespaced by the registry
+            eval_kwargs = seal_protocol_kwargs(seal_id)
 
             r = PkgEval.evaluate_seal(config, PkgEval.Package(; name=job.package);
                                       use_cache=claimed.attempts <= 1,
                                       export_dir, eval_kwargs...)
             log = r.log === missing ? "" : String(r.log)
             if String(r.status) == "seal"
-                graph, files_by_pkg = parse_seal_export(export_dir)
-                if protocol
-                    unit_uuid = try
-                        registry_uuid(seal_registry_dir(config), job.package)
-                    catch err
-                        @warn "could not resolve unit uuid from the registry" job.package err
-                        nothing
-                    end
-                    published = unit_uuid !== nothing &&
-                        publish_protocol!(ctx, seal_id, export_dir, job.package, unit_uuid)
-                    log *= published ? "\n\nPublished the unit's cachefile pair" :
-                                       "\n\nNothing published for the unit"
-                else
-                    dep_files = Dict{String,Vector{String}}(
-                        pkg => String.(idx["files"]) for (pkg, idx) in indexes)
-                    published, tainted = publish_sealed!(ctx, seal_id,
-                        joinpath(export_dir, "compiled"), files_by_pkg, graph, dep_files)
-                    log *= "\n\nSealed $(length(published)) package(s)" *
-                           (isempty(tainted) ? "" :
-                            "; lost publication races for: $(join(tainted, ", "))")
+                graph, _ = parse_seal_export(export_dir)
+                unit_uuid = try
+                    registry_uuid(seal_registry_dir(config), job.package)
+                catch err
+                    @warn "could not resolve unit uuid from the registry" job.package err
+                    nothing
                 end
+                published = unit_uuid !== nothing &&
+                    publish_protocol!(ctx, seal_id, export_dir, job.package, unit_uuid)
+                log *= published ? "\n\nPublished the unit's cachefile pair" :
+                                   "\n\nNothing published for the unit"
                 record_learned_edges(ctx, job.package, get(graph, job.package, String[]))
                 JobResult(; status="sealed", version=r.version === missing ? nothing : string(r.version),
                           duration=Float64(r.duration), wall=time() - eval_started, log)
@@ -192,17 +133,16 @@ end
 ## derivation execution (docs/sealing.md, stage 2)
 
 """
-    fetch_derivation_closure(ctx, ns, roots) -> (artifacts, pins, missing)
+    derivation_pins(ctx, ns, roots) -> (pins, missing)
 
-Resolve a derivation's dependency closure by key: BFS from the want's direct
-deps through each artifact's `.meta` sidecar. `artifacts` is `(meta, blob)`
-pairs ready to materialize; `pins` maps uuid to name/version for the
-whole-environment pin; `missing` lists unfetchable keys (unkeyable "-" deps
-are skipped — stdlibs live in the julia build itself).
+Walk a derivation's dependency closure by key — BFS from the want's direct
+deps through each artifact's `.meta` sidecar — collecting `pins` (uuid to
+name/version, for the whole-environment pin). `missing` lists unfetchable
+keys (unkeyable "-" deps are skipped — stdlibs live in the julia build
+itself). Artifacts themselves arrive in-sandbox through the nohold probe.
 """
-function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
+function derivation_pins(ctx::FarmCtx, ns::AbstractString, roots)
     seen = Set{String}()
-    artifacts = Tuple{Dict{String,Any},Vector{UInt8}}[]
     pins = Dict{String,Any}()
     missing_keys = String[]
     queue = [(String(uuid), String(key)) for (uuid, key) in roots]
@@ -211,8 +151,7 @@ function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
         (key == "-" || key in seen) && continue
         push!(seen, key)
         meta_body = get_kv(ctx, ns, uuid, key; meta=true)
-        blob = get_kv(ctx, ns, uuid, key)
-        if meta_body === nothing || blob === nothing
+        if meta_body === nothing
             push!(missing_keys, key)
             continue
         end
@@ -222,12 +161,11 @@ function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
             push!(missing_keys, key)
             continue
         end
-        push!(artifacts, (meta, blob))
         version = String(get(meta, "version", "-"))
-        # extensions materialize into the depot but are never Pkg-addable:
-        # pinning one fails resolution outright ("expected package to be
-        # registered"); their meta carries the parent's version, so the
-        # version check alone does not exclude them
+        # extensions are never Pkg-addable: pinning one fails resolution
+        # outright ("expected package to be registered"); their meta carries
+        # the parent's version, so the version check alone does not exclude
+        # them
         is_ext_meta = !isempty(String(get(meta, "ext_of", "")))
         if version != "-" && !is_ext_meta
             pins[uuid] = Dict("name" => String(meta["name"]), "uuid" => uuid,
@@ -238,28 +176,7 @@ function fetch_derivation_closure(ctx::FarmCtx, ns::AbstractString, roots)
             push!(queue, (lowercase(String(get(d, "uuid", ""))), String(get(d, "key", "-"))))
         end
     end
-    return artifacts, pins, missing_keys
-end
-
-"Unpack fetched artifacts into a depot at the filenames their producers used."
-function materialize_derivation_depot(artifacts, depot::AbstractString)
-    # even with nothing to place (leaf package, or deps still in flight) the
-    # depot must exist: it becomes a bind-mount source, and mounting a
-    # nonexistent path crashed 162 derivations in the first fixed-pins run
-    mkpath(depot)
-    n = 0
-    for (meta, blob) in artifacts
-        pair = unframe_pair(blob)
-        pair === nothing && continue
-        ji, so = pair
-        dir = joinpath(depot, "compiled", String(meta["vdir"]), String(meta["name"]))
-        mkpath(dir)
-        write(joinpath(dir, String(meta["ji"])), ji)
-        so_name = String(get(meta, "so", ""))
-        !isempty(so_name) && !isempty(so) && write(joinpath(dir, so_name), so)
-        n += 1
-    end
-    return n
+    return pins, missing_keys
 end
 
 function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
@@ -288,20 +205,17 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             scratch = mktempdir(prefix="pkgeval_derive_")
             try
                 roots = [(d.uuid, d.key) for d in want.deps]
-                artifacts, pins, missing_keys = fetch_derivation_closure(ctx, ns, roots)
-                # Not-yet-published deps are NOT a decline: the sandbox fetches
-                # them through the proxy, which holds each request while that
-                # key's derivation is in flight (dataflow ordering by blocking;
-                # the slot meanwhile donates, see maybe_donate!). Deps the want
-                # names still get version-pinned so resolution stays exact even
-                # before their artifacts land.
+                pins, missing_keys = derivation_pins(ctx, ns, roots)
+                # Not-yet-published deps are NOT a decline: the derivation
+                # compiles them locally (the nohold probe below 404s) and its
+                # produced key is simply inexact until a later pass re-derives
+                # against the published set. Deps the want names still get
+                # version-pinned so resolution stays exact regardless.
                 is_ext = want.ext_of !== nothing
                 merge_want_pins!(pins, want; include_unversioned=is_ext)
                 isempty(missing_keys) ||
                     @info "deriving with deps in flight" key=first(job.package, 12) nmissing=length(missing_keys)
                 begin
-                    depot = joinpath(scratch, "depot")
-                    materialize_derivation_depot(artifacts, depot)
                     pins_file = joinpath(scratch, "derive_pins.toml")
                     open(pins_file, "w") do io
                         TOML.print(io, pins)
@@ -313,21 +227,15 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                                             uuid=UUID(want.uuid),
                                             version=VersionNumber(want.version));
                             use_cache=claimed.attempts <= 1, export_dir, pins_file,
-                            mounts=Dict("$SEALED_DEPOT_MOUNT:ro" => depot),
-                            env=Dict("PKGEVAL_EXTRA_DEPOTS" => SEALED_DEPOT_MOUNT,
-                                     "PKGEVAL_CACHE_SERVER" => proxy_url(),
+                            env=Dict("PKGEVAL_CACHE_SERVER" => proxy_url(),
                                      "PKGEVAL_CACHE_NAMESPACE" => ns,
                                      # probe-only fetch: canonical deps come
-                                     # from the store (so the produced preimage
+                                     # from the store, so the produced preimage
                                      # carries the build_ids consumers want —
-                                     # the sealed-depot mount alone fails the
-                                     # @depot source-path check and recompiles
-                                     # privately, wedging units like TimeZones
-                                     # in a permanent-miss state), but nothing
-                                     # ever holds: holding on an unpublished
-                                     # key deadlocks the derivation against
-                                     # itself (seen live: TestEnv derive + 5
-                                     # test jobs all inactivity-killed)
+                                     # but nothing ever holds: holding on an
+                                     # unpublished key deadlocks the derivation
+                                     # against itself (seen live: TestEnv
+                                     # derive + 5 test jobs inactivity-killed)
                                      "PKGEVAL_CACHE_NOHOLD" => "1",
                                      # extension unit: install pins only; the
                                      # ext compiles once parent+triggers land
@@ -415,7 +323,7 @@ function merge_want_pins!(pins::AbstractDict, want; include_unversioned::Bool=fa
             include_unversioned || continue
             # implied-extension dep lines are unversioned like stdlib triggers
             # but are never Pkg-addable; their uuid5 shape tells them apart
-            # (they reach the derive env via depot materialization instead)
+            # (they reach the derive env via the nohold fetch instead)
             is_uuid5_shaped(d.uuid) && continue
             pins[d.uuid] = Dict("uuid" => d.uuid)
         else

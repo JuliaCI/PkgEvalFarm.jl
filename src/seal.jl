@@ -40,13 +40,7 @@ sealing_enabled(cfg::FarmConfig) = !isempty(cfg.seal_queue_url)
 
 ## S3 layout
 #
-# compilecache/<seal-id>/files/<relpath>       depot-shaped artifact files
-# compilecache/<seal-id>/index/<Package>.json  transitive closure index
-#
-# `relpath` is relative to a depot's `compiled` dir, e.g. "v1.13/Foo/slug.ji".
-
-seal_artifact_key(seal_id, relpath) = "compilecache/$seal_id/files/$relpath"
-seal_index_key(seal_id, package) = "compilecache/$seal_id/index/$package.json"
+# compilecache/<ns>/kv/<uuid>/<key>[.meta]   protocol artifacts (seal_proxy.jl)
 
 is_not_found(err) = err isa AWS.AWSException &&
     (err.code in ("NoSuchKey", "NotFound", "404") ||
@@ -90,278 +84,9 @@ function put_sealed_object(ctx::FarmCtx, key::AbstractString, body::Vector{UInt8
     return String(existing) == Base64.base64encode(digest) ? :exists_same : :exists_differs
 end
 
-"""
-    publish_sealed!(ctx, seal_id, compiled_dir, files_by_pkg, graph,
-                    dep_files::Dict{String,Vector{String}}) -> (published, tainted)
-
-Publish a seal job's produced compilecache. `files_by_pkg` maps package name to
-relpaths under `compiled_dir`; `graph` maps package to its direct deps (within
-the resolved environment); `dep_files` carries the transitive file lists of
-dependencies that were already sealed elsewhere (from their fetched indexes).
-
-Publication is bottom-up in topological order. If a file loses its
-first-writer race against *different* content, everything that depends on it
-in this job is tainted and skipped: an already-published artifact may
-reference the exact dep files it was compiled against, and ours are not them.
-Each tainted package still has its own seal job, so nothing is lost.
-"""
-function publish_sealed!(ctx::FarmCtx, seal_id::AbstractString, compiled_dir::AbstractString,
-                         files_by_pkg::AbstractDict, graph::AbstractDict,
-                         dep_files::AbstractDict=Dict{String,Vector{String}}())
-    order = topo_order(collect(keys(files_by_pkg)), graph)
-    published = String[]
-    tainted = Set{String}()
-    transitive = Dict{String,Vector{String}}(k => v for (k, v) in dep_files)
-    for pkg in order
-        deps = [d for d in get(graph, pkg, String[]) if d != pkg]
-        if any(in(tainted), deps)
-            push!(tainted, pkg)
-            continue
-        end
-        ok = true
-        for rel in files_by_pkg[pkg]
-            body = read(joinpath(compiled_dir, rel))
-            outcome = put_sealed_object(ctx, seal_artifact_key(seal_id, rel), body)
-            if outcome == :exists_differs
-                ok = false
-                break
-            end
-        end
-        if !ok
-            push!(tainted, pkg)
-            continue
-        end
-        # transitive file list: own files plus every dep's (sealed-elsewhere deps
-        # contribute via dep_files, locally-compiled ones via this loop)
-        files = copy(files_by_pkg[pkg])
-        for d in deps
-            append!(files, get(transitive, d, String[]))
-        end
-        unique!(sort!(files))
-        transitive[pkg] = files
-        index = Dict("package" => pkg, "files" => files, "deps" => sort(deps),
-                     "sealed_at" => isodate(), "producer" => worker_identity())
-        put_sealed_object(ctx, seal_index_key(seal_id, pkg),
-                          Vector{UInt8}(codeunits(JSON.json(index)));
-                          content_type="application/json")
-        push!(published, pkg)
-    end
-    return published, sort!(collect(tainted))
-end
-
-"Kahn topological order over `nodes`; edges outside `nodes` are ignored, and
-nodes absent from `graph` (e.g. extension cache dirs) sort last — extensions
-depend on their parents, so last is the safe end."
-function topo_order(nodes::Vector{String}, graph::AbstractDict)
-    inset = Set(nodes)
-    known = [n for n in nodes if haskey(graph, n)]
-    unknown = sort([n for n in nodes if !haskey(graph, n)])
-    deps = Dict(n => [d for d in graph[n] if d in inset && d != n] for n in known)
-    order = String[]
-    ready = sort([n for n in known if isempty(deps[n])])
-    remaining = Dict(n => length(deps[n]) for n in known)
-    rdeps = Dict{String,Vector{String}}()
-    for n in known, d in deps[n]
-        push!(get!(Vector{String}, rdeps, d), n)
-    end
-    while !isempty(ready)
-        n = popfirst!(ready)
-        push!(order, n)
-        for r in get(rdeps, n, String[])
-            remaining[r] -= 1
-            remaining[r] == 0 && push!(ready, r)
-        end
-    end
-    # cycles (malformed metadata) fall out here; publish them anyway, unordered —
-    # worst case they taint and are covered by their own seal jobs
-    leftover = sort([n for n in known if !(n in Set(order))])
-    return [order; leftover; unknown]
-end
-
-
-## consumption: local artifact cache + per-job materialized depot
+## the local artifact cache
 
 seal_cache_root() = get(ENV, "PKGEVAL_SEAL_CACHE", joinpath(tempdir(), "pkgeval-seal-cache"))
-
-# indexes that recently 404'd, so gate checks and materialization don't hammer
-# S3 for never-sealed packages; entries expire (a seal may land any moment)
-const ABSENT_INDEXES = Dict{Tuple{String,String},Float64}()
-const ABSENT_LOCK = ReentrantLock()
-const ABSENT_TTL = 60.0
-
-"""
-Fetch (and cache on disk, immutably) the closure index of `package`, or
-`nothing` when it has not been published. The on-disk copy is trusted forever:
-indexes are create-only in S3.
-"""
-function fetch_seal_index(ctx::FarmCtx, seal_id::AbstractString, package::AbstractString)
-    path = joinpath(seal_cache_root(), seal_id, "index", "$package.json")
-    isfile(path) && return JSON.parsefile(path)
-    recently_absent = lock(ABSENT_LOCK) do
-        if get(ABSENT_INDEXES, (seal_id, package), 0.0) > time()
-            true
-        else
-            delete!(ABSENT_INDEXES, (seal_id, package))
-            false
-        end
-    end
-    recently_absent && return nothing
-    body = aws_retry() do
-        try
-            copy(S3.get_object(ctx.cfg.bucket, seal_index_key(seal_id, package),
-                               Dict("return_raw" => true); aws_config=ctx.aws))
-        catch err
-            # absence is an answer, not a retryable failure
-            is_not_found(err) ? nothing : rethrow()
-        end
-    end
-    if body === nothing
-        lock(ABSENT_LOCK) do
-            ABSENT_INDEXES[(seal_id, package)] = time() + ABSENT_TTL
-        end
-        return nothing
-    end
-    try
-        mkpath(dirname(path))
-        tmp = path * ".tmp.$(getpid())"
-        write(tmp, body)
-        mv(tmp, path; force=true)   # concurrent fetchers write identical content
-    catch err
-        @warn "index disk cache write failed; parsing from memory" path err maxlog=1
-    end
-    return JSON.parse(String(body))
-end
-
-"Download any of `relpaths` missing from the local cache; tolerate individual
-failures (a missing artifact just means a local compile later)."
-function ensure_sealed_artifacts!(ctx::FarmCtx, seal_id::AbstractString, relpaths)
-    root = joinpath(seal_cache_root(), seal_id, "files")
-    missing_paths = [rel for rel in relpaths if !isfile(joinpath(root, rel))]
-    isempty(missing_paths) && return nothing
-    asyncmap(missing_paths; ntasks=16) do rel
-        dest = joinpath(root, rel)
-        try
-            body = aws_retry() do
-                try
-                    copy(S3.get_object(ctx.cfg.bucket, seal_artifact_key(seal_id, rel),
-                                       Dict("return_raw" => true); aws_config=ctx.aws))
-                catch err
-                    # absence is an answer, not a retryable failure
-                    is_not_found(err) ? nothing : rethrow()
-                end
-            end
-            if body !== nothing
-                mkpath(dirname(dest))
-                tmp = dest * ".tmp.$(getpid()).$(objectid(current_task()))"
-                write(tmp, body)
-                mv(tmp, dest; force=true)
-            end
-        catch err
-            @warn "failed to fetch sealed artifact" rel err
-        end
-        nothing
-    end
-    return nothing
-end
-
-"""
-    materialize_sealed_depot(seal_id, relpaths, dest) -> ncached
-
-Hardlink locally-cached artifacts into `dest/compiled/<relpath>`, forming the
-plain read-only depot a job mounts. Hardlinks make per-job materialization
-O(files) metadata operations and zero bytes; copy is the cross-device fallback.
-"""
-function materialize_sealed_depot(seal_id::AbstractString, relpaths, dest::AbstractString)
-    root = joinpath(seal_cache_root(), seal_id, "files")
-    n = 0
-    for rel in relpaths
-        src = joinpath(root, rel)
-        isfile(src) || continue
-        target = joinpath(dest, "compiled", rel)
-        mkpath(dirname(target))
-        try
-            hardlink(src, target)
-        catch
-            isfile(target) || cp(src, target)
-        end
-        n += 1
-    end
-    return n
-end
-
-"""
-Every published relpath under one package's cache dir, straight from an S3
-listing. Indexes only record the versions their producing seal job resolved,
-but dependents with tighter compat may have published *other* versions of the
-same package under `files/<vdir>/<pkg>/` — a listing sees them all, which is
-what dynamic discovery wants.
-"""
-function list_sealed_package_files(ctx::FarmCtx, seal_id::AbstractString,
-                                   vdir::AbstractString, package::AbstractString)
-    prefix = "compilecache/$seal_id/files/$vdir/$package/"
-    files = String[]
-    token = nothing
-    while true
-        params = Dict{String,Any}("prefix" => prefix)
-        token === nothing || (params["continuation-token"] = token)
-        resp = aws_retry() do
-            S3.list_objects_v2(ctx.cfg.bucket, params; aws_config=ctx.aws)
-        end
-        contents = get(resp, "Contents", [])
-        contents isa AbstractVector || (contents = [contents])
-        for obj in contents
-            key = String(obj["Key"])
-            push!(files, chopprefix(key, "compilecache/$seal_id/files/"))
-        end
-        get(resp, "IsTruncated", "false") in (true, "true") || break
-        token = get(resp, "NextContinuationToken", nothing)
-        token === nothing && break
-    end
-    return files
-end
-
-"The `vX.Y` cache directories present under a seal id (one delimiter listing)."
-function sealed_version_dirs(ctx::FarmCtx, seal_id::AbstractString)
-    prefix = "compilecache/$seal_id/files/"
-    resp = aws_retry() do
-        S3.list_objects_v2(ctx.cfg.bucket,
-                           Dict{String,Any}("prefix" => prefix, "delimiter" => "/");
-                           aws_config=ctx.aws)
-    end
-    prefixes = get(resp, "CommonPrefixes", [])
-    prefixes isa AbstractVector || (prefixes = [prefixes])
-    return [basename(chopsuffix(String(p["Prefix"]), "/")) for p in prefixes]
-end
-
-"""
-Closure of relpaths for `packages`, fetched into the local cache. Index-driven
-by default: a package's index lists the exact transitive files its seal job
-resolved, which is precisely what that package's *test* job wants.
-
-`all_versions=true` additionally lists each package's S3 prefix and takes
-every published cachefile: indexes are immutable and only record the versions
-their producer resolved, but dependents with tighter compat publish *other*
-versions under the same package dir. Seal jobs materialize deps this way, so
-pull-before-compile reuses canonical files whatever version resolution picks.
-"""
-function sealed_closure!(ctx::FarmCtx, seal_id::AbstractString, packages;
-                         all_versions::Bool=false)
-    files = Set{String}()
-    indexes = Dict{String,Any}()
-    vdirs = all_versions ? sealed_version_dirs(ctx, seal_id) : String[]
-    for pkg in packages
-        index = fetch_seal_index(ctx, seal_id, pkg)
-        if index !== nothing
-            indexes[pkg] = index
-            union!(files, String.(index["files"]))
-        end
-        for vdir in vdirs
-            union!(files, list_sealed_package_files(ctx, seal_id, vdir, pkg))
-        end
-    end
-    ensure_sealed_artifacts!(ctx, seal_id, files)
-    return files, indexes
-end
 
 "Drop cache entries untouched for `max_age` (default a week): PR-build seal ids
 die with their runs, and the S3 side re-materializes anything evicted early."
@@ -469,8 +194,7 @@ the reserved config name and an empty context, which the bot's delivery guards
 already skip; they start `active` (there is no expand phase — jobs are added
 directly, possibly across many user runs).
 """
-function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::AbstractString,
-                         scheme::AbstractString="depot")
+function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::AbstractString)
     run_id = seal_run_id(seal_id)
     seal_config = Dict{String,Any}(config_dict)
     seal_config["name"] = SEAL_CONFIG_NAME
@@ -481,9 +205,9 @@ function ensure_seal_run(ctx::FarmCtx, config_dict::AbstractDict, seal_id::Abstr
                 "submitter" => "sealer",
                 "status" => "active",
                 "kind" => "seal",
-                # decided once per fingerprint (create-only item): every job of
-                # this seal run — and every consumer gating on it — sees one scheme
-                "scheme" => String(scheme),
+                # recorded so gates can recognize (and run cold against) seal
+                # runs from retired schemes instead of misreading them
+                "scheme" => "protocol",
                 "configs" => JSON.json([seal_config]),
                 "packages" => "[]",
                 "context" => JSON.json(Dict("seal" => true)),
@@ -712,14 +436,17 @@ function setup_sealing(ctx::FarmCtx, run::AbstractDict, fresh::Vector{JobRef})
         try
             fingerprint = seal_fingerprint(config_dict)
             config = config_from_dict(config_dict)
-            scheme = detect_seal_scheme(config, fingerprint)
-            id = ensure_seal_run(ctx, config_dict, fingerprint, scheme)
+            if !detect_seal_support(config, fingerprint)
+                @info "julia lacks the cache-fetch hook; jobs run unsealed" config=name
+                continue
+            end
+            id = ensure_seal_run(ctx, config_dict, fingerprint)
             registry = seal_registry_dir(config)
             graph = seal_dep_graph(registry, packages, learned)
             ncreated, ready = add_seal_jobs(ctx, id, packages, graph)
             isempty(ready) || enqueue_seal_jobs(ctx, id, ready)
             mapping[name] = id
-            @info "sealing set up" run_id=run["run_id"] config=name seal_run=id scheme ncreated nready=length(ready)
+            @info "sealing set up" run_id=run["run_id"] config=name seal_run=id ncreated nready=length(ready)
         catch err
             @error "sealing setup failed for config; its jobs run cold" name exception=(err, catch_backtrace())
         end

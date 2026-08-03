@@ -5,9 +5,8 @@
 #
 # Gated on PKGEVAL_SIM_JULIA: a julia *install directory* (bin/julia inside) to
 # evaluate with. Point it at a cache-hook build (e.g. a cache-fetch-hook branch
-# checkout's usr/) and expansion's sandboxed detection selects the protocol
-# scheme, exercising the full ladder; a plain julia falls back to the depot
-# scheme, which is also a valid (smaller) simulation.
+# checkout's usr/); expansion's sandboxed detection requires the hook — a
+# plain julia runs everything unsealed.
 #
 # Host accommodations (attempted automatically, skipped with a message if
 # unavailable):

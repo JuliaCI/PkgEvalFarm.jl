@@ -25,18 +25,6 @@ const PEF = PkgEvalFarm
     @test PEF.seal_run_id(fp) == "seal-$fp"
 end
 
-@testset "topological publish order" begin
-    graph = Dict("A" => String[], "B" => ["A"], "C" => ["A", "B"])
-    order = PEF.topo_order(["C", "B", "A"], graph)
-    @test findfirst(==("A"), order) < findfirst(==("B"), order) < findfirst(==("C"), order)
-    # nodes without graph entries (extension cache dirs) sort last
-    order = PEF.topo_order(["AExt", "A"], Dict("A" => String[]))
-    @test order == ["A", "AExt"]
-    # a cycle still yields every node (publish anyway; taint covers the rest)
-    order = PEF.topo_order(["X", "Y"], Dict("X" => ["Y"], "Y" => ["X"]))
-    @test sort(order) == ["X", "Y"]
-end
-
 @testset "registry dependency graph" begin
     mktempdir() do reg
         mkpath(joinpath(reg, "J", "JSON"))
@@ -95,24 +83,6 @@ end
     mktempdir() do dir
         graph, files = PEF.parse_seal_export(dir)
         @test isempty(graph) && isempty(files)
-    end
-end
-
-@testset "materialize hardlinks" begin
-    mktempdir() do dir
-        cache = joinpath(dir, "cache")
-        withenv("PKGEVAL_SEAL_CACHE" => cache) do
-            src = joinpath(cache, "sid", "files", "v1.13", "Foo")
-            mkpath(src)
-            write(joinpath(src, "Foo_x.ji"), "content")
-            dest = joinpath(dir, "depot")
-            n = PEF.materialize_sealed_depot("sid", ["v1.13/Foo/Foo_x.ji", "v1.13/Foo/missing.ji"], dest)
-            @test n == 1   # missing files are skipped, not errors
-            target = joinpath(dest, "compiled", "v1.13", "Foo", "Foo_x.ji")
-            @test read(target, String) == "content"
-            # hardlink, not a copy (same inode) — per-job materialization is free
-            @test stat(target).inode == stat(joinpath(src, "Foo_x.ji")).inode
-        end
     end
 end
 

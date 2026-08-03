@@ -1,10 +1,9 @@
 # Sealed compilecache
 
 Design for sharing precompilation work across the fleet — and, eventually, for
-producing the artifacts a package server could serve. The consumer side is
-deliberately dumb (files in depots, stock loading semantics); all coordination
-lives in farm code, because the farm evaluates *arbitrary* Julia builds and can
-never require protocol support inside the Julia under test.
+producing the artifacts a package server could serve. All coordination lives
+in farm code plus a ~25-line loader hook (`Base.CACHE_FETCH_HOOK`) in the
+Julia under test; julias without the hook simply run unsealed.
 
 ## Overview
 
@@ -14,16 +13,18 @@ exactly like PkgEval's existing precompile phase), and precompile it with the
 exact CLI flags the test process will use (`--check-bounds=yes` + the config's
 `julia_args` — flag mismatch would silently make every artifact unreusable,
 see the `JULIA_PKG_PRECOMPILE_AUTO=0` note in PkgEval's sandbox setup). The
-produced compilecache files are published to S3, immutably. A **test job** for
-X waits (bounded) for seal(X) to reach a terminal state and then runs with the
-sealed artifacts mounted as a read-only secondary depot — fully warm, through
-completely stock loader semantics.
+produced compilecache pair is published to S3, immutably. A **test job** for
+X waits (bounded) for seal(X) to reach a terminal state and then runs with
+its sandbox pointed at the worker's loopback cache proxy — fully warm,
+through the loader hook, with stock validation semantics on every fetched
+candidate.
 
-Seal jobs are the *only* writers to the shared S3 layer. Test jobs keep using
-the machine-local scavenged cache exactly as before; that cache never crosses
-machines. This confines the poisoning surface of the cross-machine layer to
-what precompilation itself does — the same code any user executes on
-`Pkg.add`, which is the right trust bar for ever serving these files.
+Seal and derivation jobs are the *only* writers to the shared S3 layer. Test
+jobs keep using the machine-local scavenged cache exactly as before; that
+cache never crosses machines. This confines the poisoning surface of the
+cross-machine layer to what precompilation itself does — the same code any
+user executes on `Pkg.add`, which is the right trust bar for ever serving
+these files.
 
 ## S3 layout
 
@@ -32,26 +33,21 @@ the configuration fields that affect compilecache validity (julia spec,
 buildflags, julia_args, registry; scheduling-only fields like time limits and
 cpu pinning are excluded so they don't fragment the cache):
 
-    compilecache/<seal-id>/files/v1.13/<Package>/<slug>.{ji,so}   # depot-shaped
-    compilecache/<seal-id>/index/<Package>.json                   # closure index
+    compilecache/<seal-id>/kv/<uuid>/<key>         # framed .ji+.so pair
+    compilecache/<seal-id>/kv/<uuid>/<key>.meta    # names + direct-dep identities
 
-Both are written create-only (`If-None-Match: *`): **first writer wins, objects
-are immutable**. Losing a publication race is detected by comparing the sha256
-checksum of the existing object (uploads carry `x-amz-checksum-sha256`); a
-mismatch means some already-published dependent references a file we failed to
-publish — the affected subtree is simply not published by this job (each
-package has its own seal job, so nothing is lost, only deferred).
-
-The `files/` layout mirrors a depot, so a future package server can front the
-bucket directly and a resolving client can compute the exact paths it wants.
-The closure index lists the *transitive* file set for one package, so a
-consumer fetches one small object and then knows every file to download.
+`<key>` is the sha256 of the artifact's full build-context preimage (see the
+protocol below). Objects are written create-only (`If-None-Match: *`):
+**first writer wins, objects are immutable**. Losing a publication race is
+detected by comparing the sha256 checksum of the existing object (uploads
+carry `x-amz-checksum-sha256`).
 
 Precompile determinism is not assumed anywhere: resolution is a pure function
 of (registry snapshot, source, julia build), so seal(X) reproduces the same
-environment computation test(X) will perform; and Julia's loader validates
-every cache candidate itself, so a stale or mismatched artifact degrades to a
-local compile, never to a wrong result.
+environment computation test(X) will perform; keys bind the full build
+context, so an inexact reproduction produces a different key, never a wrong
+hit; and Julia's loader validates every fetched candidate itself, so a stale
+or mismatched artifact degrades to a local compile, never to a wrong result.
 
 By default seal jobs produce what PkgEval test jobs produce today (`.ji` under
 `--pkgimages=existing`), keeping test behavior byte-identical to the unsealed
@@ -82,9 +78,9 @@ cross-run cache reuse for free, and later runs only add jobs for packages not
 yet covered (create-only item writes keep the totals honest).
 
 Test-job dependency discovery that the static graph missed (runtime `Pkg.add`,
-platform-conditional deps) is handled by the policy filesystem below; seal-job
-discovery is handled by construction (the seal job resolves the real test env
-and reports its manifest, which is where learned edges come from).
+platform-conditional deps) is handled by the want/derivation machinery below;
+seal-job discovery is handled by construction (the seal job resolves the real
+test env and reports its manifest, which is where learned edges come from).
 
 ## Worker slot policy: prefer sealing, hold-and-fill
 
@@ -94,8 +90,8 @@ job's seal(X) is still pending, the slot **holds the claim** (heartbeats
 continue; nothing is re-enqueued, so no receive-count or attempt accounting is
 disturbed) and fills the wait with seal jobs: poll the seal queue, run what it
 gets, recheck seal(X) between jobs. Deadline or seal(X) terminal → run the
-test. "Cold" is soft: the materialized depot still serves whatever was sealed
-by then, so an aggressive deadline is safe.
+test. "Cold" is soft: the proxy still serves whatever was sealed by then, so
+an aggressive deadline is safe.
 
 Waiting slots polling the seal queue is what makes this deadlock-free: every
 pending seal is either in flight on some slot or gated on deps whose jobs are
@@ -105,45 +101,39 @@ worker crashing mid-decrement) are healed by `reconcile_seal_run`, run —
 throttled — by exactly the party that cares: a slot whose fill-poll came up
 empty while its test job is still gated.
 
-## Consumption: depot stacking, one materialized layer
+## Consumption: the worker's loopback proxy
 
-    JULIA_DEPOT_PATH = ~/.julia (job, rw) : materialized sealed dir (ro)
+The worker runs a loopback HTTP proxy per process; sandboxes reach it via
+`PKGEVAL_CACHE_SERVER`. The proxy answers from a local disk cache
+(`PKGEVAL_SEAL_CACHE`, immutable objects trusted forever), then S3. There is
+no filesystem-level cache layer and no daemon in the sandbox.
 
-The worker keeps a local cache of downloaded artifacts (`PKGEVAL_SEAL_CACHE`)
-and, before each job, hardlinks the job's closure into a plain per-job
-directory, bind-mounted read-only. Native filesystem, no daemon anywhere.
+## Why demand is a protocol, not a filesystem
 
-- A **test** job materializes from `index(X)`: the exact transitive file list
-  `seal(X)` resolved, which is exactly what `test(X)` will resolve.
-- A **seal** job materializes its deps from prefix *listings* (`all_versions`),
-  not indexes: X's compat may resolve a dep to a different version than the
-  dep's own seal job sealed, and any published variant is canonical — this is
-  what makes pull-before-compile effective under version skew. Whatever X
-  cold-compiles anyway (unpublished versions included) gets published and
-  indexed by X, so its test job is still exactly warm.
+An earlier revision of this design had file-shaped delivery: a policy FUSE
+that could *block* a cache-dir miss while an in-flight seal finished, later a
+read-only pre-materialized depot mount. Both were dropped for fundamental
+reasons. A path-shaped miss carries no resolution context (version, dep
+build_ids, preferences), so nothing behind a filesystem interface can cause
+the *right* artifact to be produced — it can only serve already-published
+bytes, and blocking on `seal(D)` is merely a bet that D's own resolution
+coincides with the requester's. And a cachefile materialized into a
+`packages/`-less secondary depot fails the loader's `@depot` source-path
+staleness check outright, so it is silently recompiled — file delivery must
+land in the *primary* depot, next to the sources it references, which is
+exactly where the loader hook writes. Demand-driven artifact generation
+inherently needs the resolver's view — the hook has it; a filesystem does
+not. The dynamic tail (runtime `Pkg.add` and friends) still compiles locally
+when its keys were never published, and learned edges fold it into the
+static closure over successive runs.
 
-## Why there is no on-demand (filesystem-level) layer
+## The cache protocol
 
-An earlier revision of this design had a policy FUSE at the end of the depot
-path that could *block* a cache-dir miss while an in-flight seal finished —
-suspension as filesystem latency. It was dropped for a fundamental reason: a
-path-shaped miss carries no resolution context (version, dep build_ids,
-preferences), so nothing behind a filesystem interface can cause the *right*
-artifact to be produced — it can only serve already-published bytes, and
-blocking on `seal(D)` is merely a bet that D's own resolution coincides with
-the requester's. Demand-driven artifact generation inherently needs the
-resolver's view; that is the future Pkg client protocol, not a farm concern.
-The dynamic tail (runtime `Pkg.add` and friends) therefore compiles locally,
-exactly as today, and learned edges fold it into the static closure over
-successive runs. The job-level gate is unaffected: it is package-scoped with
-full context via the `test(X)` ↔ `seal(X)` mapping.
-
-## The cache-protocol scheme (auto-selected per julia build)
-
-The depot scheme above has a residual trust hole: seal(X)'s published closure
-contains dependency files produced while X's code ran, so a malicious or
-buggy X can poison artifacts other packages load. The protocol scheme closes
-it by moving demand to a loader hook with full resolution context:
+A file-delivery scheme where seal(X) publishes its whole closure has a trust
+hole: the closure contains dependency files produced while X's code ran, so
+a malicious or buggy X could poison artifacts other packages load. The
+protocol closes it by moving demand to a loader hook with full resolution
+context and making publication per-unit under registry authority:
 
 - The julia-under-test carries `Base.CACHE_FETCH_HOOK` (the
   `cache-fetch-hook` branch); PkgEval's `scripts/cache_client.jl` installs a
@@ -168,11 +158,11 @@ it by moving demand to a loader hook with full resolution context:
 it carries the resolved version and the dep's *own* context key, and every
 published artifact carries a `.meta` sidecar (filenames plus its direct deps'
 identities and keys), making the store a by-key DAG. The proxy dedups each
-want into a derivation job on the seal queue; an executor slot resolves the
-closure by key through the meta chain (declining if anything was never
-published), materializes it, pins the *entire* environment
+want into a derivation job on the seal queue; an executor slot walks the
+closure by key through the meta chain, pins the *entire* environment
 (`/derive_pins.toml`), and runs `goal = :derive` — like `:seal` but without
-TestEnv, since the requester wanted the package as a dependency. The produced
+TestEnv, since the requester wanted the package as a dependency; the
+artifacts themselves arrive in-sandbox through the probe-only fetch below. The produced
 key is checked against the want; on mismatch (inexact environment
 reproduction) the artifact still publishes under its true key — which is
 exactly the canonical-chain key later bottom-up consumers compute, so keys
@@ -213,23 +203,27 @@ name an extension; it compiles once parent and triggers land), including
 uuid-only entries for unversioned stdlib triggers. Old proxies reject v3
 as malformed, which clients already treat as an ordinary miss.
 
-Derivation sandboxes are the one place the fetch hook is *not* installed
-(`PKGEVAL_CACHE_FETCH=0`; the client still loads to emit produced keys).
-Everything published is already materialized into the derivation's depot,
-so an in-sandbox fetch could only target unpublished keys — and holding on
-one deadlocks the derivation against the very publication it (or a donor
-sibling) is supposed to perform. Derivations compile missing deps locally;
-chains still converge because each hold-releasing publication triggers the
-requester's next want, dep-before-dependent.
+Derivation sandboxes fetch in **probe-only** mode (`PKGEVAL_CACHE_NOHOLD=1`,
+an `X-Nohold` header on every ensure): published deps are consumed from the
+store — essential, because the produced preimage then carries exactly the
+canonical dep build_ids consumers compute, making the derivation's key the
+key consumers want — but a miss answers 404 immediately, never holds, and
+never enqueues. Holding on an unpublished key would deadlock the derivation
+against the very publication it (or a donor sibling) is supposed to perform.
+The probe bypasses the proxy's negative cache (a sibling may have published
+within its TTL). Deps that genuinely aren't published yet get compiled
+locally; that derivation's key is then inexact, and a later pass's fresh
+want re-derives against the published set — convergence is monotone.
 
-There is no global switch. Expansion decides the scheme per configuration —
-"protocol" iff the julia under test carries `Base.CACHE_FETCH_HOOK`, detected
-by running it *sandboxed* (never on the host: detection carries exactly the
-same trust as evaluation) — and records it on the (per-fingerprint,
-create-only) seal run item. Every job of a seal run, and every test job
-gating on it, therefore sees one scheme; hookless julias get the depot
-scheme, i.e. exactly the pre-protocol behavior, and detection failures fall
-back the same way. Suboptimal beats a mixed state.
+There is no global switch. Expansion decides per configuration whether
+sealing happens at all — the julia under test must carry
+`Base.CACHE_FETCH_HOOK`, detected by running it *sandboxed* (never on the
+host: detection carries exactly the same trust as evaluation); hookless
+julias run unsealed, exactly the pre-sealing behavior, and detection
+failures fall back the same way. The seal run item records its scheme
+(`"protocol"`) create-only per fingerprint; gates treat any other value
+(runs created by retired schemes) as gating nothing, so a mixed-deploy
+window degrades to cold evaluation, never to a mixed state.
 
 ## Degradation ladder
 

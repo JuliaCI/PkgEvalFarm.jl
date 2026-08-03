@@ -1278,7 +1278,7 @@ try
             Crayons = "aaaaaaaa-0000-0000-0000-000000000002"
             """)
         PEF.SEAL_REGISTRY_OVERRIDE[] = reg
-        PEF.SEAL_SCHEME_OVERRIDE[] = "depot"   # no sandbox here to detect with
+        PEF.SEAL_SUPPORT_OVERRIDE[] = true   # no sandbox here to detect with
         cache_dir = mktempdir()
 
         withenv("PKGEVAL_SEAL_CACHE" => cache_dir) do
@@ -1360,56 +1360,18 @@ try
             # absent seal job (package never sealed) -> :none, run immediately
             @test PEF.seal_status(sctx, sr, "NeverSealed") == :none
 
-            # publication: first-writer-wins with checksums, topological
-            # ordering, taint on content mismatch
-            mktempdir() do export_dir
-                for (pkg, file) in [("Crayons", "Crayons_aa.ji"), ("JSON", "JSON_bb.ji")]
-                    mkpath(joinpath(export_dir, "v1.13", pkg))
-                    write(joinpath(export_dir, "v1.13", pkg, file), "bytes of $pkg")
-                end
-                graph = Dict("JSON" => ["Crayons"], "Crayons" => String[])
-                files = Dict("JSON" => ["v1.13/JSON/JSON_bb.ji"],
-                             "Crayons" => ["v1.13/Crayons/Crayons_aa.ji"])
-                sid = PEF.seal_id_of(sr)
-                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
-                @test sort(published) == ["Crayons", "JSON"] && isempty(tainted)
-
-                # identical republish: no-op, no taint
-                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
-                @test sort(published) == ["Crayons", "JSON"] && isempty(tainted)
-
-                # a losing race with *different* content taints the dependent
-                write(joinpath(export_dir, "v1.13", "Crayons", "Crayons_aa.ji"), "DIFFERENT")
-                published, tainted = PEF.publish_sealed!(sctx, sid, export_dir, files, graph)
-                if PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
-                                         Vector{UInt8}("x")) == :created &&
-                   PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
-                                         Vector{UInt8}("y")) == :exists_differs
-                    # moto reports checksums: full taint semantics observable
-                    @test published == String[] && tainted == ["Crayons", "JSON"]
-                else
-                    @test_skip "moto build doesn't return checksums; taint degrades to exists_unknown"
-                end
-
-                # consumption: index-driven closure fetch + hardlink depot
-                closure, indexes = PEF.sealed_closure!(sctx, sid, ["JSON"])
-                @test "v1.13/JSON/JSON_bb.ji" in closure
-                @test "v1.13/Crayons/Crayons_aa.ji" in closure   # transitive via index
-                @test haskey(indexes, "JSON")
-                depot = mktempdir()
-                @test PEF.materialize_sealed_depot(sid, closure, depot) == 2
-                @test read(joinpath(depot, "compiled", "v1.13", "Crayons", "Crayons_aa.ji"),
-                           String) == "bytes of Crayons"
-
-                # all_versions listing sees files indexes don't (version skew)
-                stray = "v1.13/Crayons/Crayons_zz.ji"
-                PEF.put_sealed_object(sctx, PEF.seal_artifact_key(sid, stray),
-                                      Vector{UInt8}("skewed"))
-                @test PEF.sealed_version_dirs(sctx, sid) == ["v1.13"]
-                listed = PEF.list_sealed_package_files(sctx, sid, "v1.13", "Crayons")
-                @test stray in listed
-                all_closure, _ = PEF.sealed_closure!(sctx, sid, ["Crayons"]; all_versions=true)
-                @test stray in all_closure
+            # publication primitive: create-only with checksum comparison —
+            # identical republish is a no-op, different content is detected
+            let sid = PEF.seal_id_of(sr)
+                @test PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
+                                            Vector{UInt8}("x")) == :created
+                @test PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
+                                            Vector{UInt8}("x")) in (:exists_same, :exists_unknown)
+                outcome = PEF.put_sealed_object(sctx, "compilecache/$sid/probe",
+                                                Vector{UInt8}("y"))
+                @test outcome in (:exists_differs, :exists_unknown)
+                outcome == :exists_unknown &&
+                    @test_skip "moto build doesn't return checksums"
             end
 
             # reconciliation: a stuck counter (deps all terminal) is healed and
@@ -1451,7 +1413,7 @@ try
             end
         end
         PEF.SEAL_REGISTRY_OVERRIDE[] = nothing
-        PEF.SEAL_SCHEME_OVERRIDE[] = nothing
+        PEF.SEAL_SUPPORT_OVERRIDE[] = nothing
     end
 
     @testset "cache-protocol scheme (proxy + namespaced publication)" begin
@@ -1465,9 +1427,10 @@ try
         sctx = FarmCtx(scfg, aws)
         cache_dir = mktempdir()
         withenv("PKGEVAL_SEAL_CACHE" => cache_dir) do
-            # scheme is a per-seal-run property now, not global state
+            # scheme is a per-seal-run property; anything but "protocol"
+            # (retired schemes, pre-scheme runs) gates nothing
             @test PEF.seal_run_scheme(Dict{String,Any}("scheme" => "protocol")) == "protocol"
-            @test PEF.seal_run_scheme(Dict{String,Any}()) == "depot"   # pre-scheme runs
+            @test PEF.seal_run_scheme(Dict{String,Any}()) != "protocol"
             proxy = PEF.start_seal_proxy!(sctx)
             try
                 base = "http://127.0.0.1:$(proxy.port)"
@@ -1570,11 +1533,10 @@ try
                 @test any(w -> occursin(uuid, w), proxy.wants)
 
                 # sandbox-facing kwargs carry the proxy coordinates, no mounts
-                kwargs, cleanup = PEF.sealed_depot_kwargs(sctx, ns, ["JSON"]; scheme="protocol")
+                kwargs = PEF.seal_protocol_kwargs(ns)
                 @test kwargs.env["PKGEVAL_CACHE_SERVER"] == base
                 @test kwargs.env["PKGEVAL_CACHE_NAMESPACE"] == ns
                 @test !haskey(kwargs, :mounts)
-                cleanup()
 
                 # --- stage 2: wants become derivation jobs -------------------
                 frame_rt = PEF.unframe_pair(PEF.frame_pair(Vector{UInt8}(b"JI"), Vector{UInt8}(b"SO")))
@@ -1636,23 +1598,12 @@ try
                 end
 
                 # the closure walk follows the meta chain and pins everything
-                artifacts, pins, missing_keys = PEF.fetch_derivation_closure(
-                    sctx, ns, [(uuid, unit_key)])
+                pins, missing_keys = PEF.derivation_pins(sctx, ns, [(uuid, unit_key)])
                 @test isempty(missing_keys)
-                @test length(artifacts) == 2
                 @test pins[dep_uuid]["version"] == "4.1.0"
                 @test pins[uuid]["name"] == "JSON"
-                depot = mktempdir()
-                @test PEF.materialize_derivation_depot(artifacts, depot) == 2
-                @test read(joinpath(depot, "compiled", "v1.13", "Crayons", "Crayons_kk.ji"),
-                           String) == "DEPJI"
-                # regression: zero artifacts (leaf package / deps in flight) must
-                # still create the depot — it becomes a bind-mount source
-                empty_depot = joinpath(mktempdir(), "depot")
-                @test PEF.materialize_derivation_depot([], empty_depot) == 0
-                @test isdir(empty_depot)
                 # a root that was never published is reported missing
-                _, _, missing2 = PEF.fetch_derivation_closure(sctx, ns, [(uuid, "12"^32)])
+                _, missing2 = PEF.derivation_pins(sctx, ns, [(uuid, "12"^32)])
                 @test missing2 == ["12"^32]
 
                 # want ingestion: dedup'd derivation job + one seal-queue message
