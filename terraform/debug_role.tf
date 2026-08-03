@@ -169,6 +169,15 @@ resource "aws_iam_role_policy" "debug" {
         Resource = [aws_dynamodb_table.runs.arn, aws_dynamodb_table.jobs.arn]
       },
       {
+        # Submitting runs from a debug session (`farm submit` = one run-item
+        # put + an expand message, which RedriveJobs above already covers).
+        # Runs-table only: job items stay worker-written.
+        Sid      = "SubmitRuns"
+        Effect   = "Allow"
+        Action   = "dynamodb:PutItem"
+        Resource = aws_dynamodb_table.runs.arn
+      },
+      {
         Sid      = "ReadResults"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:ListBucket"]
