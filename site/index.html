@@ -569,7 +569,7 @@ const linkify = (s) =>   // escape first, then turn bare URLs into links
 // DynamoDB speaks SigV4, so the page carries a minimal signer (crypto.subtle).
 const AWS_REGION = "us-east-2";
 const RUNS_TABLE = "pkgeval-runs";
-const IDENTITY_POOL = "us-east-2:REPLACE-WITH-DASHBOARD-IDENTITY-POOL";
+const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
 
 function ddbClient(params) {
   const enc = new TextEncoder();
