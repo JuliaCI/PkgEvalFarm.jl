@@ -403,7 +403,10 @@ function hold_and_fill!(ctx::FarmCtx, job::JobRef, seal_run_id::AbstractString, 
             nothing
         end
         if filled isa ClaimedJob
-            process_seal_job(ctx, filled, cpu, run_cache, run_cache_lock)
+            # the seal queue carries seal AND derivation messages: dispatch
+            # like the main claim path does, or a filled derivation crashes in
+            # seal processing (seen live: 66 error'd derivations, trial run 1)
+            process_job(ctx, filled, cpu, run_cache, run_cache_lock)
         else
             maybe_reconcile_seal_run(ctx, seal_run_id)
             sleep(15)
