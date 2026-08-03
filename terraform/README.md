@@ -436,9 +436,11 @@ caps fork-PR permissions at read-only, so such a job cannot mint a token at
 all. Guards IAM cannot express — only on `push`, only on a GitHub-hosted runner
 — live in the deploy job's `if:` and should be backed by branch protection.
 
-The `oidc-check` job in the workflow is a ~20s canary that assumes the role
-with no test/build dependency; use it to validate trust-policy changes without
-waiting for the full pipeline.
+To validate a trust-policy change without waiting for the full pipeline, add a
+throwaway job to the workflow that assumes the role and runs
+`aws sts get-caller-identity` (it must live in ci.yml itself so its
+`job_workflow_ref` matches the deploy job's); the publish job exercises the
+trust policy for real on every master push.
 
 Terraform bootstraps the initial bundles and then defers to CI: the zip objects
 and the functions' `source_code_hash` carry `ignore_changes`, so a later
