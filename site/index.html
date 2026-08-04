@@ -741,8 +741,10 @@ async function dashboard(bucket, params) {
     </div>`;
 
   const render = async () => {
-    // seal runs share the runs table but are internal machinery
-    const runs = (await ddb.scanRuns()).filter((r) => !r.run_id.startsWith("seal-"));
+    // seal runs and _-prefixed sentinels (e.g. the _fleet-generation record
+    // cloud-init claims) share the runs table but are internal machinery
+    const runs = (await ddb.scanRuns()).filter((r) =>
+      !r.run_id.startsWith("seal-") && !r.run_id.startsWith("_"));
     runs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || "") ||
                         (a.run_id < b.run_id ? 1 : -1));
     const shown = runs.slice(0, 30);
