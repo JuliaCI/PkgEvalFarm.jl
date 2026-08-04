@@ -573,7 +573,7 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   const runId = params.get("run");
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
-  if (!runId) return dashboard(bucket, params);
+  if (!runId) return dashboard(params);
   const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
   try {
     D = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`);
@@ -735,10 +735,9 @@ function ddbClient(params) {
 // updated_at those bumps stamp as an activity clock), failed with its reason,
 // or done. Finished runs get their verdict chip from the already-public
 // report.json (probed only for the newest dozen, cached across refreshes).
-async function dashboard(bucket, params) {
+async function dashboard(params) {
   const esc = escHtml;
   const ddb = ddbClient(params);
-  const reports = new Map();   // run id -> report.json (successes only)
 
   const when = (iso) => iso
     ? iso.replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC") : "";
@@ -768,18 +767,6 @@ async function dashboard(bucket, params) {
     if (!(s > 0)) return null;
     return s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
   };
-  const OKS = new Set(["t", "l"]);
-  const countNewFails = (D) => {
-    const hasA = !!D.run.against;
-    let n = 0;
-    for (const r of D.pkgs) {
-      const ps = r[2], as = r[5];
-      if (!hasA || !as) { if (!hasA && !OKS.has(ps) && ps !== "s") n++; continue; }
-      if (!OKS.has(ps) && ps !== "s" && OKS.has(as)) n++;
-    }
-    return n;
-  };
-
   const row = (r, chip, meta, extra) => `
     <div class="runidx-row">
       <span class="rid"><a class="mono" target="_self" href="${esc(href(r.run_id))}">${esc(r.run_id)}</a
@@ -836,46 +823,28 @@ async function dashboard(bucket, params) {
     $("runidx-rows").innerHTML = finished.join("");
     $("runidx-active-rows").innerHTML = active.join("");
     $("runidx-active").hidden = !active.length;
-    // reveal the table before the verdict-chip probes below: they cost
-    // another round of report.json fetches and shouldn't gate first paint
-    $("loadstate").hidden = true;
-    $("runindex").hidden = false;
     // verdict chips: the bot annotates each finished run with new_fails/cost
     // at report time, so chips render straight off the scan; runs predating
-    // the annotation fall back to probing report.json, capped at the newest
-    // dozen to bound the fetches (a just-finished run whose report is still
-    // being posted stays bare until the next refresh)
-    await Promise.all(shown.map(async (r, i) => {
-      if (r.status !== "done") return;
-      const id = r.run_id;
-      let n = r.new_fails, cost = r.cost || 0;
-      if (n == null) {
-        if (i >= 12) return;
-        let D = reports.get(id);
-        if (!D) {
-          try {
-            D = await fetchJson(`${bucket}/runs/${encodeURIComponent(id)}/report/report.json`);
-          } catch { return; }
-          reports.set(id, D);
-        }
-        n = countNewFails(D);
-        cost = D.run.cost || 0;
-      }
-      setChip(id, n ? "bad" : "ok",
-              n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
+    // the annotation (and a just-finished run whose report is still being
+    // posted) simply stay bare
+    for (const r of shown) {
+      if (r.status !== "done" || r.new_fails == null) continue;
+      const cost = r.cost || 0;
+      setChip(r.run_id, r.new_fails ? "bad" : "ok",
+              r.new_fails ? `${r.new_fails} new failure${r.new_fails === 1 ? "" : "s"}`
+                          : "no new failures");
       const bits = [...runMeta(r)];
       const took = r.finished_at && elapsed(r.created_at, r.finished_at);
       if (took) bits.push(esc(took));
       if (cost > 0) bits.push(`$${cost.toFixed(2)}`);
       bits.push(esc(when(r.created_at)));
-      metaEl(id).innerHTML = bits.join(" · ");
-    }));
+      metaEl(r.run_id).innerHTML = bits.join(" · ");
+    }
   };
 
   try {
     await render();
   } catch (err) {
-    $("loadstate").hidden = false;   // may already be hidden by a partial render
     $("loadstate").textContent = `Could not load runs (${err.message}). ` +
       "Open a report directly with ?run=<run id>.";
     return;
