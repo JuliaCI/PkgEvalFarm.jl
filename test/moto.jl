@@ -185,6 +185,7 @@ try
         @test occursin("Packages that failed on both", report.markdown)  # Crayons
         @test occursin("package has test failures", report.markdown)  # stored reason_message
         @test occursin("possible new issues: 1 package", report.summary)
+        @test report.new_fails == 1  # JSON regressed; Crayons fails on both
         # 5 jobs x 42 s + one 84 s wall-billed at $0.36/slot-h -> $0.0294
         @test occursin("estimated compute cost: \$0.03", report.markdown)
         @test isapprox(report.cost, (5 * 42.0 + 84.0) / 3600 * 0.36; rtol=1e-6)
@@ -733,6 +734,11 @@ try
             @test length(posted) == 4  # a fresh report comment...
             @test occursin("@keno: run `$webhook_run_id` finished", posted[end])
             @test deleted[end] == "700003"   # ...replacing the status comment
+            # reporting also annotated the run item with the scalars the
+            # dashboard's verdict chips read straight off its table scan
+            annotated = PEF.get_run(ctx, webhook_run_id)
+            @test annotated["new_fails"] == 0
+            @test annotated["cost"] == 0  # no job carried cost metering here
 
             # duplicate stream delivery does not double-report
             n_edited6 = length(edited)

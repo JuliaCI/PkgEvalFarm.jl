@@ -974,6 +974,20 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     end
 
     report = generate_report(ctx, run_id; run)
+    # annotate the run item with the two scalars the dashboard's verdict chips
+    # need, so it can render them straight off its Scan instead of fetching
+    # report.json per run; best-effort — without it the page falls back to the
+    # report.json probe
+    annotate = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+               "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+               "\"UpdateExpression\":\"SET new_fails = :nf, cost = :c\"," *
+               "\"ExpressionAttributeValues\":{\":nf\":{\"N\":\"$(report.new_fails)\"}," *
+               "\":c\":{\"N\":\"$(round(report.cost; digits=2))\"}}}"
+    try
+        ddb(ctx, "UpdateItem", annotate)
+    catch err
+        @warn "failed to annotate run with its chip data" run_id err
+    end
     context = parse_json(str(run, "context", "{}"), RunContext)
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
@@ -1446,10 +1460,12 @@ function dollars(x::Float64)
 end
 
 """
-    generate_report(ctx, run_id) -> (; summary, markdown)
+    generate_report(ctx, run_id) -> (; summary, markdown, url, cost, cost_partial, new_fails)
 
 Aggregate all job results into a markdown comparison report + `db.json`, uploaded to
-`runs/<run_id>/report/` in S3.
+`runs/<run_id>/report/` in S3. `new_fails` counts the packages the dashboard's
+verdict chip reports: primary-vs-against regressions for comparison runs, all
+non-skip failures for single-config runs.
 """
 function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, run_id))
     jobs = run_jobs(ctx, run_id)
@@ -1509,6 +1525,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
 
     config_names = String[something(c.name, "?") for c in configs]
     summary = ""
+    new_fails = 0
     if length(config_names) == 2
         by_pkg = Dict{String,Dict{String,Item}}()
         for job in jobs
@@ -1532,6 +1549,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
                 push!(still_failing, "- " * describe_job(ctx, p))
             end
         end
+        new_fails = length(new_failures)
         summary = isempty(new_failures) ? "no new package failures ✅" :
                   "possible new issues: $(length(new_failures)) package$(length(new_failures) == 1 ? "" : "s") ❌"
         println(io, "**", summary, "**\n")
@@ -1549,6 +1567,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     else
         npass = count(j -> issuccess(str(j, "status")), jobs)
         nfail = count(j -> str(j, "status") in ("fail", "crash", "kill", "error"), jobs)
+        new_fails = nfail
         summary = "$npass passed, $nfail failed"
         println(io, "**", summary, "**\n")
         for status in TERMINAL_STATUSES
@@ -1573,7 +1592,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            report_json(ctx, run, jobs, configs, total_cost, nmetered < nran);
            content_type="application/json")
     return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
-            cost_partial=(nmetered < nran))
+            cost_partial=(nmetered < nran), new_fails)
 end
 
 ## compact per-package dataset rendered by the report page
