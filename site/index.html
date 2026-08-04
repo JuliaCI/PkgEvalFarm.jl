@@ -1,4 +1,31 @@
 <!doctype html>
+<!--
+  Agents and scrapers: this page is client-rendered, so the HTML you are
+  reading carries no results. Fetch the data directly instead; <run_id> is
+  this page's ?run= query parameter, and the base is
+  https://pkgeval.s3.us-east-2.amazonaws.com
+
+    runs/<run_id>/report/report.md    human-readable summary (start here)
+    runs/<run_id>/report/report.json  compact dataset this page renders:
+        a `run` object (id, submitter, created/finished, trigger, builds,
+        cost; `in_progress: true` marks an hourly mid-run snapshot with
+        `done_jobs` of `total_jobs` evaluated as of `as_of`) plus `pkgs`
+        rows [name, version, primary status, reason idx, duration, against
+        status, reason idx, duration, version-if-different, primary logdir
+        idx, against logdir idx]; status chars t/l = pass, f = fail,
+        c = crash, k = kill, s = skip, e = error; reason/logdir indices
+        point into the `reasons` and `logdirs` arrays (-1 = none).
+    runs/<run_id>/report/db.json      full per-job records
+    <logdirs[i]>/<Package>.log        per-package logs — build the path from
+        `logdirs` (reused baseline results keep their donor run's prefix,
+        so it is not always this run's prefix)
+
+  The landing page (no ?run=) lists runs from the DynamoDB table
+  `pkgeval-runs` (us-east-2), which is anonymously readable: mint
+  credentials from the Cognito identity pool in IDENTITY_POOL below with
+  GetId + GetCredentialsForIdentity, then Scan/GetItem — live runs carry
+  status/completed_jobs/total_jobs/updated_at.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">
