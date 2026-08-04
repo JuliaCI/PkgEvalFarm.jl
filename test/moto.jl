@@ -504,6 +504,12 @@ try
                               JSON.parse(String(req.body))["body"])
                 TestHTTP.Response(200, "{}")
             end)
+        deleted = String[]  # comment ids removed (the status comment, on delivery)
+        TestHTTP.register!(router, "DELETE", "/repos/JuliaLang/julia/issues/comments/*",
+            req -> begin
+                push!(deleted, String(split(req.target, '/')[end]))
+                TestHTTP.Response(204)
+            end)
         gh_port, server = let p = 0, srv = nothing
             for attempt in 1:10   # random ports collide occasionally; retry
                 p = rand(30001:40000)
@@ -606,12 +612,13 @@ try
             # the counter bumps stamped the dashboard's activity clock
             @test haskey(PEF.get_run(ctx, run_id), "updated_at")
 
-            # 3. next poll edits the report into the submission comment
+            # 3. next poll posts the report as a *new* comment (edits send no
+            #    email notification) and removes the superseded status comment
             PEF.FarmBot.handle_invocation(lite, gh)
-            @test length(posted) == 1  # no new comment: the report arrives by edit
-            @test edited[end].first == "700001"
-            @test occursin("@keno: run `$run_id` finished", edited[end].second)
-            @test occursin("no new package failures", edited[end].second)
+            @test length(posted) == 2
+            @test occursin("@keno: run `$run_id` finished", posted[end])
+            @test occursin("no new package failures", posted[end])
+            @test deleted == ["700001"]   # the status comment is gone
             # the published report anchors its trigger link on the comment
             rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
                 PEF.report_key(run_id, "report.json"), Dict("return_raw" => true);
@@ -622,12 +629,12 @@ try
                   chopprefix(run_id, "gh-")
             # the final report replaced the work-in-progress snapshot outright
             @test !haskey(rj["run"], "in_progress")
-            @test occursin("?run=$run_id", edited[end].second)
+            @test occursin("?run=$run_id", posted[end])
 
             # 4. and does not double-report
             n_edited = length(edited)
             PEF.FarmBot.handle_invocation(lite, gh)
-            @test length(posted) == 1 && length(edited) == n_edited
+            @test length(posted) == 2 && length(edited) == n_edited
 
             # 5. webhook path: an issue_comment delivery submits a run with a
             #    single GitHub call (no notifications involved)
@@ -651,14 +658,14 @@ try
                 # bad signature is rejected without side effects
                 resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign("evil")), lite, gh))
                 @test resp["statusCode"] == 401
-                @test length(posted) == 1
+                @test length(posted) == 2
 
                 resp = JSON.parse(PEF.FarmBot.handle_event(webhook_event(payload, sign(payload)), lite, gh))
                 @test resp["statusCode"] == 200
             end
-            @test length(posted) == 2
-            @test occursin("has been submitted as run", posted[2])
-            webhook_run_id = match(r"run `([^`]+)`", posted[2]).captures[1]
+            @test length(posted) == 3
+            @test occursin("has been submitted as run", posted[3])
+            webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
             @test webhook_run_id == "gh-555111"  # deterministic, comment-derived
 
             # 5a. duplicate deliveries collapse into the one run: a webhook
@@ -676,9 +683,9 @@ try
                     "latest_comment_url" => "$(gh_base[])/repos/JuliaLang/julia/issues/comments/2"))])
             PEF.FarmBot.handle_invocation(lite, gh)
             notifications[] = "[]"
-            @test length(posted) == 2      # no extra ack comments
+            @test length(posted) == 3      # no extra ack comments
             # ... but that poll did edit a status body onto the webhook run's comment
-            @test edited[end].first == "700002"
+            @test edited[end].first == "700003"
             @test occursin("`gh-555111`", edited[end].second)
             run = PEF.get_run(ctx, "gh-555111")
             @test run["status"] == "expanding"  # still exactly one run, untouched
@@ -690,8 +697,8 @@ try
                     webhook_event(intruder, sign(intruder)), lite, gh))
                 @test resp["statusCode"] == 200
             end
-            @test length(posted) == 3
-            @test occursin("only members of the KenoAIStaging/pkgeval-submitters team", posted[3])
+            @test length(posted) == 4
+            @test occursin("only members of the KenoAIStaging/pkgeval-submitters team", posted[4])
             posted_refusal = pop!(posted)  # keep later indices stable
 
             # both authorization modes, checked directly
@@ -723,19 +730,19 @@ try
                 "eventName" => "MODIFY",
                 "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item))))]))
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
-            @test length(posted) == 2  # the report is an edit, not a new comment
-            @test edited[end].first == "700002"
-            @test occursin("@keno: run `$webhook_run_id` finished", edited[end].second)
+            @test length(posted) == 4  # a fresh report comment...
+            @test occursin("@keno: run `$webhook_run_id` finished", posted[end])
+            @test deleted[end] == "700003"   # ...replacing the status comment
 
             # duplicate stream delivery does not double-report
             n_edited6 = length(edited)
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
-            @test length(posted) == 2 && length(edited) == n_edited6
+            @test length(posted) == 4 && length(edited) == n_edited6
 
             # 7. an unrecognized event falls back to the scheduled poll
             notifications[] = "[]"
             @test JSON.parse(PEF.FarmBot.handle_event("{}", lite, gh))["ok"] == true
-            @test length(posted) == 2 && length(edited) == n_edited6  # all runs done
+            @test length(posted) == 4 && length(edited) == n_edited6  # all runs done
 
             # 8. a worker-failed run (e.g. its Julia build failed) is reported
             #    with the recorded reason on the next poll

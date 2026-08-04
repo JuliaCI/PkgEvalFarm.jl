@@ -494,6 +494,12 @@ function update_comment(gh::GitHubCtx, repo::String, comment_id::Int, body::Stri
     return nothing
 end
 
+function delete_comment(gh::GitHubCtx, repo::String, comment_id::Int)
+    resp = github_request(gh, "DELETE", "/repos/$repo/issues/comments/$comment_id")
+    resp.status == 204 || error("failed to delete comment (HTTP $(resp.status))")
+    return nothing
+end
+
 "Notifications-driven path: resolve the thread to a comment/issue, then run the command."
 function handle_mention(ctx::LiteCtx, gh::GitHubCtx, name::String,
                         subject::NotificationSubject)
@@ -642,7 +648,8 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     comment_id = post_comment(gh, repo, number, """
         Your package evaluation job has been submitted as run `$run_id` \
         (primary: `$primary`, against: `$against`). I will keep this comment \
-        updated with progress, and post the report here when it finishes.""")
+        updated with progress, and post the report as a new comment when it \
+        finishes.""")
     if comment_id !== nothing
         try
             record_comment_id(ctx, run_id, something(comment_id))
@@ -928,23 +935,23 @@ function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::Strin
 end
 
 """
-Deliver a run's final message: edit the submission comment when one was
-recorded (keeps PR threads quiet), falling back to a fresh comment otherwise.
-The requester still gets notified either way — GitHub sends mention
-notifications for @-mentions an edit *adds*, and the in-progress bodies
-deliberately contain no mention.
+Deliver a run's final message as a *new* comment, then delete the status
+comment when one was recorded. Editing the status comment in place kept
+threads tidy but sent no email — GitHub only notifies on new comments — so
+the final word arrives fresh and the superseded status body is removed
+(best-effort: a failed delete leaves a stale status comment behind, never
+blocks delivery).
 """
 function deliver_final(gh::GitHubCtx, repo::String, issue::Int, run::Item, body::String)
+    post_comment(gh, repo, issue, body)
     comment_id = int(run, "comment_id", 0)
     if comment_id > 0
         try
-            update_comment(gh, repo, comment_id, body)
-            return nothing
+            delete_comment(gh, repo, comment_id)
         catch err
-            @error "editing submission comment failed; posting a new one" comment_id msg=error_message(err)
+            @error "deleting the status comment failed" comment_id msg=error_message(err)
         end
     end
-    post_comment(gh, repo, issue, body)
     return nothing
 end
 
@@ -1133,7 +1140,7 @@ function status_comment_body(run_id::String, config_desc::String, status::String
 
         **Status** as of $(Dates.format(asof, stampfmt)): $line
 
-        I will keep updating this comment (about once an hour) and post the report here when the run finishes."""
+        I will keep updating this comment (about once an hour) and post the report as a new comment when the run finishes."""
 end
 
 """
