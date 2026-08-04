@@ -211,6 +211,9 @@ Base.@kwdef struct JobResult
     # only the test/load phase's CPU time and misses ~60% of slot occupancy
     # (skips and kills bill zero by it despite minutes of real slot time)
     wall::Float64 = 0.0
+    # CPU slots the job occupied (1 except for WIDE_PACKAGES); cost metering
+    # prices wall × slots
+    slots::Int = 1
     # peak cgroup memory of the sandbox in bytes (page cache included), for
     # memory-aware scheduling backtests; nothing when the metric was unavailable
     peak_rss::Union{Int,Nothing} = nothing

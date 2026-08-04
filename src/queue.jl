@@ -571,7 +571,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                      # test-phase duration alone misses most of the slot time
                      ":cost" => SLOT_HOURLY_RATE[] === nothing ? nothing :
                                 (result.wall > 0 ? result.wall : result.duration) /
-                                3600 * something(SLOT_HOURLY_RATE[]),
+                                3600 * something(SLOT_HOURLY_RATE[]) * result.slots,
                      ":peak_rss" => result.peak_rss,
                      ":log_key" => result.log === nothing ? nothing : key,
                      (line === nothing ? () : ((":error_line" => line),))...)))),

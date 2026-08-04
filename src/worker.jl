@@ -65,10 +65,13 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     end
 
     # One receiver owns the only SQS long poll; slots take claimed work from the
-    # channel. A message is claimed *only* once a slot is free (the semaphore),
-    # so nothing sits claimed-but-unheartbeated waiting for capacity.
+    # channel. A message is claimed *only* once a CPU is free (the pool below),
+    # so nothing sits claimed-but-unheartbeated waiting for capacity. The pool
+    # holds concrete CPU ids rather than a bare count because WIDE_PACKAGES
+    # jobs pin several at once, and a cpuset needs to know *which*.
     work = Channel{Any}(ninstances)
-    free_slots = Base.Semaphore(ninstances)
+    free_cpus = Channel{Int}(ninstances)
+    foreach(c -> put!(free_cpus, c), 0:ninstances-1)
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
     fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
 
@@ -102,19 +105,20 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
 
     slots = map(1:ninstances) do i
         errormonitor(@async begin
-            for claimed in work
+            for (claimed, cpus) in work
                 try
                     if claimed isa ClaimedExpand
                         process_expand(ctx, claimed)
                     else
-                        process_job(ctx, claimed, i - 1, run_cache, run_cache_lock)
+                        process_job(ctx, claimed, cpus[1], run_cache, run_cache_lock;
+                                    cpus)
                     end
                 finally
                     lock(claims_lock) do
                         delete!(active_claims, claimed.receipt_handle)
                     end
                     Threads.atomic_sub!(busy, 1)
-                    Base.release(free_slots)
+                    foreach(c -> put!(free_cpus, c), cpus)
                 end
             end
         end)
@@ -129,7 +133,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                     sleep(30)
                     continue
                 end
-                Base.acquire(free_slots)
+                cpus = Int[take!(free_cpus)]
                 claimed = try
                     draining[] ? nothing : claim_job(ctx)
                 catch err
@@ -138,17 +142,32 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                     nothing
                 end
                 if claimed === nothing
-                    Base.release(free_slots)
+                    put!(free_cpus, only(cpus))
                     idle_polls += 1
                     once && idle_polls >= 3 && break
                     continue
                 end
                 idle_polls = 0
+                width = claimed isa ClaimedJob ? job_width(claimed.job, ninstances) : 1
+                if width > 1
+                    # gather the extra CPUs before dispatch — claiming pauses
+                    # naturally (this is the only pool consumer), and the wait
+                    # can span other jobs' remaining runtimes, so keep the
+                    # message invisible throughout
+                    stop_hb = start_heartbeat(ctx, claimed, claimed.job.package)
+                    try
+                        while length(cpus) < width && !draining[]
+                            push!(cpus, take!(free_cpus))
+                        end
+                    finally
+                        stop_hb()
+                    end
+                end
                 Threads.atomic_add!(busy, 1)
                 lock(claims_lock) do
                     active_claims[claimed.receipt_handle] = claimed
                 end
-                put!(work, claimed)   # released by the slot that runs it
+                put!(work, (claimed, cpus))   # cpus return when the slot finishes
             end
         finally
             close(work)
@@ -567,19 +586,34 @@ function start_heartbeat(ctx::FarmCtx, claimed, what)
     end
 end
 
+# Packages whose test suites parallelize to `JULIA_CPU_THREADS` (LinearAlgebra
+# runs under ParallelTestRunner with --jobs=Sys.CPU_THREADS) and whose serial
+# runtime (hours) would otherwise dominate every run tail: the receiver gathers
+# this many CPUs from the pool before dispatching them, and the sandbox gets
+# the whole set as its cpuset. Trading slot-hours for tail latency only pays
+# off when the suite actually scales, so additions belong here, not in a
+# duration heuristic.
+const WIDE_PACKAGES = Dict("LinearAlgebra" => 8)
+
+"CPUs a job should occupy: its WIDE_PACKAGES width, capped by the machine."
+job_width(job::JobRef, ninstances::Int) =
+    is_seal_job(job) || is_derivation_job(job) ? 1 :
+    min(get(WIDE_PACKAGES, job.package, 1), ninstances)
+
 function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
-                     run_cache, run_cache_lock)
+                     run_cache, run_cache_lock;
+                     cpus::Union{Nothing,Vector{Int}}=nothing)
     job = claimed.job
     is_derivation_job(job) &&
         return process_derivation_job(ctx, claimed, cpu, run_cache, run_cache_lock)
     is_seal_job(job) && return process_seal_job(ctx, claimed, cpu, run_cache, run_cache_lock)
-    @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu
+    @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu nslots=(cpus === nothing ? 1 : length(something(cpus)))
 
     stop_heartbeat = start_heartbeat(ctx, claimed, job.package)
 
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
-        config = PkgEval.Configuration(config; cpus=[cpu])
+        config = PkgEval.Configuration(config; cpus=something(cpus, [cpu]))
         # redeliveries skip the package cache: cache interactions are the most likely
         # source of irreproducible failures (mirrors evaluate()'s retry behavior).
         # The seal gate and cache protocol are skipped too, for the same reason.
@@ -610,6 +644,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                   reason=r.reason === missing ? nothing : String(r.reason),
                   version=r.version === missing ? nothing : string(r.version),
                   duration=Float64(r.duration), wall=time() - eval_started,
+                  slots=cpus === nothing ? 1 : length(something(cpus)),
                   # haskey: tolerate a PkgEval pinned before peak_rss existed
                   peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
                   log=r.log === missing ? nothing : String(r.log))
