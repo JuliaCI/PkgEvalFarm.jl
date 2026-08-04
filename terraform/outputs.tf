@@ -82,3 +82,8 @@ output "seal_queue_url" {
   description = "URL of the compilecache seal queue (docs/sealing.md; workers poll it first)."
   value       = aws_sqs_queue.jobs_seal.url
 }
+
+output "dashboard_identity_pool" {
+  description = "Cognito identity pool the dashboard uses for anonymous runs-table reads (bake into site/index.html; empty when reports are private)."
+  value       = length(aws_cognito_identity_pool.dashboard) > 0 ? aws_cognito_identity_pool.dashboard[0].id : ""
+}

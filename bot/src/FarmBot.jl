@@ -625,7 +625,9 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     configs_json = "[" * config_json("primary", primary; assertions=true) * "," *
                          config_json("against", against; assertions=true) * "]"
     context_json = "{\"repo\":$(JSON.json(repo)),\"issue\":$number," *
-                   "\"requester\":$(JSON.json(requester))}"
+                   "\"requester\":$(JSON.json(requester))" *
+                   (comment_id === nothing ? "" :
+                    ",\"comment\":$(something(comment_id))") * "}"
     # a comment-derived run id makes submission idempotent: webhook redelivery,
     # the fallback poll rediscovering the same mention, and webhook+poll overlap
     # all collapse into one run (kicking off a run is expensive)
@@ -669,12 +671,14 @@ struct RunContext
     repo::Union{Nothing,String}
     issue::Union{Nothing,Int}
     requester::Union{Nothing,String}
+    comment::Union{Nothing,Int}   # the triggering comment, when one exists
 end
 
 function json_make(::Type{RunContext}, x::LazyVal)
     repo = Ref{Union{Nothing,String}}(nothing)
     issue = Ref{Union{Nothing,Int}}(nothing)
     requester = Ref{Union{Nothing,String}}(nothing)
+    comment = Ref{Union{Nothing,Int}}(nothing)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         if k == "repo"
@@ -683,11 +687,21 @@ function json_make(::Type{RunContext}, x::LazyVal)
             n, p = json_int(v); issue[] = Int(n); return p
         elseif k == "requester"
             s, p = json_string(v); requester[] = s; return p
+        elseif k == "comment"
+            n, p = json_int(v); comment[] = Int(n); return p
         end
         return nothing
     end
-    return RunContext(repo[], issue[], requester[]), pos::Int
+    return RunContext(repo[], issue[], requester[], comment[]), pos::Int
 end
+
+"""
+The link a run's trigger label points at: the comment that started the run
+when the context recorded one, the PR otherwise.
+"""
+trigger_link(repo::String, issue::Int, comment::Union{Nothing,Int}) =
+    "https://github.com/$repo/pull/$issue" *
+    (comment === nothing ? "" : "#issuecomment-$(something(comment))")
 
 function check_finished_runs(ctx::LiteCtx, gh::GitHubCtx)
     start_key = ""
@@ -1613,7 +1627,7 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     context = parse_json(str(run, "context", "{}"), RunContext)
     if context.repo !== nothing && context.issue !== nothing
         repo, issue = something(context.repo), something(context.issue)
-        print(io, ",\"trigger_url\":", JSON.json("https://github.com/$repo/pull/$issue"),
+        print(io, ",\"trigger_url\":", JSON.json(trigger_link(repo, issue, context.comment)),
               ",\"trigger_label\":", JSON.json("$repo#$issue"))
     end
     print_build_json(io, "primary", configs[1])

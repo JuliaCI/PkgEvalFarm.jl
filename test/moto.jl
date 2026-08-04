@@ -527,6 +527,10 @@ try
             @test run["packages"] == ["Example"]
             @test run["context"]["repo"] == "JuliaLang/julia"
             @test run["submitter"] == "keno via @pkgeval"
+            # the triggering comment is recorded (its id is also the
+            # comment-derived run id's suffix) so the report links straight
+            # to the comment that started the run
+            @test run["context"]["comment"] == parse(Int, chopprefix(run_id, "gh-"))
             @test run["configs"][1]["name"] == "primary"
             @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
             @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
@@ -554,6 +558,8 @@ try
                                                         duration=1.0, log="ok"))
             end
             @test PEF.get_run(ctx, run_id)["status"] == "done"
+            # the counter bumps stamped the dashboard's activity clock
+            @test haskey(PEF.get_run(ctx, run_id), "updated_at")
 
             # 3. next poll edits the report into the submission comment
             PEF.FarmBot.handle_invocation(lite, gh)
@@ -561,6 +567,14 @@ try
             @test edited[end].first == "700001"
             @test occursin("@keno: run `$run_id` finished", edited[end].second)
             @test occursin("no new package failures", edited[end].second)
+            # the published report anchors its trigger link on the comment
+            rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key(run_id, "report.json"), Dict("return_raw" => true);
+                aws_config=aws))))
+            @test rj["run"]["trigger_label"] == "JuliaLang/julia#12345"
+            @test rj["run"]["trigger_url"] ==
+                  "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
+                  chopprefix(run_id, "gh-")
             @test occursin("?run=$run_id", edited[end].second)
 
             # 4. and does not double-report

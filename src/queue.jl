@@ -324,11 +324,12 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
         Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
             Dict("ConditionExpression" => "#s = :expanding",
                  "UpdateExpression" => "SET #s = :active, total_jobs = :total, " *
-                                       "completed_jobs = :reused",
+                                       "completed_jobs = :reused, updated_at = :now",
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":expanding" => "expanding", ":active" => "active",
-                     ":total" => length(jobs), ":reused" => length(reused))));
+                     ":total" => length(jobs), ":reused" => length(reused),
+                     ":now" => isodate())));
             aws_config=ctx.aws)
     catch err
         if is_conditional_failure(err)
@@ -577,8 +578,11 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),
-                 "UpdateExpression" => "ADD completed_jobs :one",
-                 "ExpressionAttributeValues" => ddb_item(Dict(":one" => 1))))];
+                 # updated_at is the dashboard's activity clock: when this run
+                 # last made progress, as opposed to created_at/finished_at
+                 "UpdateExpression" => "SET updated_at = :now ADD completed_jobs :one",
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":one" => 1, ":now" => isodate()))))];
             aws_config=ctx.aws)
     end
 
