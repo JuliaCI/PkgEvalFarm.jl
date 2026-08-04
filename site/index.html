@@ -527,6 +527,11 @@ const escHtml = (s) => String(s).replace(/[&<>"]/g,
 const linkify = (s) =>   // escape first, then turn bare URLs into links
   escHtml(s).replace(/https?:\/\/[^\s<)]+/g, (u) => `<a href="${u}">${u}</a>`);
 
+// declared above boot(), which uses them synchronously on load
+const AWS_REGION = "us-east-2";
+const RUNS_TABLE = "pkgeval-runs";
+const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
+
 (async function boot() {
   let D;
   // served from GitHub Pages: ?run=<run_id> names the run to render, whose
@@ -567,10 +572,6 @@ const linkify = (s) =>   // escape first, then turn bare URLs into links
 // credentials from a Cognito identity pool that allows unauthenticated
 // identities (terraform/dashboard.tf) — their role can only read that table.
 // DynamoDB speaks SigV4, so the page carries a minimal signer (crypto.subtle).
-const AWS_REGION = "us-east-2";
-const RUNS_TABLE = "pkgeval-runs";
-const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
-
 function ddbClient(params) {
   const enc = new TextEncoder();
   const hex = (buf) => [...new Uint8Array(buf)]
