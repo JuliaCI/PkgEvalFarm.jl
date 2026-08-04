@@ -109,6 +109,8 @@
   .pill[hidden] { display: none; }
   .pill.done { background: var(--good-wash); color: var(--good-text); }
   .pill.done::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .pill.wip { background: var(--warning-wash); color: var(--warning); }
+  .pill.wip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--warning-dot); }
 
   .meta-line {
     color: var(--ink-2); font-size: 13.5px;
@@ -545,13 +547,13 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
   if (!runId) return dashboard(bucket, params);
+  const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
   try {
     D = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`);
   } catch (err) {
     // no report — the runs table still explains an unfinished or failed run
     let run = null;
     try { run = await ddbClient(params).getRun(runId); } catch { /* stay bare */ }
-    const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
     $("loadstate").innerHTML = run === null
       ? `Could not load the report for run <span class="mono">${escHtml(runId)}</span> ` +
         `(${escHtml(err.message)}).` + back
@@ -561,6 +563,25 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
       : `Run <span class="mono">${escHtml(runId)}</span> is still in progress — ` +
         "its report will appear here once it finishes." + back;
     return;
+  }
+  if (D.run.in_progress) {
+    // the snapshot may be stale: a run that since failed shows its reason,
+    // one that since finished reloads once for the final report (the flag
+    // stops a loop when the final hasn't been published yet)
+    try {
+      const live = await ddbClient(params).getRun(runId);
+      if (live && live.status === "failed") {
+        $("loadstate").innerHTML =
+          `Run <span class="mono">${escHtml(runId)}</span> failed — ` +
+          linkify(live.failure_reason || "unspecified failure") + "." + back;
+        return;
+      }
+      const flag = "wip-reloaded-" + runId;
+      if (live && live.status === "done" && !sessionStorage.getItem(flag)) {
+        sessionStorage.setItem(flag, "1");
+        return location.reload();
+      }
+    } catch { /* best-effort: render the snapshot */ }
   }
   $("loadstate").hidden = true;
   $("app").hidden = false;
@@ -902,14 +923,21 @@ function main(D) {
   // ---- header -----------------------------------------------------------
   document.title = "PkgEval — " + D.run.id;
   $("runid").textContent = D.run.id;
+  const stamp = (iso) => esc((iso || "?").replace("T", " ").replace("Z", " UTC"));
+  if (D.run.in_progress) {   // a mid-run snapshot, republished about hourly
+    $("runstatus").className = "pill wip";
+    $("runstatus").textContent = "in progress";
+  }
   $("runstatus").hidden = false;
   const wallMs = Date.parse(D.run.finished || "") - Date.parse(D.run.created || "");
   const wall = isNaN(wallMs) ? "" : `${Math.floor(wallMs / 3600000)}h ${Math.round((wallMs % 3600000) / 60000)}m`;
   $("metaline").innerHTML =
     `<span>submitted by <strong>${esc(D.run.submitter || "?")}</strong></span>` +
     (D.run.trigger_url ? `<span>triggered from <a href="${esc(D.run.trigger_url)}">${esc(D.run.trigger_label)}</a></span>` : "") +
-    `<span>started <strong>${esc((D.run.created || "?").replace("T", " ").replace("Z", " UTC"))}</strong></span>` +
-    (wall ? `<span>finished in <strong>${wall}</strong></span>` : "");
+    `<span>started <strong>${stamp(D.run.created)}</strong></span>` +
+    (wall ? `<span>finished in <strong>${wall}</strong></span>` : "") +
+    (D.run.in_progress ? `<span>partial: <strong>${D.run.done_jobs || 0} of ` +
+      `${D.run.total_jobs || "?"}</strong> jobs evaluated as of <strong>${stamp(D.run.as_of)}</strong></span>` : "");
 
   // ---- comparison strip -------------------------------------------------
   const buildCard = (role, b, isPrimary) => {

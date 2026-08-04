@@ -579,12 +579,28 @@ try
             @test expand_claim isa PEF.ClaimedExpand
             PEF.expand_run(ctx, run_id, ["Example"])
             SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
+            recorded = 0
             for _ in 1:20  # claim_job also returns nothing for swallowed duplicates
                 PEF.get_run(ctx, run_id)["status"] == "done" && break
                 c = PEF.claim_job(ctx; wait=1)
                 c isa PEF.ClaimedJob || continue
                 PEF.record_result(ctx, c, PEF.JobResult(; status="test", version="1.0.0",
                                                         duration=1.0, log="ok"))
+                if (recorded += 1) == 1
+                    # 2b. mid-run, the hourly tick publishes a work-in-progress
+                    #     report (min_interval=0 sidesteps the submission
+                    #     edit's throttle claim)
+                    PEF.FarmBot.update_status_comment(lite, gh,
+                        PEF.FarmBot.get_run(lite, String(run_id));
+                        min_interval=Dates.Minute(0))
+                    wip = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                        PEF.report_key(run_id, "report.json"), Dict("return_raw" => true);
+                        aws_config=aws))))
+                    @test wip["run"]["in_progress"] == true
+                    @test wip["run"]["done_jobs"] == 1
+                    @test haskey(wip["run"], "as_of")
+                    @test length(wip["pkgs"]) <= 1   # only terminal jobs appear
+                end
             end
             @test PEF.get_run(ctx, run_id)["status"] == "done"
             # the counter bumps stamped the dashboard's activity clock
@@ -604,6 +620,8 @@ try
             @test rj["run"]["trigger_url"] ==
                   "https://github.com/JuliaLang/julia/pull/12345#issuecomment-" *
                   chopprefix(run_id, "gh-")
+            # the final report replaced the work-in-progress snapshot outright
+            @test !haskey(rj["run"], "in_progress")
             @test occursin("?run=$run_id", edited[end].second)
 
             # 4. and does not double-report

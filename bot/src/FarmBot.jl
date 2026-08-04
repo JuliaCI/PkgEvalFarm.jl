@@ -1149,11 +1149,9 @@ baseline.
 """
 function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
                                min_interval::Dates.Minute=Dates.Minute(55))
-    comment_id = int(run, "comment_id", 0)
-    comment_id > 0 || return nothing
-    context = parse_json(str(run, "context", "{}"), RunContext)
-    (context.repo === nothing || context.issue === nothing) && return nothing
     run_id = str(run, "run_id")
+    # seal runs share the table but are internal: no comment, no report
+    startswith(run_id, "seal-") && return nothing
     status = str(run, "status", "")
     completed = int(run, "completed_jobs", 0)
     total = int(run, "total_jobs", 0)
@@ -1174,45 +1172,65 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
         err isa ErrorException && is_conditional_failure(err) && return nothing
         rethrow()
     end
-    eta = nothing
-    if status == "active"
-        work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
-        if remaining >= 0
-            eta = eta_from_work(str(run, "status_commented_at", ""),
-                                flt(run, "status_work_done", -1.0),
-                                work_done, remaining, now)
+    comment_id = int(run, "comment_id", 0)
+    context = parse_json(str(run, "context", "{}"), RunContext)
+    if comment_id > 0 && context.repo !== nothing && context.issue !== nothing
+        eta = nothing
+        if status == "active"
+            work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
+            if remaining >= 0
+                eta = eta_from_work(str(run, "status_commented_at", ""),
+                                    flt(run, "status_work_done", -1.0),
+                                    work_done, remaining, now)
+            end
+            # whole seconds: string(::Float64) can go scientific, which DynamoDB's
+            # number grammar does not accept
+            snapshot = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                       "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+                       "\"UpdateExpression\":\"SET status_work_done = :w\"," *
+                       "\"ExpressionAttributeValues\":{\":w\":{\"N\":\"$(round(Int, work_done))\"}}}"
+            ddb(ctx, "UpdateItem", snapshot)
         end
-        # whole seconds: string(::Float64) can go scientific, which DynamoDB's
-        # number grammar does not accept
-        snapshot = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-                   "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
-                   "\"UpdateExpression\":\"SET status_work_done = :w\"," *
-                   "\"ExpressionAttributeValues\":{\":w\":{\"N\":\"$(round(Int, work_done))\"}}}"
-        ddb(ctx, "UpdateItem", snapshot)
+        body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
+                                   status, completed, total, now, eta)
+        update_comment(gh, something(context.repo), comment_id, body)
+        @info "updated status comment" run_id status completed total
     end
-    body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
-                               status, completed, total, now, eta)
-    update_comment(gh, something(context.repo), comment_id, body)
-    @info "updated status comment" run_id status completed total
-    # Forensic canary: deliberately re-run the crash-suspect workload (the
-    # full-item parse the slim query above avoids) now that this tick's real
-    # work is done and durable. The trimmed runtime segfaults on this parse in
-    # Lambda (foreign-thread MAPERR, under investigation); with the SEGVREPORT
-    # handler armed, every tick becomes a diagnostic sample instead of the
-    # run-completion report being the sole shot. Remove once root-caused.
-    if status == "active" && total > 5000
-        canary = run_jobs(ctx, run_id)
-        @info "forensic canary parse survived" n=length(canary)
+    # a work-in-progress report each tick, so the report page shows partial
+    # results while the run executes. This full-item parse also took over the
+    # forensic-canary role: the trimmed runtime historically segfaulted on it
+    # in Lambda (foreign-thread MAPERR), and with the SEGVREPORT handler armed
+    # every tick stays a diagnostic sample.
+    if status == "active"
+        publish_wip_report(ctx, run_id)
     end
     return nothing
 end
 
-"Edit the submission comment of every in-flight run that recorded one."
+"""
+Publish a work-in-progress report for a still-active run (same objects as the
+final report, marked `in_progress`; see `report_json`). The final report from
+`report_finished_run` overwrites it — and if the run reaches a terminal state
+*while* we generate, one regeneration makes the objects complete, so a stale
+partial can never shadow the final even if this write lands after the
+stream-triggered one.
+"""
+function publish_wip_report(ctx::LiteCtx, run_id::String)
+    generate_report(ctx, run_id)
+    str(get_run(ctx, run_id), "status", "") in ("expanding", "active") ||
+        generate_report(ctx, run_id)
+    return nothing
+end
+
+"""
+The hourly tick over every in-flight run: edit the submission comment of runs
+that recorded one, and publish a work-in-progress report for all of them.
+"""
 function update_status_comments(ctx::LiteCtx, gh::GitHubCtx)
     start_key = ""
     while true
         payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-                  "\"FilterExpression\":\"#s IN (:expanding, :active) AND attribute_exists(comment_id)\"," *
+                  "\"FilterExpression\":\"#s IN (:expanding, :active)\"," *
                   "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
                   "\"ExpressionAttributeValues\":{\":expanding\":{\"S\":\"expanding\"}," *
                   "\":active\":{\"S\":\"active\"}}" *
@@ -1556,6 +1574,7 @@ end
 # Schema (kept in sync with site/index.html):
 #   run     .id .bucket .bot .submitter .created .finished .trigger_url
 #           .trigger_label .total_jobs .cpu_hours .cost .cost_partial
+#           .in_progress .done_jobs .as_of   (mid-run snapshots only)
 #           .primary/.against = {name, julia, repo, sha, flags}  (against only
 #           for two-config comparisons; repo/sha empty when `julia` is not a
 #           repo#sha spec)
@@ -1636,6 +1655,13 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     # print calls degrades Base.print's loop to Any-typed dispatch, which the
     # trim verifier rejects
     print(io, ",\"total_jobs\":", string(int(run, "total_jobs", 0)))
+    # a report generated mid-run says so (see publish_wip_report): the page
+    # banners it and covers only the jobs finished as of `as_of`
+    if str(run, "status", "") != "done"
+        ndone = count(j -> str(j, "status") in TERMINAL_STATUSES, jobs)
+        print(io, ",\"in_progress\":true,\"done_jobs\":", string(ndone),
+              ",\"as_of\":", JSON.json(isodate()))
+    end
     cpu_seconds = 0.0
     for j in jobs
         cpu_seconds += flt(j, "duration", 0.0)
