@@ -836,11 +836,21 @@ async function dashboard(bucket, params) {
     $("runidx-rows").innerHTML = finished.join("");
     $("runidx-active-rows").innerHTML = active.join("");
     $("runidx-active").hidden = !active.length;
-    // verdict chips for the newest dozen finished runs; a just-finished run
-    // whose report is still being posted stays bare until the next refresh
-    await Promise.all(shown.slice(0, 12)
-      .filter((r) => r.status === "done").map(async (r) => {
-        const id = r.run_id;
+    // reveal the table before the verdict-chip probes below: they cost
+    // another round of report.json fetches and shouldn't gate first paint
+    $("loadstate").hidden = true;
+    $("runindex").hidden = false;
+    // verdict chips: the bot annotates each finished run with new_fails/cost
+    // at report time, so chips render straight off the scan; runs predating
+    // the annotation fall back to probing report.json, capped at the newest
+    // dozen to bound the fetches (a just-finished run whose report is still
+    // being posted stays bare until the next refresh)
+    await Promise.all(shown.map(async (r, i) => {
+      if (r.status !== "done") return;
+      const id = r.run_id;
+      let n = r.new_fails, cost = r.cost || 0;
+      if (n == null) {
+        if (i >= 12) return;
         let D = reports.get(id);
         if (!D) {
           try {
@@ -848,21 +858,24 @@ async function dashboard(bucket, params) {
           } catch { return; }
           reports.set(id, D);
         }
-        const n = countNewFails(D);
-        setChip(id, n ? "bad" : "ok",
-                n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
-        const bits = [...runMeta(r)];
-        const took = r.finished_at && elapsed(r.created_at, r.finished_at);
-        if (took) bits.push(esc(took));
-        if (D.run.cost > 0) bits.push(`$${D.run.cost.toFixed(2)}`);
-        bits.push(esc(when(r.created_at)));
-        metaEl(id).innerHTML = bits.join(" · ");
-      }));
+        n = countNewFails(D);
+        cost = D.run.cost || 0;
+      }
+      setChip(id, n ? "bad" : "ok",
+              n ? `${n} new failure${n === 1 ? "" : "s"}` : "no new failures");
+      const bits = [...runMeta(r)];
+      const took = r.finished_at && elapsed(r.created_at, r.finished_at);
+      if (took) bits.push(esc(took));
+      if (cost > 0) bits.push(`$${cost.toFixed(2)}`);
+      bits.push(esc(when(r.created_at)));
+      metaEl(id).innerHTML = bits.join(" · ");
+    }));
   };
 
   try {
     await render();
   } catch (err) {
+    $("loadstate").hidden = false;   // may already be hidden by a partial render
     $("loadstate").textContent = `Could not load runs (${err.message}). ` +
       "Open a report directly with ?run=<run id>.";
     return;
