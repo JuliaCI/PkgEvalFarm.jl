@@ -403,6 +403,35 @@ try
         @test PEF.get_run(ctx, run_id)["status"] == "done"
     end
 
+    @testset "duration estimates prefer covering donors" begin
+        # a streak of small recent runs must not crowd an ecosystem-scale donor
+        # out of the max_donors window: that leaves the whole request on the
+        # default estimate and un-front-loads the exact jobs the slow queue
+        # exists for (seen live: LinearAlgebra unestimated, 11-hour run tail).
+        # Job items only — a fake `done` run item would sidetrack the bot's
+        # report poll in later testsets, so the donor tuples are hand-built.
+        put_job(run, pkg, dur) = Dynamodb.put_item(PEF.ddb_item(Dict(
+            "run_id" => run, "job_key" => "primary#$pkg", "config" => "primary",
+            "package" => pkg, "status" => "test", "duration" => dur)),
+            cfg.jobs_table; aws_config=aws)
+        put_job("big-donor", "Alpha", 100.0)
+        put_job("big-donor", "Beta", 8000.0)
+        put_job("big-donor", "Gamma", 50.0)
+        for i in 1:3   # newer, but covering only Alpha
+            put_job("small-donor-$i", "Alpha", 10.0)
+        end
+        donors = [("2026-02-03T00:00:00Z", "small-donor-3", Any[], 1),
+                  ("2026-02-02T00:00:00Z", "small-donor-2", Any[], 1),
+                  ("2026-02-01T00:00:00Z", "small-donor-1", Any[], 1),
+                  ("2026-01-01T00:00:00Z", "big-donor", Any[], 3)]
+        est = PEF.duration_estimates(ctx, ["Alpha", "Beta", "Gamma"], donors)
+        @test est["Beta"] == 8000.0    # would be absent under newest-3 alone
+        @test est["Gamma"] == 50.0
+        @test est["Alpha"] == 100.0    # max over donors, not first-donor-wins
+        # and completed_runs supplies the total_jobs the preference keys on
+        @test any(d -> d[4] >= 6, PEF.completed_runs(ctx))
+    end
+
     @testset "submitter requirement parsing" begin
         # "TEAM" gates on a GITHUB_ORG team; "ORG/TEAM" carries its own org
         # (matching the broker's spec format); "" is plain org membership

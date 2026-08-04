@@ -86,16 +86,16 @@ const DEFAULT_DURATION_ESTIMATE = 45.0 * 60
 const DEFAULT_FLEET_SLOTS = 128
 fleet_slots() = parse(Int, get(ENV, "PKGEVAL_FLEET_SLOTS", string(DEFAULT_FLEET_SLOTS)))
 
-"Completed runs, newest first, as `(created_at, run_id, configs)` tuples."
+"Completed runs, newest first, as `(created_at, run_id, configs, total_jobs)` tuples."
 function completed_runs(ctx::FarmCtx)
-    runs = Tuple{String,String,Any}[]
+    runs = Tuple{String,String,Any,Int}[]
     start_key = nothing
     while true
         params = Dict{String,Any}(
             "FilterExpression" => "#s = :done",
             "ExpressionAttributeNames" => Dict("#s" => "status"),
             "ExpressionAttributeValues" => ddb_item(Dict(":done" => "done")),
-            "ProjectionExpression" => "run_id, created_at, configs")
+            "ProjectionExpression" => "run_id, created_at, configs, total_jobs")
         start_key === nothing || (params["ExclusiveStartKey"] = start_key)
         resp = aws_retry() do
             Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
@@ -107,7 +107,7 @@ function completed_runs(ctx::FarmCtx)
             # results (and pollute duration estimates)
             startswith(String(item["run_id"]), "seal-") && continue
             push!(runs, (String(get(item, "created_at", "")), String(item["run_id"]),
-                         JSON.parse(item["configs"])))
+                         JSON.parse(item["configs"]), Int(get(item, "total_jobs", 0))))
         end
         start_key = get(resp, "LastEvaluatedKey", nothing)
         start_key === nothing && break
@@ -116,16 +116,25 @@ function completed_runs(ctx::FarmCtx)
 end
 
 """
-Per-package duration estimates from recent completed runs (newest first, up to
-`max_donors` of them). Duration is mostly package-intrinsic, so estimates
-transfer across Julia versions where results would not; the max over configs
-and donors is used, since underestimating is what causes stragglers.
+Per-package duration estimates from recent completed runs (up to `max_donors`
+of them). Duration is mostly package-intrinsic, so estimates transfer across
+Julia versions where results would not; the max over configs and donors is
+used, since underestimating is what causes stragglers.
+
+Donors big enough to plausibly cover the request are preferred over merely
+recent ones: recency alone lets a streak of small runs crowd every
+ecosystem-scale donor out of the window, leaving the whole request on the
+default estimate — which un-front-loads exactly the jobs the slow queue
+exists for (seen live: LinearAlgebra unestimated, claimed dead last, an
+11-hour idle tail on runs gh-51739*).
 """
 function duration_estimates(ctx::FarmCtx, packages::Vector{String},
                             donors::Vector{<:Tuple}; max_donors::Int=3)
     est = Dict{String,Float64}()
     wanted = Set(packages)
-    for (_, donor_id, _) in first(donors, max_donors)
+    covering(d) = d[4] >= length(wanted)   # total_jobs spans ≥ one config's worth
+    ordered = vcat(filter(covering, donors), filter(!covering, donors))
+    for (_, donor_id) in first(ordered, max_donors)
         length(est) == length(wanted) && break
         for job in run_jobs(ctx, donor_id)
             pkg = String(job["package"])
