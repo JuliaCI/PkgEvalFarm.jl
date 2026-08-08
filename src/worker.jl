@@ -5,6 +5,24 @@
 # visibility timeout and is picked up elsewhere (with the package cache disabled on
 # retries, in case the job's cache use was what killed the worker).
 
+# Tempdirs of a worker incarnation that died uncleanly (spot reclaim, OOM,
+# SIGKILL) are never removed: Base's exit-time cleanup didn't run, and the
+# restarted worker mints fresh cache dirs while the orphans — whole sandbox
+# homes and compilecaches — keep their disk space. Nothing else evaluates on
+# this machine at startup, so every pkgeval tempdir present now is stale.
+function sweep_stale_tempdirs!()
+    for entry in readdir(tempdir(); join=true)
+        startswith(basename(entry), "pkgeval_") || continue
+        @info "removing stale tempdir" entry
+        try
+            isdir(entry) && PkgEval.chmod_recursive(entry, 0o777) # JuliaLang/julia#47650
+            rm(entry; recursive=true, force=true)
+        catch err
+            @warn "could not remove stale tempdir" entry err
+        end
+    end
+end
+
 """
     run_worker(; broker=nothing, ninstances=Sys.CPU_THREADS, once=false)
 
@@ -29,6 +47,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # build surfaces as MissingStagedBuild and is requested from CI instead
     PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
+    sweep_stale_tempdirs!()
     init_slot_rate!(ctx, ninstances)
     if sealing_enabled(ctx.cfg) && pkgeval_supports_seal()
         sweep_seal_cache!()
