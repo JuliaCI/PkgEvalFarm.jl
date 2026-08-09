@@ -783,14 +783,18 @@ async function dashboard(params) {
     </div>`;
 
   const render = async () => {
-    // seal runs and _-prefixed sentinels (e.g. the _fleet-generation record
-    // cloud-init claims) share the runs table but are internal machinery —
-    // though active runs reference seal runs, to show the sealing phase below
+    // some runs-table items are internal machinery, not runs anyone
+    // submitted, and are hidden: seal-* (the shared precompile phase's
+    // bookkeeping — though active runs reference them, to show sealing
+    // progress below), deriv-* (compilecache derivations of deps discovered
+    // at test time; new wants re-open them forever, so they'd render as
+    // perpetually running), and _-prefixed sentinels (e.g. the
+    // _fleet-generation record cloud-init claims)
     const all = await ddb.scanRuns();
     const sealById = new Map(all.filter((r) => r.run_id.startsWith("seal-"))
       .map((r) => [r.run_id, r]));
-    const runs = all.filter((r) =>
-      !r.run_id.startsWith("seal-") && !r.run_id.startsWith("_"));
+    const runs = all.filter((r) => !r.run_id.startsWith("seal-") &&
+      !r.run_id.startsWith("deriv-") && !r.run_id.startsWith("_"));
     runs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || "") ||
                         (a.run_id < b.run_id ? 1 : -1));
     const shown = runs.slice(0, 30);
