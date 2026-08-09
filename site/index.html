@@ -24,7 +24,11 @@
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
   credentials from the Cognito identity pool in IDENTITY_POOL below with
   GetId + GetCredentialsForIdentity, then Scan/GetItem — live runs carry
-  status/completed_jobs/total_jobs/updated_at.
+  status/completed_jobs/total_jobs/updated_at, plus `waiting` (the Julia
+  builds a stalled run is blocked on CI producing, keyed by config name,
+  each with sha/variant and the Buildkite url) and `seal_runs` (per
+  config, the id of the shared `seal-*` run item — same table — whose
+  precompile jobs gate this run's test jobs).
 -->
 <html lang="en">
 <head>
@@ -733,8 +737,11 @@ function ddbClient(params) {
 // One Scan per minute renders every run's live truth — queued (expanding),
 // running (with the counters the workers bump transactionally, and the
 // updated_at those bumps stamp as an activity clock), failed with its reason,
-// or done. Finished runs get their verdict chip from the already-public
-// report.json (probed only for the newest dozen, cached across refreshes).
+// or done. Runs making no visible progress explain themselves: a `waiting`
+// marker links the CI Julia build being waited on, and the sealing phase
+// shows its own progress off the run's seal-* items. Finished runs get their
+// verdict chip from the already-public report.json (probed only for the
+// newest dozen, cached across refreshes).
 async function dashboard(params) {
   const esc = escHtml;
   const ddb = ddbClient(params);
@@ -777,8 +784,12 @@ async function dashboard(params) {
 
   const render = async () => {
     // seal runs and _-prefixed sentinels (e.g. the _fleet-generation record
-    // cloud-init claims) share the runs table but are internal machinery
-    const runs = (await ddb.scanRuns()).filter((r) =>
+    // cloud-init claims) share the runs table but are internal machinery —
+    // though active runs reference seal runs, to show the sealing phase below
+    const all = await ddb.scanRuns();
+    const sealById = new Map(all.filter((r) => r.run_id.startsWith("seal-"))
+      .map((r) => [r.run_id, r]));
+    const runs = all.filter((r) =>
       !r.run_id.startsWith("seal-") && !r.run_id.startsWith("_"));
     runs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || "") ||
                         (a.run_id < b.run_id ? 1 : -1));
@@ -802,19 +813,58 @@ async function dashboard(params) {
             linkify(r.failure_reason || "unspecified failure")}</span></div>`));
       } else {   // expanding | active: the in-progress section
         bits.push(esc(when(r.created_at)));
+        // say what a run without visible progress is actually doing, so it
+        // doesn't read as hung: waiting on CI Julia builds (the workers stamp
+        // `waiting` per config — both sides of a comparison can need one —
+        // with the Buildkite URLs once known)…
+        const w = r.waiting;
+        const builds = w ? Object.keys(w)
+          .sort((a, b) => (a === "primary" ? -1 : b === "primary" ? 1 : a < b ? -1 : 1))
+          .map((c) => {
+            const b = w[c] || {};
+            const sha = esc((b.sha || "").slice(0, 10));
+            const link = b.url
+              ? `<a class="mono" href="${esc(b.url)}">${sha} ↗</a>`
+              : `<span class="mono">${sha}</span>`;
+            const label = [...(c === "?" ? [] : [esc(c)]),   // "?": config unknown
+                           ...(b.variant && b.variant !== "linux" ? [esc(b.variant)] : [])]
+              .join(", ");
+            return link + (label ? ` (${label})` : "");
+          }) : [];
+        const buildWait = builds.length
+          ? "waiting for CI to build Julia " + builds.join(" and ") : null;
         let gauge, chip;
         if (r.status === "active" && r.total_jobs > 0) {
           chip = ["run", "running"];
           const done = r.completed_jobs || 0, total = r.total_jobs;
-          const ago = r.updated_at
-            ? Math.round((Date.now() - Date.parse(r.updated_at)) / 60000) : null;
-          gauge = `<span class="n">${done} of ${total} jobs${esc(
+          // …or the shared precompile (seal) phase its test jobs are gated
+          // on, whose progress lives on the referenced seal-* run items
+          let phase = buildWait, tick = r.updated_at;
+          if (r.seal_runs) {
+            const seals = [...new Set(Object.values(r.seal_runs))]
+              .map((id) => sealById.get(id))
+              .filter((s) => s && (s.completed_jobs || 0) < (s.total_jobs || 0));
+            if (seals.length) {
+              const sdone = seals.reduce((n, s) => n + (s.completed_jobs || 0), 0);
+              const stot = seals.reduce((n, s) => n + (s.total_jobs || 0), 0);
+              if (!phase) phase = `<span title="shared precompilation (seal) jobs; a package's test starts once its seal is done">precompiling ${sdone} of ${stot}</span>`;
+              // seal completions are progress: fold them into the activity
+              // clock, which otherwise reads idle through the whole phase
+              for (const s of seals)
+                if (s.updated_at && (!tick || s.updated_at > tick)) tick = s.updated_at;
+            }
+          }
+          const ago = tick
+            ? Math.round((Date.now() - Date.parse(tick)) / 60000) : null;
+          gauge = `<span class="n">${done} of ${total} jobs${
+              phase ? " · " + phase : ""}${esc(
               ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
             }</span><span class="bar"><i style="width:${
               Math.min(100, Math.round(done / total * 100))}%"></i></span>`;
         } else {
           chip = ["q", "queued"];
-          gauge = '<span class="n">waiting for a worker to expand the run</span>';
+          gauge = `<span class="n">${buildWait ||
+            "waiting for a worker to expand the run"}</span>`;
         }
         active.push(row(r, chip,
           bits.join(" · ") + ` · <span class="runidx-prog">${gauge}</span>`));

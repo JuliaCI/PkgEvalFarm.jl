@@ -332,9 +332,11 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     try
         Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
             Dict("ConditionExpression" => "#s = :expanding",
+                 # expansion succeeding also retires any waiting-for-build note
                  "UpdateExpression" => "SET #s = :active, total_jobs = :total, " *
-                                       "completed_jobs = :reused, updated_at = :now",
-                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                                       "completed_jobs = :reused, updated_at = :now " *
+                                       "REMOVE #w",
+                 "ExpressionAttributeNames" => Dict("#s" => "status", "#w" => "waiting"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":expanding" => "expanding", ":active" => "active",
                      ":total" => length(jobs), ":reused" => length(reused),
@@ -497,6 +499,57 @@ function fail_run(ctx::FarmCtx, run_id::AbstractString, why::AbstractString)
     return nothing
 end
 
+"""
+Record on the run item which Julia builds its work is stalled on — keyed by
+configuration name, so a run whose primary *and* baseline both need building
+shows both waits — letting the dashboard explain a run that shows no progress
+instead of looking hung. Repeat notes for a config only land when they learn
+the Buildkite URL, so the every-10-minutes retry chatter of a whole fleet
+degrades to cheap conditional no-ops. Cleared by `expand_run`'s flip to
+active and by every `record_result` (a config still stalled simply re-stamps
+on its next retry).
+"""
+function note_run_waiting(ctx::FarmCtx, run_id::AbstractString;
+                          config::AbstractString, sha::AbstractString,
+                          variant::AbstractString,
+                          url::Union{AbstractString,Nothing}=nothing)
+    in_flight = Dict(":expanding" => "expanding", ":active" => "active")
+    try
+        # two writes, because one expression cannot both create a map and set
+        # a key inside it: first materialize the (empty) map…
+        try
+            Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+                Dict("ConditionExpression" => "#s IN (:expanding, :active) AND " *
+                                              "attribute_not_exists(#w)",
+                     "UpdateExpression" => "SET #w = :empty",
+                     "ExpressionAttributeNames" => Dict("#s" => "status", "#w" => "waiting"),
+                     "ExpressionAttributeValues" => ddb_item(merge(in_flight,
+                         Dict(":empty" => Dict{String,Any}()))));
+                aws_config=ctx.aws)
+        catch err
+            is_conditional_failure(err) || rethrow()   # already there: the common case
+        end
+        # …then fill this config's slot, skipping writes that change nothing
+        Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+            Dict("ConditionExpression" =>
+                     "#s IN (:expanding, :active) AND attribute_exists(#w) AND " *
+                     "(attribute_not_exists(#w.#c) OR #w.#c.#u <> :url)",
+                 "UpdateExpression" => "SET #w.#c = :entry",
+                 "ExpressionAttributeNames" => Dict("#s" => "status", "#w" => "waiting",
+                                                    "#c" => String(config), "#u" => "url"),
+                 "ExpressionAttributeValues" => ddb_item(merge(in_flight, Dict(
+                     ":url" => url === nothing ? "" : String(url),
+                     ":entry" => Dict("sha" => String(sha), "variant" => String(variant),
+                                      "url" => url === nothing ? "" : String(url),
+                                      "since" => isodate())))));
+            aws_config=ctx.aws)
+    catch err
+        # a failed condition is the common no-change case, not a problem
+        is_conditional_failure(err) || @warn "failed to note run wait state" run_id err
+    end
+    return nothing
+end
+
 "Give up on a claimed job without recording a result; it will be redelivered."
 function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
     try
@@ -588,8 +641,12 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),
                  # updated_at is the dashboard's activity clock: when this run
-                 # last made progress, as opposed to created_at/finished_at
-                 "UpdateExpression" => "SET updated_at = :now ADD completed_jobs :one",
+                 # last made progress, as opposed to created_at/finished_at.
+                 # Progress also retires any waiting-for-build note (a job
+                 # still stalled on a build simply re-stamps it on its retry)
+                 "UpdateExpression" => "SET updated_at = :now ADD completed_jobs :one " *
+                                       "REMOVE #w",
+                 "ExpressionAttributeNames" => Dict("#w" => "waiting"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":one" => 1, ":now" => isodate()))))];
             aws_config=ctx.aws)

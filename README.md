@@ -162,7 +162,14 @@ the (pipeline-scoped) Buildkite token in SSM and deduplicates requests — and
 the workers' periodic re-asks double as its polling clock: each repeat ask
 checks the triggered build's state, and a build Buildkite reports as failed
 comes back as `build-failed`, which the worker turns into a run failure (at
-expansion) or an error result (for a job) instead of waiting forever.
+expansion) or an error result (for a job) instead of waiting forever. When
+both sides of a comparison need building, both builds are requested up front
+(expansion probes every config before yielding) so CI produces them in
+parallel. While the wait lasts, workers stamp the run item with a `waiting`
+marker (per config: sha, variant, Buildkite build URL), which the dashboard
+renders — a run showing no progress always says what it is blocked on,
+likewise for the sealing phase, whose progress the dashboard reads off the
+run's `seal_runs`.
 
 **Straggler avoidance**: long jobs are routed to a separate slow queue that
 workers drain first, so they start while plenty of short work remains to

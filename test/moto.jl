@@ -891,6 +891,48 @@ try
         end
     end
 
+    @testset "run waiting marker" begin
+        # workers stamp which builds a stalled run waits on; progress clears it
+        sha1 = "1234567890abcdef1234567890abcdef12345678"
+        sha2 = "abcdef1234567890abcdef1234567890abcdef12"
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Example"], Dict{String,Any}());
+                                submitter="tester")
+        # while expanding: the first note lands, without a URL yet
+        PEF.note_run_waiting(ctx, run_id; config="primary", sha=sha1, variant="linux")
+        run = PEF.get_run(ctx, run_id)
+        @test run["waiting"]["primary"]["sha"] == sha1
+        @test run["waiting"]["primary"]["url"] == ""
+        # a retry that learned the Buildkite URL fills it in
+        PEF.note_run_waiting(ctx, run_id; config="primary", sha=sha1, variant="linux",
+                             url="http://bk/42")
+        @test PEF.get_run(ctx, run_id)["waiting"]["primary"]["url"] == "http://bk/42"
+        # the baseline's own missing build gets its own slot: both are shown
+        PEF.note_run_waiting(ctx, run_id; config="against", sha=sha2, variant="linuxassert",
+                             url="http://bk/43")
+        run = PEF.get_run(ctx, run_id)
+        @test run["waiting"]["primary"]["url"] == "http://bk/42"
+        @test run["waiting"]["against"]["sha"] == sha2
+        @test run["waiting"]["against"]["variant"] == "linuxassert"
+
+        # expansion completing clears the marker
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example"]) == 1
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+        @test !haskey(PEF.get_run(ctx, run_id), "waiting")
+
+        # ...as does any job recording a result
+        PEF.note_run_waiting(ctx, run_id; config="primary", sha=sha1, variant="linux",
+                             url="http://bk/42")
+        @test haskey(PEF.get_run(ctx, run_id), "waiting")
+        c = PEF.claim_job(ctx; wait=1)
+        @test c isa PEF.ClaimedJob
+        PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+        run = PEF.get_run(ctx, run_id)
+        @test !haskey(run, "waiting")
+        @test run["status"] == "done"
+    end
+
     @testset "build-request claim/release" begin
         # BuildRequest's dedup: claimed once, poisoned claims releasable
         Dynamodb.create_table([Dict("AttributeName" => "build_key", "AttributeType" => "S")],
@@ -968,16 +1010,18 @@ try
                           "BUILDKITE_API_BASE" => "http://127.0.0.1:$bk_port",
                           "BUILDKITE_ORG" => "testorg", "BUILDKITE_PIPELINE" => "testpipe",
                           "BUILDKITE_TOKEN_PARAM" => "/pkgeval/buildkite-token")) do
-                # fresh ask: claims, triggers, records the build identity
+                # fresh ask: claims, triggers, records the build identity;
+                # the answer links the triggered build
                 resp = BuildRequest.handle_event(ask, lctx)
                 @test occursin("\"statusCode\":202", resp) && occursin("requested", resp)
+                @test occursin("http://bk/42", resp)
                 claim = BuildRequest.get_claim(lctx, "pkgeval-builds", key2)
                 @test FL.int(something(claim), "build_number", -1) == 42
                 @test FL.str(something(claim), "build_url", "") == "http://bk/42"
 
-                # build still running: plain dedup answer
+                # build still running: dedup answer, still carrying the URL
                 resp = BuildRequest.handle_event(ask, lctx)
-                @test occursin("already-requested", resp)
+                @test occursin("already-requested", resp) && occursin("http://bk/42", resp)
 
                 # Buildkite reports failure: claim flips, answer carries the URL
                 bk_state[] = "failed"
@@ -1040,6 +1084,7 @@ try
                 n0 = triggers[]
                 resp = BuildRequest.handle_event(askU, lctx)
                 @test occursin("waiting-upstream", resp)
+                @test occursin("http://bk/up/7", resp)   # links the upstream build
                 @test triggers[] == n0
                 @test statusof("$shaU/linuxassert") == "upstream"
                 # still in flight on re-ask: keep waiting, still no trigger

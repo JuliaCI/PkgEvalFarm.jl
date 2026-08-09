@@ -387,7 +387,7 @@ function takeover_and_trigger(ctx::LiteCtx, table::String, key::String,
         ddb(ctx, "UpdateItem", payload)
     catch err
         is_conditional_failure(err) || rethrow()
-        return json_response(200, "{\"status\":\"already-requested\"}")
+        return pending_response(200, "already-requested", commit_builds_url(commit))
     end
     build = try
         trigger_build(bk_token(ctx),
@@ -412,7 +412,8 @@ function takeover_and_trigger(ctx::LiteCtx, table::String, key::String,
             println(Core.stderr, "failed to record build identity for " * key * ": " * msg)
         end
     end
-    return json_response(202, "{\"status\":\"requested\"}")
+    url = something(build.web_url, "")
+    return pending_response(202, "requested", isempty(url) ? commit_builds_url(commit) : url)
 end
 
 """
@@ -422,7 +423,7 @@ grace period for artifact upload lag, stop waiting and trigger our own build —
 never answer `build-failed` from here, since an upstream build's failure says
 nothing about whether *our* build would succeed.
 """
-function poll_upstream(ctx::LiteCtx, table::String, key::String, c::Item)
+function poll_upstream(ctx::LiteCtx, table::String, key::String, c::Item, url::String)
     variant = String(last(split(key, '/')))
     commit = String(first(split(key, '/')))
     asked = parse_isodate(str(c, "requested_at", ""))
@@ -435,7 +436,7 @@ function poll_upstream(ctx::LiteCtx, table::String, key::String, c::Item)
         if Dates.now(UTC) - something(done_at) >= Dates.Second(UPSTREAM_DONE_GRACE)
             return takeover_and_trigger(ctx, table, key, commit, variant)
         end
-        return json_response(200, "{\"status\":\"already-requested\"}")
+        return pending_response(200, "already-requested", url)
     end
 
     pipeline = str(c, "upstream_pipeline", "")
@@ -454,12 +455,24 @@ function poll_upstream(ctx::LiteCtx, table::String, key::String, c::Item)
     if state !== nothing && !upstream_active(something(state))
         mark_upstream_done(ctx, table, key)   # grace clock; next asks decide
     end
-    return json_response(200, "{\"status\":\"already-requested\"}")
+    return pending_response(200, "already-requested", url)
 end
 
 failed_response(url::String) =
     json_response(200, isempty(url) ? "{\"status\":\"build-failed\"}" :
                        "{\"status\":\"build-failed\",\"url\":" * JSON.json(url) * "}")
+
+# Non-terminal answers carry a Buildkite URL too, so askers can surface *where*
+# the wait is happening (the dashboard links it on stalled runs).
+pending_response(code::Int, status::String, url::String) =
+    json_response(code, isempty(url) ? "{\"status\":\"" * status * "\"}" :
+                        "{\"status\":\"" * status * "\",\"url\":" * JSON.json(url) * "}")
+
+"Buildkite's builds page filtered by commit: always a valid link, used when no
+specific build identity is recorded on the claim."
+commit_builds_url(commit::String) =
+    "https://buildkite.com/" * (ENV["BUILDKITE_ORG"]::String) * "/" *
+    (ENV["BUILDKITE_PIPELINE"]::String) * "/builds?commit=" * commit
 
 """
 The dedup-hit path doubles as the failure detector: workers re-ask every
@@ -472,19 +485,18 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
     claim = get_claim(ctx, table, key)
     # claim gone: released by a concurrent failed trigger; the asker's next
     # retry will re-claim
-    claim === nothing && return json_response(200, "{\"status\":\"already-requested\"}")
+    claim === nothing && return pending_response(200, "already-requested",
+                                                 commit_builds_url(String(first(split(key, '/')))))
     c = something(claim)::Item
     url = str(c, "build_url", "")
     if isempty(url)
         # claims without a recorded build identity (a trigger-response parse
         # failure, or predating identity recording) still deserve a link:
         # Buildkite's builds page filters by commit
-        url = "https://buildkite.com/" * (ENV["BUILDKITE_ORG"]::String) * "/" *
-              (ENV["BUILDKITE_PIPELINE"]::String) * "/builds?commit=" *
-              String(first(split(key, '/')))
+        url = commit_builds_url(String(first(split(key, '/'))))
     end
     str(c, "status", "") == "failed" && return failed_response(url)
-    str(c, "status", "") == "upstream" && return poll_upstream(ctx, table, key, c)
+    str(c, "status", "") == "upstream" && return poll_upstream(ctx, table, key, c, url)
     asked = parse_isodate(str(c, "requested_at", ""))
     expired = asked !== nothing &&
               Dates.now(UTC) - something(asked) >= Dates.Second(MAX_BUILD_AGE)
@@ -504,7 +516,7 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
                      something(state) in ("failed", "canceled", "skipped", "not_run")
         end
     end
-    failed || return json_response(200, "{\"status\":\"already-requested\"}")
+    failed || return pending_response(200, "already-requested", url)
     try
         mark_build_failed(ctx, table, key)
     catch err
@@ -566,7 +578,7 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
         pipeline, number, up_url, active = something(upstream)
         try
             mark_claim_upstream(ctx, table, key, pipeline, number, up_url, active)
-            return json_response(202, "{\"status\":\"waiting-upstream\"}")
+            return pending_response(202, "waiting-upstream", up_url)
         catch err
             # an unmarkable claim must not wedge as a bare "requested" with no
             # build identity: release it and let the next asker redo the dance
@@ -578,7 +590,7 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
                 msg2 = (FarmLite.@trim_errmsg release_err)::String
                 println(Core.stderr, "failed to release build claim for " * key * ": " * msg2)
             end
-            return json_response(202, "{\"status\":\"waiting-upstream\"}")
+            return pending_response(202, "waiting-upstream", up_url)
         end
     end
 
@@ -611,7 +623,8 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env())
             println(Core.stderr, "failed to record build identity for " * key * ": " * msg)
         end
     end
-    return json_response(202, "{\"status\":\"requested\"}")
+    url = something(build.web_url, "")
+    return pending_response(202, "requested", isempty(url) ? commit_builds_url(commit) : url)
 end
 
 lambda_main() = lambda_loop(handle_event)

@@ -468,10 +468,11 @@ the URL auth layer despite valid identity- and resource-policy allows — the
 same signed requests from an IAM user worked. Undiagnosable from outside.)
 The Lambda deduplicates, so re-requesting on every retry is free — and repeat
 asks double as its polling clock: it checks the triggered build's state and
-answers `build-failed` when CI gave up. Returns `(:pending, nothing)` while a
+answers `build-failed` when CI gave up. Returns `(:pending, url)` while a
 build is requested/underway, `(:failed, url)` when it failed (the caller
 should stop waiting and surface the failure), or `(:error, nothing)` when the
-ask itself could not be made (treated as pending: retry).
+ask itself could not be made (treated as pending: retry). The url is the
+Buildkite build being waited on when the Lambda knows it, else `nothing`.
 """
 function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
     fn = ctx.cfg.build_request_function
@@ -495,12 +496,13 @@ function request_julia_build(ctx::FarmCtx, miss::PkgEval.MissingStagedBuild)
                 (try JSON.parse(body) catch; nothing end) : nothing
         status = inner isa AbstractDict ? get(inner, "status", "") : ""
         url = inner isa AbstractDict ? get(inner, "url", nothing) : nothing
+        bkurl = url isa AbstractString ? String(url) : nothing
         if status == "build-failed"
             @error "CI reports the build failed" miss.sha url
-            return (:failed, url isa AbstractString ? String(url) : nothing)
+            return (:failed, bkurl)
         elseif code isa Integer && 200 <= code < 300
             @info "requested CI build" miss.repo sha=miss.sha[1:10] miss.variant status
-            return (:pending, nothing)
+            return (:pending, bkurl)
         else
             # an invoke that reaches the function but is refused is a failure
             @error "build request refused" miss.sha response=first(payload, 300)
@@ -525,9 +527,25 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
             # uuid (stdlibs), so intersect the *names* of its values: comparing
             # Package structs would rely on their fields being egal.
             # This may download the Julia versions under test, since determining
-            # compatibility needs their version numbers.
-            names = intersect([Set(pkg.name for pkg in values(PkgEval.get_packages(cfg)))
-                               for cfg in configs]...)
+            # compatibility needs their version numbers — so probe every config
+            # before giving up on any: a run whose primary AND baseline both
+            # need building must request both CI builds now (they run in
+            # parallel), not discover the second one whole build later.
+            sets = Set{String}[]
+            misses = Tuple{String,PkgEval.MissingStagedBuild}[]
+            for cfg in configs
+                try
+                    push!(sets, Set(pkg.name for pkg in values(PkgEval.get_packages(cfg))))
+                catch err
+                    err isa PkgEval.MissingStagedBuild || rethrow()
+                    push!(misses, (cfg.name, err))
+                end
+            end
+            if !isempty(misses)
+                expand_missing_builds(ctx, claimed, misses)
+                return
+            end
+            names = intersect(sets...)
             # JLL wrappers are not worth testing (PkgEval.evaluate drops them too)
             packages = sort!([n for n in names if !endswith(n, "_jll")])
         end
@@ -538,22 +556,9 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
         @info "expanded run" claimed.run_id njobs
     catch err
         if err isa PkgEval.MissingStagedBuild
-            # determining package compatibility needs the Julia under test; ask
-            # CI to build it and retry once the queue redelivers this message —
-            # unless CI reports the build *failed*, in which case waiting is
-            # pointless: fail the run with the reason (the bot notices and
-            # tells the submitter) and retire the message.
-            @info "expansion needs a Julia build that is not staged" claimed.run_id sha=err.sha[1:10] err.variant
-            status, bkurl = request_julia_build(ctx, err)
-            if status === :failed
-                why = "the Julia build for $(err.repo)@$(err.sha[1:10]) ($(err.variant)) failed" *
-                      (bkurl === nothing ? "" : ": $(something(bkurl))")
-                @error "julia build failed; failing the run" claimed.run_id why
-                fail_run(ctx, claimed.run_id, why)
-                SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
-            else
-                release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
-            end
+            # safety net: the probe above normally batches these ("?": the
+            # throwing config is unknown here)
+            expand_missing_builds(ctx, claimed, [("?", err)])
         else
             @error "failed to expand run; releasing for retry" claimed.run_id exception=(err, catch_backtrace())
             release_job(ctx, claimed)
@@ -561,6 +566,40 @@ function process_expand(ctx::FarmCtx, claimed::ClaimedExpand)
     finally
         stop_heartbeat()
     end
+end
+
+"""
+Expansion blocked on unstaged Julia builds: ask CI for every missing one at
+once — the builds then run in parallel, instead of the second one being
+discovered a whole build later — note them on the run for the dashboard, and
+retry once the queue redelivers the expand message. A build CI reports as
+*failed* makes waiting pointless: fail the run with the reason (the bot
+notices and tells the submitter) and retire the message.
+"""
+function expand_missing_builds(ctx::FarmCtx, claimed::ClaimedExpand,
+                               misses::Vector{Tuple{String,PkgEval.MissingStagedBuild}})
+    failures = String[]
+    for (config, miss) in misses
+        @info "expansion needs a Julia build that is not staged" claimed.run_id config sha=miss.sha[1:10] miss.variant
+        status, bkurl = request_julia_build(ctx, miss)
+        if status === :failed
+            push!(failures,
+                  "the Julia build for $(miss.repo)@$(miss.sha[1:10]) ($(miss.variant)) failed" *
+                  (bkurl === nothing ? "" : ": $(something(bkurl))"))
+        else
+            note_run_waiting(ctx, claimed.run_id;
+                             config, sha=miss.sha, variant=miss.variant, url=bkurl)
+        end
+    end
+    if isempty(failures)
+        release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
+    else
+        why = join(failures, "; ")
+        @error "julia build failed; failing the run" claimed.run_id why
+        fail_run(ctx, claimed.run_id, why)
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+    end
+    return nothing
 end
 
 "Look up (and cache) the run item a job belongs to."
@@ -682,6 +721,9 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                           log="the Julia build for $(err.repo)@$(err.sha) ($(err.variant)) failed" *
                               (bkurl === nothing ? "" : "\n$(something(bkurl))"))
             else
+                note_run_waiting(ctx, job.run_id;
+                                 config=job.config, sha=err.sha, variant=err.variant,
+                                 url=bkurl)
                 release_job(ctx, claimed; delay=BUILD_RETRY_DELAY)
                 return
             end
