@@ -655,7 +655,8 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                                run_cache, run_cache_lock)
             # a seal run from a retired scheme gates nothing: run cold
             seal_run_scheme(seal_run) == "protocol" ?
-                seal_protocol_kwargs(seal_id_of(gated_seal_run)) : (;)
+                seal_protocol_kwargs(seal_id_of(gated_seal_run);
+                                     fetch_deadline=test_fetch_deadline()) : (;)
         end
         r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
                                  use_cache, sealed_kwargs...)

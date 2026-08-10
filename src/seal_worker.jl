@@ -19,17 +19,27 @@ running cold. Cold is soft — whatever sealed by then is still consumed — so
 this trades duplicate compilation against latency, nothing more."
 seal_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_WAIT", "")), 20.0 * 60)
 
+"How long a test job's in-sandbox fetch may wait on a held `/ensure` before
+degrading to a local compile. Seal jobs stay unbounded: their holds are
+graph-ordered and productive, and precompilation is their entire job — for a
+test job a hold is an accelerator that must never eat the remaining budget."
+test_fetch_deadline() =
+    something(tryparse(Float64, get(ENV, "PKGEVAL_TEST_FETCH_DEADLINE", "")), 600.0)
+
 """
 Evaluation kwargs pointing a job's sandbox at the cache protocol: the loopback
 proxy address and its namespace. Empty when the proxy isn't running.
 """
-function seal_protocol_kwargs(seal_id::AbstractString)
+function seal_protocol_kwargs(seal_id::AbstractString;
+                              fetch_deadline::Union{Nothing,Float64}=nothing)
     pkgeval_supports_seal() || return (;)
     # the expansion-side detection guarantees this julia carries the hook
     proxy = SEAL_PROXY[]
     proxy === nothing && return (;)
     env = Dict("PKGEVAL_CACHE_SERVER" => "http://127.0.0.1:$(proxy.port)",
                "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
+    fetch_deadline === nothing ||
+        (env["PKGEVAL_CACHE_FETCH_DEADLINE"] = string(fetch_deadline))
     # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
     # rejection reasons in job logs when chasing convergence bugs
     dbg = get(ENV, "PKGEVAL_JULIA_DEBUG", "")

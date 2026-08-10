@@ -105,8 +105,10 @@ const SEAL_PROXY = Ref{Any}(nothing)
 # artifact lands (dataflow ordering by blocking — the sandbox idles at zero
 # CPU). While holds are active the worker donates slots to seal-queue work
 # (typically the very derivations being waited on): run_worker registers the
-# donor closure, and holds are bounded well inside PkgEval's inactivity
-# windows so a stuck rung degrades to a local compile, never a killed job.
+# donor closure. Holds are only taken for derivable wants (every keyable dep
+# published, see `want_derivable`), and test jobs additionally bound the
+# client-side fetch deadline, so a stuck derivation degrades to a local
+# compile instead of eating the evaluation's time budget (#11).
 const SEAL_DONOR = Ref{Any}(nothing)
 const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
 
@@ -124,6 +126,9 @@ level (evaluation time limits, worker heartbeat bounds); a derivation that
 dies terminally releases every holder through the status check. The hard cap
 here is task-hygiene only — beyond any legitimate job lifetime, so a holder
 whose requester already died doesn't poll forever.
+
+Underivable wants never reach here (see `want_derivable`): a hold is only
+ever taken for a key some derivation can actually produce.
 """
 function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
                              key::AbstractString)
@@ -211,6 +216,17 @@ function start_seal_proxy!(ctx::FarmCtx)
                     # holding or enqueuing (the consumer's own wants already
                     # schedule the chain); authoritative look because the
                     # negative cache may postdate a sibling's publish
+                    body = get_kv(ctx, ns, want.uuid, key)
+                elseif !want_derivable(ctx, ns, want)
+                    # a keyable dep without a published artifact was a local
+                    # compile in the requester's sandbox: the wanted key embeds
+                    # a build_id no derivation can reproduce, so holding would
+                    # wait out a full derivation for a guaranteed 404, and
+                    # enqueuing would spend an executor slot on an artifact no
+                    # future consumer can address. The dep misses themselves
+                    # already scheduled the derivations that eventually make
+                    # contexts like this one derivable.
+                    @info "underivable want; answering without hold" ns name=want.name key=first(key, 12)
                     body = get_kv(ctx, ns, want.uuid, key)
                 else
                     try
@@ -336,6 +352,20 @@ function parse_want_preimage(body::AbstractString)
     return (; name=fields["name"], uuid=lowercase(fields["uuid"]),
             version=fields["version"], ext_of, deps)
 end
+
+"""
+Whether a derivation could ever produce `want`'s key: every keyable dep
+(`key != "-"`) must already be published. A consumer that fetched those
+artifacts embeds their canonical build_ids, which a derivation reproduces by
+fetching the same keys; an unpublished keyable dep means the consumer
+compiled it locally, baking a build_id into the wanted key that no other
+process can reproduce. (Unkeyable `-` deps are stdlibs and the like, whose
+build_ids ship with the julia build. The one taint this misses — a locally
+compiled *unkeyable* extension — is caught by the client's own X-Nohold,
+which knows cachefile provenance.)
+"""
+want_derivable(ctx::FarmCtx, ns::AbstractString, want) =
+    all(d -> d.key == "-" || get_kv(ctx, ns, d.uuid, d.key) !== nothing, want.deps)
 
 deriv_run_id(ns::AbstractString) = "deriv-" * ns
 

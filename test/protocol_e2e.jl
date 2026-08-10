@@ -176,14 +176,23 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
                       trig["key"] => frame_of(trig), ext["key"] => frame_of(ext))
 
         # stub proxy speaking /ensure: hash the preimage, serve known keys,
-        # collect the preimages of unknown ones (the derivation requests)
+        # collect the preimages of unknown ones (the derivation requests) and
+        # each request's X-Nohold flag — the client's own derivability verdict
         wants = String[]
+        requests = NamedTuple[]
         handler = req -> begin
             if req.method == "POST" && startswith(req.target, "/ensure/v2/")
+                ns = String(chopprefix(req.target, "/ensure/v2/"))
                 body = String(req.body)
                 key = bytes2hex(SHA.sha256(codeunits(body)))
-                startswith(req.target, "/ensure/v2/e2e") && haskey(frames, key) &&
-                    return HTTP.Response(200, frames[key])
+                nm = match(r"^name=(.*)$"m, body)
+                served = ns == "e2e" ? frames :
+                         ns == "mixed" ? Dict(dep["key"] => frames[dep["key"]]) :
+                         Dict{String,Vector{UInt8}}()
+                hit = haskey(served, key)
+                push!(requests, (; ns, name=nm === nothing ? "?" : String(nm[1]),
+                                 nohold=HTTP.header(req, "X-Nohold", "") == "1", hit))
+                hit && return HTTP.Response(200, served[key])
                 push!(wants, body)   # derivation requests, any namespace
                 return HTTP.Response(404)
             end
@@ -223,6 +232,9 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
                 """)
             @test ok || error(out)
             @test occursin("CONSUMER_OK", out)
+            # every context resolved through fetches alone: all derivable,
+            # so no request may carry the probe flag
+            @test all(r -> !r.nohold, filter(r -> r.ns == "e2e", requests))
 
             # a consumer the server has nothing for (different namespace)
             # compiles locally and reports misses with full context
@@ -247,6 +259,37 @@ parse_keys(file, unit) = TOML.parsefile(file)[unit]
                                    occursin("ext_of=$UUID_S", w), wants)
             v3_ext_want || @error "no v3 ext want" firstlines=[join(first(split(w, "\n"), 5), " | ") for w in wants]
             @test v3_ext_want
+            # leaf contexts (no deps) stay derivable — a hold on them would be
+            # productive — but once a dep compiled locally, no derivation can
+            # ever produce the wanted key: the client must flag those requests
+            # so the proxy neither holds nor enqueues a doomed derivation
+            other = filter(r -> r.ns == "other", requests)
+            for name in ("DepPkg", "TrigPkg", "ProtoPkg", EXT_NAME)
+                @test any(r -> r.name == name, other)
+            end
+            @test all(r -> r.nohold == (r.name in ("ProtoPkg", EXT_NAME)), other)
+
+            # taint is per-context, not per-process: with only DepPkg served,
+            # ProtoPkg (DepPkg its sole dep) stays derivable while the
+            # extension (locally compiled trigger) does not
+            depot_d = joinpath(dir, "depot_d")
+            mkpath(depot_d)
+            cp(joinpath(depot_a, "packages"), joinpath(depot_d, "packages"))
+            ok, out = run_client(depot_d, proj, base, """
+                PkgEvalCacheClient.install!()
+                using ProtoPkg, TrigPkg
+                @assert ProtoPkg.answer() == 42
+                @assert PkgEvalCacheClient.HITS[] == 1   # DepPkg only
+                println("MIXED_OK")
+                """; namespace="mixed")
+            @test ok || error(out)
+            @test occursin("MIXED_OK", out)
+            mixed = filter(r -> r.ns == "mixed", requests)
+            @test any(r -> r.name == "DepPkg" && r.hit, mixed)
+            for name in ("ProtoPkg", EXT_NAME)
+                @test any(r -> r.name == name, mixed)
+            end
+            @test all(r -> r.nohold == (r.name == EXT_NAME), mixed)
         finally
             close(server)
         end

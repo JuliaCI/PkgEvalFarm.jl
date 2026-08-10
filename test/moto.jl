@@ -1827,6 +1827,44 @@ try
                 @test PEF.get_seal_item(sctx, PEF.JobRef("deriv-otherns", "deriv",
                                                          key_probe)) === nothing
 
+                # underivable want: a keyable dep without a published artifact
+                # embeds a sandbox-local build_id no derivation can reproduce —
+                # answered without holding and without creating a derivation
+                dep_uuid_u = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                dep_key_u = "ab"^32
+                pre_und = join(["v2", "julia=1+a", "name=JSON", "uuid=$want_uuid",
+                                "version=1.4.0", "tree=$("55"^20)", "flags=1", "prefs=0",
+                                "dep=$dep_uuid_u:abc123:1.0.0:$dep_key_u"], "
+")
+                key_und = bytes2hex(PEF.SHA.sha256(codeunits(pre_und)))
+                t0 = time()
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_und,
+                                      status_exception=false)
+                @test resp.status == 404
+                @test time() - t0 < 2.0      # no hold
+                @test PEF.get_seal_item(sctx, PEF.JobRef("deriv-otherns", "deriv",
+                                                         key_und)) === nothing
+                # once the dep publishes, the same want is derivable: the
+                # request now creates the derivation and holds on it
+                PEF.put_sealed_object(sctx, PEF.kv_object_key("otherns", dep_uuid_u, dep_key_u),
+                                      PEF.frame_pair(Vector{UInt8}(codeunits("DEPJI")), nothing))
+                failer2 = @async begin
+                    sleep(3)
+                    cd_ = PEF.claim_job(sctx; wait=2)
+                    cd_ isa PEF.ClaimedJob || return
+                    PEF.record_result(sctx, cd_, PEF.JobResult(; status="unsealable",
+                                                               reason="precompile",
+                                                               duration=0.1))
+                end
+                t0 = time()
+                resp = ProxyHTTP.post("$base/ensure/v2/otherns"; body=pre_und,
+                                      status_exception=false)
+                wait(failer2)
+                @test resp.status == 404
+                @test time() - t0 >= 2.0     # it held until the terminal flip
+                @test PEF.get_seal_item(sctx, PEF.JobRef("deriv-otherns", "deriv",
+                                                         key_und)) !== nothing
+
                 # malformed preimages are rejected outright
                 @test ProxyHTTP.post("$base/ensure/v2/otherns"; body="v1\ngarbage",
                                      status_exception=false).status == 400
