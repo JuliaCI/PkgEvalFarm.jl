@@ -48,15 +48,15 @@ resource "aws_lambda_function" "broker" {
 
   environment {
     variables = {
-      GITHUB_ORG             = var.github_org
-      WORKER_TEAM            = var.worker_team
-      SUBMITTER_TEAM         = var.submitter_team
-      GITHUB_CLIENT_ID       = var.github_client_id
-      WORKER_ROLE_ARN        = aws_iam_role.worker.arn
-      SUBMITTER_ROLE_ARN     = aws_iam_role.submitter.arn
-      CRED_DURATION          = tostring(var.cred_duration_seconds)
-      PKGEVAL_QUEUE_URL      = aws_sqs_queue.jobs.url
-      PKGEVAL_SLOW_QUEUE_URL = aws_sqs_queue.jobs_slow.url
+      GITHUB_ORG              = var.github_org
+      WORKER_TEAM             = var.worker_team
+      SUBMITTER_TEAM          = var.submitter_team
+      GITHUB_CLIENT_ID        = var.github_client_id
+      WORKER_ROLE_ARN         = aws_iam_role.worker.arn
+      SUBMITTER_ROLE_ARN      = aws_iam_role.submitter.arn
+      CRED_DURATION           = tostring(var.cred_duration_seconds)
+      PKGEVAL_QUEUE_URL       = aws_sqs_queue.jobs.url
+      PKGEVAL_SLOW_QUEUE_URL  = aws_sqs_queue.jobs_slow.url
       PKGEVAL_SEAL_QUEUE_URL  = aws_sqs_queue.jobs_seal.url
       PKGEVAL_DERIV_QUEUE_URL = aws_sqs_queue.jobs_deriv.url
       # vended to workers so they can ask CI for missing Julia builds

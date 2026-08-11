@@ -246,9 +246,9 @@ resource "aws_launch_template" "ec2_worker" {
 
   # gzipped: the 16KB user-data limit applies post-compression
   user_data = base64gzip(templatefile("${path.module}/ec2_worker_userdata.sh.tpl", {
-    region         = var.region
-    queue_url      = aws_sqs_queue.jobs.url
-    slow_queue_url = aws_sqs_queue.jobs_slow.url
+    region          = var.region
+    queue_url       = aws_sqs_queue.jobs.url
+    slow_queue_url  = aws_sqs_queue.jobs_slow.url
     seal_queue_url  = aws_sqs_queue.jobs_seal.url
     deriv_queue_url = aws_sqs_queue.jobs_deriv.url
     # by name, not reference: the launch template cannot depend on the ASG
