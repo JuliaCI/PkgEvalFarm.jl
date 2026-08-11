@@ -45,6 +45,42 @@ useradd --create-home --shell /bin/bash worker
 # with every artifact present in S3)
 install -d -o worker -g worker /var/cache/pkgeval-seal
 
+# --- local NVMe scratch ------------------------------------------------------
+# The *d instance types carry ephemeral NVMe the AMI never touches, while the
+# write-hot paths — per-job sandbox scratch in /tmp, the worker depot
+# (compilecache, package installs, rootfs images), the sealed-artifact cache —
+# otherwise all contend on the single gp3 root volume (measured pinned at its
+# throughput cap with the CPUs half idle, 2026-08-11). Use the local disks
+# when present: RAID0 across multiples, bind-mounted over the hot paths.
+# Best-effort — any failure leaves the instance on EBS exactly as before.
+# Ephemerality is fine: every path bound here is rebuilt on boot, and the
+# farm's ground truth lives in S3/DynamoDB.
+setup_local_ssd() {
+    local devs dev n
+    devs=$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/"$1}')
+    [ -n "$devs" ] || return 0
+    n=$(echo "$devs" | wc -l)
+    if [ "$n" -gt 1 ]; then
+        command -v mdadm >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -qy mdadm
+        mdadm --create /dev/md0 --run --level=0 --force --raid-devices=$n $devs
+        dev=/dev/md0
+    else
+        dev=$devs
+    fi
+    mkfs.ext4 -q -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 "$dev"
+    mkdir -p /mnt/scratch
+    mount -o noatime "$dev" /mnt/scratch
+    install -d -m 1777 /mnt/scratch/tmp
+    install -d -o worker -g worker /mnt/scratch/depot
+    install -d -o worker -g worker /mnt/scratch/sealcache
+    mount --bind /mnt/scratch/tmp /tmp
+    install -d -o worker -g worker /home/worker/.julia
+    mount --bind /mnt/scratch/depot /home/worker/.julia
+    mount --bind /mnt/scratch/sealcache /var/cache/pkgeval-seal
+    echo "local NVMe scratch active on $dev ($n device(s))"
+}
+setup_local_ssd || echo "local NVMe scratch unavailable; staying on EBS"
+
 # PkgEval drives containers with `crun --systemd-cgroup`, which for a rootless
 # container asks the *user's* systemd (over its session D-Bus) to create the
 # transient scope. A `User=` system service has neither, so every container --
