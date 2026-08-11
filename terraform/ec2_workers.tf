@@ -202,8 +202,14 @@ data "aws_ami" "ubuntu" {
 }
 
 resource "aws_launch_template" "ec2_worker" {
-  count         = local.ec2_workers
-  name          = "${var.name_prefix}-ec2-worker"
+  # two variants, chosen per instance type by the ASG overrides below: types
+  # with local NVMe (cloud-init puts the write-hot paths there, see the
+  # userdata) skip the provisioned gp3 they would never touch
+  for_each = local.ec2_workers == 0 ? {} : {
+    ebs  = true  # provisioned gp3: the root volume is the working disk
+    nvme = false # default gp3: scratch lives on instance-store NVMe
+  }
+  name          = "${var.name_prefix}-ec2-worker-${each.key}"
   image_id      = data.aws_ami.ubuntu[0].id
   instance_type = var.ec2_worker_instance_types[0]
 
@@ -231,9 +237,10 @@ resource "aws_launch_template" "ec2_worker" {
       # doing exactly 125 MB/s while the CPUs sit half idle (measured on
       # i-0f061e33b6b4f1e44, 2026-08-11). Provisioned throughput is billed
       # only while spot instances run; sized so a 32-48 vCPU worker becomes
-      # CPU-bound again.
-      throughput = 750
-      iops       = 6000
+      # CPU-bound again. The nvme variant keeps the defaults: its hot paths
+      # live on instance-store NVMe and the root volume is boot-only.
+      throughput = each.value ? 750 : null
+      iops       = each.value ? 6000 : null
     }
   }
 
@@ -323,7 +330,7 @@ resource "aws_autoscaling_group" "ec2_worker" {
     }
     launch_template {
       launch_template_specification {
-        launch_template_id = aws_launch_template.ec2_worker[0].id
+        launch_template_id = aws_launch_template.ec2_worker["ebs"].id
         version            = "$Latest"
       }
       dynamic "override" {
@@ -334,6 +341,14 @@ resource "aws_autoscaling_group" "ec2_worker" {
           # allocator normalizes pool prices to price-per-slot, so it picks a
           # 24xlarge over an 8xlarge exactly when it is cheaper per vCPU
           weighted_capacity = tostring(data.aws_ec2_instance_type.worker[override.value].default_vcpus)
+          # classified from the instance-type data, never a hand-kept list:
+          # types with local disks boot the variant without provisioned gp3
+          launch_template_specification {
+            launch_template_id = aws_launch_template.ec2_worker[
+              length(data.aws_ec2_instance_type.worker[override.value].instance_disks) > 0
+            ? "nvme" : "ebs"].id
+            version = "$Latest"
+          }
         }
       }
     }
