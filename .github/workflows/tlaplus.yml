@@ -1,0 +1,38 @@
+# Model-checks docs/tla/ whenever a spec or config changes. Deliberately a
+# separate workflow from CI: a spec regression should be loud, but the model
+# is documentation of the protocol, not a gate — it must never block a deploy.
+name: TLA+
+
+on:
+  push:
+    branches: [master]
+    paths: ['docs/tla/**']
+  pull_request:
+    paths: ['docs/tla/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tlc:
+    name: TLC model check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Fetch tla2tools
+        run: curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+      - name: Model-check every spec with a matching config
+        working-directory: docs/tla
+        run: |
+          for cfg in *.cfg; do
+            spec="${cfg%.cfg}"
+            echo "::group::TLC $spec"
+            java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+              -deadlock -workers auto "$spec"
+            echo "::endgroup::"
+          done
