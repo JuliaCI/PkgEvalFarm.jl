@@ -416,30 +416,50 @@ seal_registry_dir(config::PkgEval.Configuration) =
 
 Expansion-side sealing setup: per config, ensure the shared seal run, add seal
 jobs for this run's fresh packages (with dependency counters from the static
-graph) and enqueue the ready ones. Best-effort by design — sealing is an
-accelerator, so any failure here degrades the run to cold evaluation, never
-fails it.
+graph) and enqueue the ready ones.
+
+The decision is symmetric across configs — all seal or none do (`nothing`) —
+because a run whose sides evaluate under different schemes isn't comparing
+julias anymore: timing, precompile behavior and protocol-induced failures all
+masquerade as one-sided regressions (#12, 31 spurious kill→ok flips). And it
+is *definitive*: the hook probe answers only when the sandboxed julia
+actually ran (an unprobeable config — unstaged build, sandbox failure —
+throws out of expansion, whose redelivery retries once the cause clears;
+"couldn't ask" must never freeze into "unsupported"). Setup failures after
+detection degrade the whole run to cold, never one config.
 """
 function setup_sealing(ctx::FarmCtx, run::AbstractDict, fresh::Vector{JobRef})
     sealing_enabled(ctx.cfg) || return nothing
-    mapping = Dict{String,String}()
+    wanted = Tuple{Any,String,Vector{String}}[]
+    for config_dict in run["configs"]
+        name = String(config_dict["name"])
+        packages = sort!(unique([j.package for j in fresh if j.config == name]))
+        isempty(packages) || push!(wanted, (config_dict, name, packages))
+    end
+    isempty(wanted) && return nothing
+    # phase 1: a definitive hook verdict for every config before any setup
+    for (config_dict, name, _) in wanted
+        fingerprint = seal_fingerprint(config_dict)
+        if !detect_seal_support(config_from_dict(config_dict), fingerprint)
+            @info "julia lacks the cache-fetch hook; whole run evaluates cold (scheme symmetry)" config=name
+            return nothing
+        end
+    end
     learned = try
         learned_edges(ctx)
     catch err
         @warn "failed to load learned edges; using the registry graph alone" err
         Dict{String,Vector{String}}()
     end
-    for config_dict in run["configs"]
-        name = String(config_dict["name"])
-        packages = sort!(unique([j.package for j in fresh if j.config == name]))
-        isempty(packages) && continue
+    # phase 2: per-config setup, all or nothing — a partial seal_runs map
+    # would evaluate the configs under different schemes. Orphaned seal runs
+    # from an abandoned partial setup are harmless: they are shared by
+    # fingerprint and still warm the store.
+    mapping = Dict{String,String}()
+    for (config_dict, name, packages) in wanted
         try
             fingerprint = seal_fingerprint(config_dict)
             config = config_from_dict(config_dict)
-            if !detect_seal_support(config, fingerprint)
-                @info "julia lacks the cache-fetch hook; jobs run unsealed" config=name
-                continue
-            end
             id = ensure_seal_run(ctx, config_dict, fingerprint)
             registry = seal_registry_dir(config)
             graph = seal_dep_graph(registry, packages, learned)
@@ -448,7 +468,8 @@ function setup_sealing(ctx::FarmCtx, run::AbstractDict, fresh::Vector{JobRef})
             mapping[name] = id
             @info "sealing set up" run_id=run["run_id"] config=name seal_run=id ncreated nready=length(ready)
         catch err
-            @error "sealing setup failed for config; its jobs run cold" name exception=(err, catch_backtrace())
+            @error "sealing setup failed; whole run evaluates cold (scheme symmetry)" name exception=(err, catch_backtrace())
+            return nothing
         end
     end
     return isempty(mapping) ? nothing : mapping

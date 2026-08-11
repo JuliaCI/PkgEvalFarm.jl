@@ -1531,6 +1531,34 @@ try
                                                           "sealed" : "test", duration=1.0))
             end
         end
+        # scheme symmetry (#12): a definitive "no hook" verdict for ANY config
+        # runs the whole run cold — no partial seal_runs map that would compare
+        # a sealed julia against a cold one
+        PEF.SEAL_SUPPORT_OVERRIDE[] = nothing
+        let cfgs = [Dict{String,Any}("name" => "primary", "julia" => "fake-julia-A"),
+                    Dict{String,Any}("name" => "against", "julia" => "fake-julia-B")],
+            run_dict = Dict{String,Any}("run_id" => "symm-test", "configs" => cfgs),
+            fresh = [PEF.JobRef("symm-test", "primary", "JSON"),
+                     PEF.JobRef("symm-test", "against", "JSON")],
+            fpA = PEF.seal_fingerprint(cfgs[1]), fpB = PEF.seal_fingerprint(cfgs[2])
+
+            PEF.SEAL_SUPPORT_CACHE[fpA] = true
+            PEF.SEAL_SUPPORT_CACHE[fpB] = false
+            @test PEF.setup_sealing(sctx, run_dict, fresh) === nothing
+            # both definitively hooked: both configs seal
+            PEF.SEAL_SUPPORT_CACHE[fpB] = true
+            mapping = PEF.setup_sealing(sctx, run_dict, fresh)
+            @test mapping !== nothing && length(mapping) == 2
+            delete!(PEF.SEAL_SUPPORT_CACHE, fpA)
+            delete!(PEF.SEAL_SUPPORT_CACHE, fpB)
+            # close out the seal jobs this enqueued so later testsets start clean
+            for _ in 1:6
+                c = PEF.claim_job(sctx; wait=1)
+                c === nothing && break
+                c isa PEF.ClaimedJob &&
+                    PEF.record_result(sctx, c, PEF.JobResult(; status="sealed", duration=0.1))
+            end
+        end
         PEF.SEAL_REGISTRY_OVERRIDE[] = nothing
         PEF.SEAL_SUPPORT_OVERRIDE[] = nothing
     end

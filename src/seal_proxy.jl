@@ -25,8 +25,11 @@ const SCHEME_LOCK = ReentrantLock()
 const SEAL_SUPPORT_OVERRIDE = Ref{Union{Nothing,Bool}}(nothing)
 
 """
-Whether a configuration's julia carries the cache-fetch hook. Detection
-failures (and PkgEval forks without the detector) mean no sealing.
+Whether a configuration's julia carries the cache-fetch hook. Only definitive
+probe verdicts are returned (and memoized): a probe that could not run throws
+through to the caller — expansion retries it later — instead of freezing
+"unsupported" into a run (#12). PkgEval forks without the detector are
+definitively hookless.
 """
 function detect_seal_support(config::PkgEval.Configuration, fingerprint::AbstractString)
     SEAL_SUPPORT_OVERRIDE[] === nothing || return something(SEAL_SUPPORT_OVERRIDE[])
