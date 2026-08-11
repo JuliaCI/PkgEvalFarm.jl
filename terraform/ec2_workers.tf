@@ -225,6 +225,15 @@ resource "aws_launch_template" "ec2_worker" {
     ebs {
       volume_size = var.ec2_worker_disk_gb
       volume_type = "gp3"
+      # gp3 defaults (125 MB/s, 3000 IOPS) are the fleet's real ceiling during
+      # seal phases: every slot's sandbox scratch, depot materialization and
+      # compilecache write shares this one volume, and it pins at 100% util
+      # doing exactly 125 MB/s while the CPUs sit half idle (measured on
+      # i-0f061e33b6b4f1e44, 2026-08-11). Provisioned throughput is billed
+      # only while spot instances run; sized so a 32-48 vCPU worker becomes
+      # CPU-bound again.
+      throughput = 750
+      iops       = 6000
     }
   }
 
