@@ -59,6 +59,30 @@ end
                                     Dict("Crayons" => ["Example", "NotInRun"]))
         @test merged["Crayons"] == ["Example"]
         @test merged["JSON"] == ["Crayons", "Example"]
+
+        # cycles deadlock the readiness counters, so the graph collapses each
+        # SCC by dropping its internal edges (the Compat <-> SHA class): a
+        # learned edge closing a Crayons -> JSON loop costs both directions,
+        # while edges out of the component survive
+        cyc = PEF.seal_dep_graph(reg, sort(collect(wanted)),
+                                 Dict("Crayons" => ["JSON"]))
+        @test cyc["JSON"] == ["Example"]
+        @test cyc["Crayons"] == String[]
+        @test cyc["Example"] == String[]
+    end
+
+    @testset "strongly connected components" begin
+        comp = PEF.scc_ids(Dict("A" => ["B"], "B" => ["C"], "C" => ["A", "D"],
+                                "D" => String[], "E" => ["D", "X"]))
+        @test comp["A"] == comp["B"] == comp["C"]
+        @test comp["D"] != comp["A"] && comp["E"] != comp["D"] && comp["E"] != comp["A"]
+        @test !haskey(comp, "X")   # dep-only nodes are external to the map
+        # an acyclic diamond stays four singleton components
+        @test length(unique(values(PEF.scc_ids(Dict("A" => ["B", "C"], "B" => ["D"],
+                                                    "C" => ["D"], "D" => String[]))))) == 4
+        # two disjoint 2-cycles do not merge
+        comp2 = PEF.scc_ids(Dict("A" => ["B"], "B" => ["A"], "C" => ["D"], "D" => ["C"]))
+        @test comp2["A"] == comp2["B"] && comp2["C"] == comp2["D"] && comp2["A"] != comp2["C"]
     end
 end
 

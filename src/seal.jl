@@ -182,7 +182,81 @@ function seal_dep_graph(registry_dir::AbstractString, packages::Vector{String},
         end
         graph[pkg] = sort!(collect(merged))
     end
+    # Cycles deadlock the readiness counters: every member waits on another
+    # member, no completion ever decrements the component free, and everything
+    # downstream of it freezes with it. They are routine, not exotic — the
+    # registry union across version ranges and the learned test-dep edges both
+    # create them (a Compat <-> SHA cycle froze ~78% of every ecosystem seal
+    # run at the same ~2,650-job prefix, runs seal-42eec8/seal-0c7a5 et al.).
+    # Collapse each strongly-connected component by dropping its internal
+    # edges: members then count only external deps, seal with their cyclic
+    # deps cold — wasted warmth, not wrongness (see add_seal_jobs).
+    comp = scc_ids(graph)
+    for (pkg, deps) in graph
+        graph[pkg] = [d for d in deps if get(comp, d, 0) != comp[pkg]]
+    end
     return graph
+end
+
+"""
+Strongly-connected components of a `node -> deps` adjacency dict, as a
+`node -> component id` map over the dict's keys. Deps that are not keys have
+no recorded out-edges, so they can never sit on a cycle — callers treat them
+as external (`get(comp, d, 0)`). Iterative Tarjan: the seal graph is
+ecosystem-sized and recursion would overflow.
+"""
+function scc_ids(graph::AbstractDict)
+    index = Dict{String,Int}()
+    low = Dict{String,Int}()
+    onstack = Set{String}()
+    stack = String[]
+    comp = Dict{String,Int}()
+    next_index = 0
+    next_comp = 0
+    for start in keys(graph)
+        haskey(index, start) && continue
+        work = Tuple{String,Int}[(String(start), 0)]
+        while !isempty(work)
+            node, i = pop!(work)
+            if i == 0
+                next_index += 1
+                index[node] = low[node] = next_index
+                push!(stack, node)
+                push!(onstack, node)
+            end
+            deps = get(graph, node, String[])
+            recursed = false
+            j = i
+            while j < length(deps)
+                j += 1
+                d = String(deps[j])
+                haskey(graph, d) || continue
+                if !haskey(index, d)
+                    push!(work, (node, j))   # resume after this dep
+                    push!(work, (d, 0))
+                    recursed = true
+                    break
+                elseif d in onstack
+                    low[node] = min(low[node], index[d])
+                end
+            end
+            recursed && continue
+            if low[node] == index[node]
+                next_comp += 1
+                while true
+                    w = pop!(stack)
+                    delete!(onstack, w)
+                    comp[w] = next_comp
+                    w == node && break
+                end
+            end
+            if !isempty(work)
+                parent, _ = work[end]
+                low[parent] = min(low[parent], low[node])
+            end
+        end
+    end
+    return comp
 end
 
 
@@ -392,6 +466,53 @@ function reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString)
         catch err
             is_conditional_failure(err) || @warn "seal reconciliation update failed" pkg err
         end
+    end
+    # cycle amnesty: a pending component whose only non-terminal deps are its
+    # own members can never decrement itself free — the counters deadlock.
+    # seal_dep_graph now collapses cycles at creation, but items from before
+    # that (and any rebuilt by races) still carry them; release such
+    # components whole, exactly as the collapse would have: members seal with
+    # their cyclic deps cold. Running deps are external liveness (their
+    # completion decrements normally), so components pointing at one wait.
+    pending_deps = Dict{String,Vector{String}}()
+    for job in jobs
+        get(job, "status", "") == "pending" || continue
+        pkg = String(job["package"])
+        pending_deps[pkg] = [String(d) for d in get(job, "deps", String[])
+                             if !seal_terminal(get(status, String(d), "sealed"))]
+    end
+    comp = scc_ids(pending_deps)
+    blocked_externally = Set{Int}()
+    for (pkg, deps) in pending_deps, d in deps
+        get(comp, d, 0) == comp[pkg] || push!(blocked_externally, comp[pkg])
+    end
+    members = Dict{Int,Vector{String}}()
+    for pkg in keys(pending_deps)
+        push!(get!(Vector{String}, members, comp[pkg]), pkg)
+    end
+    for (cid, pkgs) in members
+        cid in blocked_externally && continue
+        length(pkgs) >= 2 || continue   # free singletons belong to the branch above
+        released = String[]
+        for pkg in pkgs
+            try
+                Dynamodb.update_item(
+                    ddb_item(Dict("run_id" => seal_run_id, "job_key" => job_key(SEAL_CONFIG_NAME, pkg))),
+                    ctx.cfg.jobs_table,
+                    Dict("ConditionExpression" => "#s = :pending",
+                         "UpdateExpression" => "SET remaining = :zero",
+                         "ExpressionAttributeNames" => Dict("#s" => "status"),
+                         "ExpressionAttributeValues" => ddb_item(Dict(
+                             ":pending" => "pending", ":zero" => 0)));
+                    aws_config=ctx.aws)
+                push!(released, pkg)
+            catch err
+                is_conditional_failure(err) || @warn "cycle release failed" pkg err
+            end
+        end
+        append!(healed, released)
+        isempty(released) ||
+            @info "released deadlocked seal cycle" seal_run_id n=length(released) sample=first(sort(released), min(length(released), 5))
     end
     isempty(healed) || enqueue_seal_jobs(ctx, seal_run_id, healed)
     isempty(healed) || @info "reconciled stuck seal jobs" seal_run_id n=length(healed)

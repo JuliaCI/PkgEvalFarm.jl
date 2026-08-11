@@ -1509,6 +1509,63 @@ try
             PEF.record_result(sctx, c, PEF.JobResult(; status="unsealable",
                                                      reason="precompile", duration=1.0))
 
+            # cycle amnesty: a pending component that only waits on itself
+            # (items predating seal_dep_graph's cycle collapse — the
+            # Compat <-> SHA deadlock that froze every ecosystem seal run) is
+            # released whole by reconcile; components with a live external dep
+            # are left to normal decrement propagation
+            cyc_run = "seal-cycleamnesty00"
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                    "run_id" => cyc_run, "created_at" => PEF.isodate(),
+                    "submitter" => "sealing", "status" => "active", "kind" => "seal",
+                    "configs" => "[]", "packages" => "[]", "context" => "{}",
+                    "total_jobs" => 5, "completed_jobs" => 1)),
+                "pkgeval-runs"; aws_config=aws)
+            for (pkg, dep) in (("CycA", "CycB"), ("CycB", "CycA"))
+                Dynamodb.put_item(PEF.ddb_item(Dict(
+                        "run_id" => cyc_run, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, pkg),
+                        "config" => PEF.SEAL_CONFIG_NAME, "package" => pkg, "kind" => "seal",
+                        "status" => "pending", "attempts" => 0,
+                        "deps" => [dep, "CycDone"], "dependents" => [dep],
+                        "remaining" => 2)), "pkgeval-jobs"; aws_config=aws)
+            end
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                    "run_id" => cyc_run, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, "CycDone"),
+                    "config" => PEF.SEAL_CONFIG_NAME, "package" => "CycDone", "kind" => "seal",
+                    "status" => "sealed", "attempts" => 1,
+                    "deps" => Any[], "dependents" => Any[], "remaining" => 0)),
+                "pkgeval-jobs"; aws_config=aws)
+            # a second cycle blocked on a genuinely running dep must NOT release
+            for (pkg, dep) in (("HeldA", "HeldB"), ("HeldB", "HeldA"))
+                Dynamodb.put_item(PEF.ddb_item(Dict(
+                        "run_id" => cyc_run, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, pkg),
+                        "config" => PEF.SEAL_CONFIG_NAME, "package" => pkg, "kind" => "seal",
+                        "status" => "pending", "attempts" => 0,
+                        "deps" => [dep, "CycLive"], "dependents" => [dep],
+                        "remaining" => 2)), "pkgeval-jobs"; aws_config=aws)
+            end
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                    "run_id" => cyc_run, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, "CycLive"),
+                    "config" => PEF.SEAL_CONFIG_NAME, "package" => "CycLive", "kind" => "seal",
+                    "status" => "running", "attempts" => 1,
+                    "deps" => Any[], "dependents" => ["HeldA", "HeldB"], "remaining" => 0)),
+                "pkgeval-jobs"; aws_config=aws)
+            @test sort(PEF.reconcile_seal_run(sctx, cyc_run)) == ["CycA", "CycB"]
+            for pkg in ("CycA", "CycB")
+                item = PEF.get_seal_item(sctx, PEF.JobRef(cyc_run, PEF.SEAL_CONFIG_NAME, pkg))
+                @test item["remaining"] == 0 && item["status"] == "pending"
+            end
+            @test PEF.get_seal_item(sctx, PEF.JobRef(cyc_run, PEF.SEAL_CONFIG_NAME, "HeldA"))["remaining"] == 2
+            for _ in 1:3   # drain the two released messages
+                c2 = PEF.claim_job(sctx; wait=1)
+                c2 === nothing && break
+                if c2 isa PEF.ClaimedJob && c2.job.run_id == cyc_run
+                    PEF.record_result(sctx, c2, PEF.JobResult(; status="sealed", duration=0.1))
+                else
+                    PEF.release_job(sctx, c2; delay=0)
+                end
+            end
+
             # learned edges round-trip
             PEF.record_learned_edges(sctx, "JSON", ["Crayons", "TestExtras"])
             @test PEF.learned_edges(sctx)["JSON"] == ["Crayons", "TestExtras"]
