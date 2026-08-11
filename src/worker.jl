@@ -91,6 +91,19 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     work = Channel{Any}(ninstances)
     free_cpus = Channel{Int}(ninstances)
     foreach(c -> put!(free_cpus, c), 0:ninstances-1)
+    # Seal overcommit: a seal/derive job spends a large fraction of its wall
+    # clock in phases that burn no CPU — Pkg resolution, registry work, S3
+    # fetches and publishes — measured at ~40% on a disk-unconstrained worker,
+    # which caps utilization near 60% at one job per core. Spill tokens let
+    # extra seal-queue jobs overlap those latency phases. Test jobs never run
+    # on spill (their durations feed estimates and time limits, so they keep
+    # exclusive cores); CPU pinning collides nominally, exactly like the
+    # donor path below.
+    nspill = sealing_enabled(ctx.cfg) && pkgeval_supports_seal() ?
+             something(tryparse(Int, get(ENV, "PKGEVAL_SEAL_OVERCOMMIT", "")),
+                       cld(ninstances, 2)) : 0
+    spill_cpus = Channel{Int}(max(nspill, 1))
+    foreach(c -> put!(spill_cpus, c % max(ninstances, 1)), 0:nspill-1)
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
     fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
 
@@ -122,9 +135,9 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         end)
     end
 
-    slots = map(1:ninstances) do i
+    slots = map(1:(ninstances + nspill)) do i
         errormonitor(@async begin
-            for (claimed, cpus) in work
+            for (claimed, cpus, spill) in work
                 try
                     if claimed isa ClaimedExpand
                         process_expand(ctx, claimed)
@@ -137,7 +150,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                         delete!(active_claims, claimed.receipt_handle)
                     end
                     Threads.atomic_sub!(busy, 1)
-                    foreach(c -> put!(free_cpus, c), cpus)
+                    foreach(c -> put!(spill ? spill_cpus : free_cpus, c), cpus)
                 end
             end
         end)
@@ -186,15 +199,51 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                 lock(claims_lock) do
                     active_claims[claimed.receipt_handle] = claimed
                 end
-                put!(work, (claimed, cpus))   # cpus return when the slot finishes
+                put!(work, (claimed, cpus, false))   # cpus return when the slot finishes
             end
         finally
             close(work)
         end
     end)
 
+    # The spill companion: polls only the seal queue, with its own token pool,
+    # so overcommit can never bleed into test/expand claims. Dies with `work`.
+    spill_receiver = errormonitor(@async begin
+        while nspill > 0 && !draining[] && isopen(work)
+            cpu = take!(spill_cpus)
+            claimed = try
+                draining[] ? nothing : claim_seal_job(ctx)
+            catch err
+                @warn "spill poll failed; backing off" err
+                sleep(30)
+                nothing
+            end
+            if claimed === nothing
+                put!(spill_cpus, cpu)
+                sleep(3)   # claim_seal_job long-polls 1s; don't hammer an empty queue
+                continue
+            end
+            Threads.atomic_add!(busy, 1)
+            lock(claims_lock) do
+                active_claims[claimed.receipt_handle] = claimed
+            end
+            try
+                put!(work, (claimed, [cpu], true))
+            catch err
+                # the main receiver closed `work` while we were claiming:
+                # hand the message straight back and stop
+                err isa InvalidStateException || rethrow()
+                Threads.atomic_sub!(busy, 1)
+                lock(() -> delete!(active_claims, claimed.receipt_handle), claims_lock)
+                release_job(ctx, claimed; delay=0)
+                break
+            end
+        end
+    end)
+
     try
         wait(receiver)
+        wait(spill_receiver)
         wait.(slots)
         @info "queue drained; exiting"
     catch err
@@ -203,6 +252,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
             @info "interrupted; draining running jobs (Ctrl-C again to abort)"
             draining[] = true
             wait(receiver)
+            wait(spill_receiver)
             wait.(slots)
         else
             rethrow()
