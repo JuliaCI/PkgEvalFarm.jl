@@ -129,6 +129,7 @@ resource "aws_iam_role_policy" "debug" {
         ]
         Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
           aws_sqs_queue.jobs_seal.arn,
+          aws_sqs_queue.jobs_deriv.arn,
         aws_sqs_queue.jobs_dlq.arn]
       },
       {
@@ -143,6 +144,7 @@ resource "aws_iam_role_policy" "debug" {
         # without driving eight failed receives through the live queues
         Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
           aws_sqs_queue.jobs_seal.arn,
+          aws_sqs_queue.jobs_deriv.arn,
         aws_sqs_queue.jobs_dlq.arn]
       },
       {

@@ -67,7 +67,15 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # process, so oversubscription is nominal.
     donors = Threads.Atomic{Int}(0)
     SEAL_DONOR[] = function ()
-        donors[] >= ninstances && return
+        # The budget must count PARKED donors against something: a donated job
+        # that itself holds keeps its donor slot for the whole hold, and with
+        # a flat ninstances cap a few waves of chained holds consume the
+        # entire budget with resident-but-waiting sandboxes — donation then
+        # silently stops replacing capacity (seen live: fleet at 30% CPU,
+        # donor pool full, everyone parked). Each active hold licenses one
+        # extra donor, bounded at 2× for memory sanity: every chain link is a
+        # fully resident sandbox.
+        donors[] >= ninstances + min(ACTIVE_HOLDS[], ninstances) && return
         draining[] && return
         Threads.atomic_add!(donors, 1)
         errormonitor(@async try

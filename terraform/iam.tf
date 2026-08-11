@@ -124,7 +124,8 @@ locals {
           "sqs:SendMessage",
         ]
         Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
-        aws_sqs_queue.jobs_seal.arn]
+        aws_sqs_queue.jobs_seal.arn,
+        aws_sqs_queue.jobs_deriv.arn]
       },
       {
         Sid    = "RunState"

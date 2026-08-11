@@ -1418,8 +1418,10 @@ try
 
     @testset "sealed compilecache" begin
         seal_q = SQS.create_queue("pkgeval-jobs-seal"; aws_config=aws)["QueueUrl"]
+        deriv_q = SQS.create_queue("pkgeval-jobs-deriv"; aws_config=aws)["QueueUrl"]
         scfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
-                          seal_queue_url=seal_q, runs_table="pkgeval-runs",
+                          seal_queue_url=seal_q, deriv_queue_url=deriv_q,
+                          runs_table="pkgeval-runs",
                           jobs_table="pkgeval-jobs", bucket="pkgeval-results")
         sctx = FarmCtx(scfg, aws)
 
@@ -1665,8 +1667,10 @@ try
         # same physical queue as the sealing testset (create_queue is idempotent):
         # want ingestion enqueues real derivation messages
         seal_q = SQS.create_queue("pkgeval-jobs-seal"; aws_config=aws)["QueueUrl"]
+        deriv_q = SQS.create_queue("pkgeval-jobs-deriv"; aws_config=aws)["QueueUrl"]
         scfg = FarmConfig(; region="us-east-1", queue_url, slow_queue_url,
-                          seal_queue_url=seal_q, runs_table="pkgeval-runs",
+                          seal_queue_url=seal_q, deriv_queue_url=deriv_q,
+                          runs_table="pkgeval-runs",
                           jobs_table="pkgeval-jobs", bucket="pkgeval-results")
         sctx = FarmCtx(scfg, aws)
         cache_dir = mktempdir()

@@ -10,7 +10,7 @@ tpl=$(realpath "${1:-ec2_worker_userdata.sh.tpl}")
 u80=$(printf 'u%.0s' {1..80}) # longer than any real queue URL/ARN/name
 expr="length(base64gzip(templatefile(\"$tpl\", {
   region = \"us-east-2\", queue_url = \"$u80\", slow_queue_url = \"$u80\",
-  seal_queue_url = \"$u80\", asg_name = \"$u80\", build_request_function = \"$u80\",
+  seal_queue_url = \"$u80\", deriv_queue_url = \"$u80\", asg_name = \"$u80\", build_request_function = \"$u80\",
   runs_table = \"$u80\", jobs_table = \"$u80\", bucket = \"$u80\",
   farm_repo = \"$u80\", farm_ref = \"$u80\", julia_channel = \"$u80\",
   sysimage_bucket = \"$u80\" })))"

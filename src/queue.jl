@@ -413,17 +413,26 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
     # answer is trustworthy.
     slow = slow_queue(ctx.cfg)
     queues = Tuple{String,Int}[]
-    sealing_enabled(ctx.cfg) && pkgeval_supports_seal() &&
+    if sealing_enabled(ctx.cfg) && pkgeval_supports_seal()
+        # derivations first: nohold leaves, always runnable — never let them
+        # sit behind the seal jobs that hold on them (head-of-line inversion)
+        dq = deriv_queue(ctx.cfg)
+        dq == ctx.cfg.seal_queue_url || push!(queues, (dq, 1))
         push!(queues, (ctx.cfg.seal_queue_url, 1))
+    end
     slow == ctx.cfg.queue_url || push!(queues, (slow, 1))
     push!(queues, (ctx.cfg.queue_url, wait))
     return claim_from_queues(ctx, queues)
 end
 
-"Claim from the seal queue only — the hold-and-fill path of a gated test job."
+"Claim seal-pipeline work only (derivations first) — the hold-and-fill path
+of a gated test job, the donor slots, and the spill receiver."
 function claim_seal_job(ctx::FarmCtx; wait::Int=1)
     sealing_enabled(ctx.cfg) || return nothing
-    return claim_from_queues(ctx, [(ctx.cfg.seal_queue_url, wait)])
+    dq = deriv_queue(ctx.cfg)
+    queues = dq == ctx.cfg.seal_queue_url ? [(dq, wait)] :
+             [(dq, 1), (ctx.cfg.seal_queue_url, wait)]
+    return claim_from_queues(ctx, queues)
 end
 
 function claim_from_queues(ctx::FarmCtx, queues)

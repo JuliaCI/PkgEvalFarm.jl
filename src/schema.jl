@@ -22,6 +22,13 @@ Base.@kwdef struct FarmConfig
     # queue for compilecache seal jobs (docs/sealing.md); workers poll it before
     # anything else. Empty = sealing disabled: the farm behaves exactly as before
     seal_queue_url::String = ""
+    # queue for derivation jobs, claimed with priority above even seal jobs:
+    # derivations fetch with nohold probes, so they are the always-runnable
+    # leaves of the sealing dataflow — sharing the seal queue inverted the
+    # dependency order (seal jobs held on derivations buried behind them) and
+    # head-of-line blocking idled the fleet. Empty = derivations ride the seal
+    # queue, exactly the pre-split behavior.
+    deriv_queue_url::String = ""
     # name of the build-request Lambda, invoked via the plain Invoke API;
     # empty when the deployment has no build-request broker
     build_request_function::String = ""
@@ -31,11 +38,16 @@ end
 slow_queue(cfg::FarmConfig) =
     isempty(cfg.slow_queue_url) ? cfg.queue_url : cfg.slow_queue_url
 
+"The derivations queue, falling back to the seal queue when none is configured."
+deriv_queue(cfg::FarmConfig) =
+    isempty(cfg.deriv_queue_url) ? cfg.seal_queue_url : cfg.deriv_queue_url
+
 FarmConfig(d::AbstractDict) = FarmConfig(; region=d["region"], queue_url=d["queue_url"],
                                          runs_table=d["runs_table"], jobs_table=d["jobs_table"],
                                          bucket=d["bucket"],
                                          slow_queue_url=get(d, "slow_queue_url", ""),
                                          seal_queue_url=get(d, "seal_queue_url", ""),
+                                         deriv_queue_url=get(d, "deriv_queue_url", ""),
                                          build_request_function=get(d, "build_request_function", ""))
 
 function farm_config_from_env(env=ENV)
@@ -44,6 +56,7 @@ function farm_config_from_env(env=ENV)
                bucket=env["PKGEVAL_BUCKET"],
                slow_queue_url=get(env, "PKGEVAL_SLOW_QUEUE_URL", ""),
                seal_queue_url=get(env, "PKGEVAL_SEAL_QUEUE_URL", ""),
+               deriv_queue_url=get(env, "PKGEVAL_DERIV_QUEUE_URL", ""),
                build_request_function=get(env, "PKGEVAL_BUILD_REQUEST_FUNCTION", ""))
 end
 
@@ -52,6 +65,7 @@ Base.Dict(cfg::FarmConfig) =
          "jobs_table" => cfg.jobs_table, "bucket" => cfg.bucket,
          "slow_queue_url" => cfg.slow_queue_url,
          "seal_queue_url" => cfg.seal_queue_url,
+         "deriv_queue_url" => cfg.deriv_queue_url,
          "build_request_function" => cfg.build_request_function)
 
 "A FarmConfig plus the AWS credentials/config used to talk to it."

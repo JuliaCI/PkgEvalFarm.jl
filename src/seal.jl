@@ -476,10 +476,36 @@ function reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString)
         get(job, "status", "") == "pending" || continue
         pkg = String(job["package"])
         if get(job, "remaining", 0) <= 0
-            # ready but apparently unclaimed: its message may have been lost
-            # (expansion died pre-send, retention expired) — re-send, duplicates
-            # are dropped at claim time
-            push!(healed, pkg)
+            # Ready but apparently unclaimed: its message may have been lost
+            # (expansion died pre-send, retention expired) — or it is merely
+            # deep in a congested queue, which is why re-sends back off
+            # exponentially on a CAS-elected enqueued_at lease instead of
+            # firing every pass (unconditional per-pass re-sends amplified the
+            # very backlog that delayed the claims, seen live at 2× scale-up).
+            # The stamp only exists once a reconcile pass touched the job:
+            # normal expansion/decrement sends stay stamp-free and cheap.
+            rearms = Int(get(job, "rearms", 0))
+            seen = String(get(job, "enqueued_at", ""))
+            cutoff = isodate(Dates.now(Dates.UTC) - REARM_PENDING_AFTER * 2^min(rearms, 5))
+            (isempty(seen) || seen < cutoff) || continue
+            won = try
+                Dynamodb.update_item(
+                    ddb_item(Dict("run_id" => seal_run_id, "job_key" => job_key(SEAL_CONFIG_NAME, pkg))),
+                    ctx.cfg.jobs_table,
+                    Dict("ConditionExpression" => "#s = :pending AND " *
+                             (isempty(seen) ? "attribute_not_exists(enqueued_at)" : "enqueued_at = :seen"),
+                         "UpdateExpression" => "SET enqueued_at = :now ADD rearms :one",
+                         "ExpressionAttributeNames" => Dict("#s" => "status"),
+                         "ExpressionAttributeValues" => ddb_item(Dict(
+                             ":pending" => "pending", ":now" => isodate(), ":one" => 1,
+                             (isempty(seen) ? () : ((":seen" => seen),))...)));
+                    aws_config=ctx.aws)
+                true
+            catch err
+                is_conditional_failure(err) || rethrow()
+                false
+            end
+            won && push!(healed, pkg)
             continue
         end
         deps = String.(get(job, "deps", String[]))

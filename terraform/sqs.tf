@@ -31,6 +31,24 @@ resource "aws_sqs_queue" "jobs" {
 # before everything else — sealing must run ahead of the test jobs it warms,
 # and priority between queues is the only ordering SQS honors. Messages are
 # enqueued as their dependency counters hit zero (topological waves).
+# Derivations are the leaves of the sealing dataflow: they fetch with nohold
+# probes, so they never wait on anything — always-runnable, pure CPU work.
+# They get their own queue, claimed with priority above every other, because
+# sharing the seal queue inverted the dependency order: seal jobs held on
+# derivations buried BEHIND them, and donated/gated slots could only claim
+# more of the same waiting work (head-of-line blocking; fleet at 30% CPU
+# with 3.5K messages queued, 2026-08-11).
+resource "aws_sqs_queue" "jobs_deriv" {
+  name                       = "${var.name_prefix}-jobs-deriv"
+  visibility_timeout_seconds = 1800
+  message_retention_seconds  = 4 * 24 * 60 * 60 # 4 days
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.jobs_dlq.arn
+    maxReceiveCount     = 6
+  })
+}
+
 resource "aws_sqs_queue" "jobs_seal" {
   name                       = "${var.name_prefix}-jobs-seal"
   visibility_timeout_seconds = 1800
