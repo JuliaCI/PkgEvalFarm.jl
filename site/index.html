@@ -132,6 +132,13 @@
   .brand .dots i:nth-child(2) { background: #389826; }
   .brand .dots i:nth-child(3) { background: #9558b2; }
   .runid { font-size: 15px; color: var(--ink-2); }
+  .qdebug summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  .qdebug[open] summary { margin-bottom: 8px; }
+  .qdepths { border-collapse: collapse; font-size: 13px; }
+  .qdepths th { font-weight: 600; }
+  .qdepths td, .qdepths th { padding: 2px 18px 2px 0; text-align: right; }
+  .qdepths td:first-child, .qdepths th:first-child { text-align: left; }
+  .qnote { color: var(--ink-2); font-size: 12px; margin-top: 6px; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
@@ -486,6 +493,11 @@
         directly as <span class="mono" style="white-space: nowrap">?run=&lt;run id&gt;</span>.</p>
       <div class="runidx-rows" id="runidx-rows"></div>
     </section>
+    <!-- zero API calls unless a human opens it -->
+    <details class="block qdebug" id="qdebug">
+      <summary>Queue depths (debug)</summary>
+      <div class="mono" id="qdebug-body">…</div>
+    </details>
   </div>
   <div id="app" hidden>
     <div class="meta-line" id="metaline"></div>
@@ -562,6 +574,14 @@ const linkify = (s) =>   // escape first, then turn bare URLs into links
 
 // declared above boot(), which uses them synchronously on load
 const AWS_REGION = "us-east-2";
+const SQS_BASE = "https://sqs.us-east-2.amazonaws.com/873569884612/";
+const QUEUES = [
+  ["tests", SQS_BASE + "pkgeval-jobs"],
+  ["slow tests", SQS_BASE + "pkgeval-jobs-slow"],
+  ["seal", SQS_BASE + "pkgeval-jobs-seal"],
+  ["derivations", SQS_BASE + "pkgeval-jobs-deriv"],
+  ["dead letter", SQS_BASE + "pkgeval-jobs-dlq"],
+];
 const RUNS_TABLE = "pkgeval-runs";
 const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
 
@@ -675,33 +695,35 @@ function ddbClient(params) {
     return creds;
   };
 
-  const call = async (action, body) => {
+  const signedCall = async (service, url, target, action, body) => {
     const { key, secret, token } = await getCreds();
     const payload = JSON.stringify(body);
     const now = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
     const date = now.slice(0, 8);
     const headers = {
       "content-type": "application/x-amz-json-1.0",
-      "host": new URL(endpoint).host,
+      "host": new URL(url).host,
       "x-amz-date": now,
-      "x-amz-target": "DynamoDB_20120810." + action,
+      "x-amz-target": target + "." + action,
     };
     if (token) headers["x-amz-security-token"] = token;
     const names = Object.keys(headers).sort();
     const canonical = ["POST", "/", "", ...names.map((h) => h + ":" + headers[h]), "",
                        names.join(";"), await sha256(payload)].join("\n");
-    const scope = `${date}/${AWS_REGION}/dynamodb/aws4_request`;
+    const scope = `${date}/${AWS_REGION}/${service}/aws4_request`;
     const toSign = ["AWS4-HMAC-SHA256", now, scope, await sha256(canonical)].join("\n");
     let k = enc.encode("AWS4" + secret);
-    for (const part of [date, AWS_REGION, "dynamodb", "aws4_request"])
+    for (const part of [date, AWS_REGION, service, "aws4_request"])
       k = await hmac(k, part);
     delete headers.host;   // fetch sets it; it lives only in the signature
     headers.authorization = `AWS4-HMAC-SHA256 Credential=${key}/${scope}, ` +
       `SignedHeaders=${names.join(";")}, Signature=${hex(await hmac(k, toSign))}`;
-    const resp = await fetch(endpoint, { method: "POST", headers, body: payload });
+    const resp = await fetch(url, { method: "POST", headers, body: payload });
     if (!resp.ok) throw new Error(action + ": HTTP " + resp.status);
     return resp.json();
   };
+  const call = (action, body) =>
+    signedCall("dynamodb", endpoint, "DynamoDB_20120810", action, body);
 
   const unwrap = (av) => {
     const t = Object.keys(av)[0], v = av[t];
@@ -730,6 +752,20 @@ function ddbClient(params) {
         { TableName: RUNS_TABLE, Key: { run_id: { S: id } } });
       return r.Item ? unwrapItem(r.Item) : null;
     },
+    async queueDepths(queues) {
+      const out = [];
+      for (const [name, url] of queues) {
+        const r = await signedCall("sqs", `https://sqs.${AWS_REGION}.amazonaws.com/`,
+          "AmazonSQS", "GetQueueAttributes",
+          { QueueUrl: url,
+            AttributeNames: ["ApproximateNumberOfMessages",
+                             "ApproximateNumberOfMessagesNotVisible"] });
+        const a = r.Attributes || {};
+        out.push({ name, visible: a.ApproximateNumberOfMessages ?? "?",
+                   inflight: a.ApproximateNumberOfMessagesNotVisible ?? "?" });
+      }
+      return out;
+    },
   };
 }
 
@@ -745,6 +781,31 @@ function ddbClient(params) {
 async function dashboard(params) {
   const esc = escHtml;
   const ddb = ddbClient(params);
+
+  // Collapsed queue-depths panel: makes no API calls unless a human opens
+  // it, refreshes every 30 s while open, stops the moment it closes.
+  const qd = document.getElementById("qdebug");
+  if (qd && !qd.dataset.wired) {
+    qd.dataset.wired = "1";
+    const qbody = document.getElementById("qdebug-body");
+    let qtimer = null;
+    const qrefresh = async () => {
+      try {
+        const rows = await ddb.queueDepths(QUEUES);
+        qbody.innerHTML = "<table class=\"qdepths\"><tr><th>queue</th>" +
+          "<th>visible</th><th>in flight</th></tr>" +
+          rows.map((r) => "<tr><td>" + esc(r.name) + "</td><td>" + esc(r.visible) +
+                          "</td><td>" + esc(r.inflight) + "</td></tr>").join("") +
+          "</table><div class=\"qnote\">approximate; refreshes every 30 s while open</div>";
+      } catch (e) {
+        qbody.textContent = "queue depths unavailable: " + e;
+      }
+    };
+    qd.addEventListener("toggle", () => {
+      if (qd.open) { qbody.textContent = "…"; qrefresh(); qtimer = setInterval(qrefresh, 30_000); }
+      else if (qtimer) { clearInterval(qtimer); qtimer = null; }
+    });
+  }
 
   const when = (iso) => iso
     ? iso.replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC") : "";

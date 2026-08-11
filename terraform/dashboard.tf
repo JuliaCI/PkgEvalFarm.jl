@@ -53,6 +53,19 @@ resource "aws_iam_role_policy" "dashboard_reader" {
         Effect   = "Allow"
         Action   = ["dynamodb:Scan", "dynamodb:GetItem"]
         Resource = aws_dynamodb_table.runs.arn
+      },
+      {
+        # queue depths for the dashboard's collapsed debug panel: counts
+        # only, and the page fetches them exclusively while a human has the
+        # panel open
+        Sid    = "QueueDepths"
+        Effect = "Allow"
+        Action = "sqs:GetQueueAttributes"
+        Resource = [
+          aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+          aws_sqs_queue.jobs_seal.arn, aws_sqs_queue.jobs_deriv.arn,
+          aws_sqs_queue.jobs_dlq.arn,
+        ]
       }
     ]
   })
