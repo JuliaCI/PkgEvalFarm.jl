@@ -43,6 +43,8 @@
     --page: #faf9fb;
     --surface: #ffffff;
     --surface-2: #f4f2f7;
+    --qviz-1: #2a78d6;
+    --qviz-2: #eb6834;
     --ink: #1c1a21;
     --ink-2: #5b5766;
     --ink-3: #8d8896;
@@ -75,6 +77,8 @@
       --page: #131118;
       --surface: #1c1922;
       --surface-2: #242029;
+      --qviz-1: #3987e5;
+      --qviz-2: #d95926;
       --ink: #f0eef4;
       --ink-2: #b5b0c0;
       --ink-3: #7f7a8a;
@@ -139,6 +143,19 @@
   .qdepths td, .qdepths th { padding: 2px 18px 2px 0; text-align: right; }
   .qdepths td:first-child, .qdepths th:first-child { text-align: left; }
   .qnote { color: var(--ink-2); font-size: 12px; margin-top: 6px; }
+  .qviz-legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2);
+                 margin: 10px 0 2px; }
+  .qviz-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+                   margin-right: 5px; vertical-align: -1px; }
+  .qrow { margin-top: 8px; }
+  .qrow-head { display: flex; gap: 10px; font-size: 12px; align-items: baseline; }
+  .qrow-head .qname { color: var(--ink); min-width: 90px; }
+  .qrow-head .qval { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .qrow svg { display: block; width: 100%; height: 44px; margin-top: 2px; }
+  .qtip { position: fixed; pointer-events: none; background: var(--surface);
+          border: 1px solid var(--muted-wash); border-radius: 6px; padding: 4px 8px;
+          font-size: 12px; color: var(--ink); z-index: 40; display: none;
+          font-variant-numeric: tabular-nums; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
@@ -789,20 +806,90 @@ async function dashboard(params) {
     qd.dataset.wired = "1";
     const qbody = document.getElementById("qdebug-body");
     let qtimer = null;
+    // per-queue time series, kept for the page visit; samples accumulate
+    // only while the panel is open (the poll stops when it closes)
+    const qseries = new Map();   // name -> [{t, vis, inf}], capped
+    const QCAP = 240;
+    let qtip = null;
+    const fmtT = (t) => new Date(t).toISOString().slice(11, 19) + " UTC";
+    const spark = (name) => {
+      const pts = qseries.get(name) || [];
+      const w = 600, h = 44, pad = 2;
+      if (pts.length < 2) return `<svg viewBox="0 0 ${w} ${h}" data-q="${esc(name)}"></svg>`;
+      const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+      const ymax = Math.max(1, ...pts.map((p) => Math.max(p.vis, p.inf)));
+      const x = (t) => t1 === t0 ? pad : pad + (w - 2 * pad) * (t - t0) / (t1 - t0);
+      const y = (v) => h - pad - (h - 2 * pad) * (v / ymax);
+      // split the path where sampling paused (panel closed): a line drawn
+      // across the gap would invent data
+      const path = (key) => {
+        let d = "", pen = false;
+        for (let i = 0; i < pts.length; i++) {
+          const gap = i > 0 && pts[i].t - pts[i - 1].t > 45_000;
+          d += (!pen || gap ? "M" : "L") + x(pts[i].t).toFixed(1) + " " +
+               y(pts[i][key]).toFixed(1) + " ";
+          pen = true;
+        }
+        return d;
+      };
+      return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" data-q="${esc(name)}">
+        <line x1="0" y1="${h - pad}" x2="${w}" y2="${h - pad}" stroke="var(--muted-wash)" stroke-width="1"/>
+        <path d="${path("vis")}" fill="none" stroke="var(--qviz-1)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+        <path d="${path("inf")}" fill="none" stroke="var(--qviz-2)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+      </svg>`;
+    };
+    const qrender = (rows) => {
+      const legend = `<div class="qviz-legend">` +
+        `<span><i style="background:var(--qviz-1)"></i>visible</span>` +
+        `<span><i style="background:var(--qviz-2)"></i>in flight</span>` +
+        `<span>own scale per row · sampled every 15 s while open</span></div>`;
+      qbody.innerHTML = legend + rows.map((r) => {
+        const pts = qseries.get(r.name) || [];
+        const ymax = pts.length ? Math.max(...pts.map((p) => Math.max(p.vis, p.inf))) : 0;
+        return `<div class="qrow"><div class="qrow-head">` +
+          `<span class="qname">${esc(r.name)}</span>` +
+          `<span class="qval">${esc(r.visible)} visible · ${esc(r.inflight)} in flight` +
+          (ymax ? ` · peak ${ymax}` : "") + `</span></div>` + spark(r.name) + `</div>`;
+      }).join("");
+      if (!qtip) {
+        qtip = document.createElement("div");
+        qtip.className = "qtip";
+        document.body.appendChild(qtip);
+      }
+      for (const svg of qbody.querySelectorAll("svg[data-q]")) {
+        const pts = qseries.get(svg.dataset.q) || [];
+        svg.addEventListener("pointermove", (ev) => {
+          if (pts.length < 2) return;
+          const r = svg.getBoundingClientRect();
+          const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+          const t = t0 + (t1 - t0) * (ev.clientX - r.left) / r.width;
+          let best = pts[0];
+          for (const p of pts) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+          qtip.style.display = "block";
+          qtip.style.left = Math.min(ev.clientX + 12, innerWidth - 180) + "px";
+          qtip.style.top = (ev.clientY - 34) + "px";
+          qtip.textContent = `${fmtT(best.t)} · ${best.vis} visible · ${best.inf} in flight`;
+        });
+        svg.addEventListener("pointerleave", () => { qtip.style.display = "none"; });
+      }
+    };
     const qrefresh = async () => {
       try {
         const rows = await ddb.queueDepths(QUEUES);
-        qbody.innerHTML = "<table class=\"qdepths\"><tr><th>queue</th>" +
-          "<th>visible</th><th>in flight</th></tr>" +
-          rows.map((r) => "<tr><td>" + esc(r.name) + "</td><td>" + esc(r.visible) +
-                          "</td><td>" + esc(r.inflight) + "</td></tr>").join("") +
-          "</table><div class=\"qnote\">approximate; refreshes every 30 s while open</div>";
+        const now = Date.now();
+        for (const r of rows) {
+          const arr = qseries.get(r.name) || [];
+          arr.push({ t: now, vis: Number(r.visible) || 0, inf: Number(r.inflight) || 0 });
+          while (arr.length > QCAP) arr.shift();
+          qseries.set(r.name, arr);
+        }
+        qrender(rows);
       } catch (e) {
         qbody.textContent = "queue depths unavailable: " + e;
       }
     };
     qd.addEventListener("toggle", () => {
-      if (qd.open) { qbody.textContent = "…"; qrefresh(); qtimer = setInterval(qrefresh, 30_000); }
+      if (qd.open) { qbody.textContent = "…"; qrefresh(); qtimer = setInterval(qrefresh, 15_000); }
       else if (qtimer) { clearInterval(qtimer); qtimer = null; }
     });
   }
