@@ -154,6 +154,36 @@ try
         @test PEF.claim_job(ctx; wait=0) === nothing  # and not redelivered
         run = PEF.get_run(ctx, RUN_ID)
         @test run["completed_jobs"] == 6  # counter untouched
+
+        # a duplicate of a job still LIVE on another worker (fresh heartbeat
+        # stamp) bounces off instead of re-executing a long evaluation...
+        Dynamodb.put_item(PEF.ddb_item(Dict(
+                "run_id" => RUN_ID, "job_key" => "primary#LongJob",
+                "config" => "primary", "package" => "LongJob",
+                "status" => "running", "attempts" => 1,
+                "started_at" => PEF.isodate(), "heartbeat_at" => PEF.isodate())),
+            "pkgeval-jobs"; aws_config=aws)
+        PEF.enqueue_jobs(ctx, [PEF.JobRef(RUN_ID, "primary", "LongJob")])
+        @test PEF.claim_job(ctx; wait=1) === nothing   # live: duplicate deleted
+        # ...but once the beats stop (worker death), redelivery re-claims
+        Dynamodb.update_item(
+            PEF.ddb_item(Dict("run_id" => RUN_ID, "job_key" => "primary#LongJob")),
+            "pkgeval-jobs",
+            Dict("UpdateExpression" => "SET heartbeat_at = :old",
+                 "ExpressionAttributeValues" => PEF.ddb_item(Dict(
+                     ":old" => PEF.isodate(Dates.now(Dates.UTC) - Dates.Minute(20)))));
+            aws_config=aws)
+        PEF.enqueue_jobs(ctx, [PEF.JobRef(RUN_ID, "primary", "LongJob")])
+        c = PEF.claim_job(ctx; wait=1)
+        @test c isa PEF.ClaimedJob && c.job.package == "LongJob"
+        # and a released job is immediately re-claimable: release clears the
+        # stamp precisely so drain fast-release redelivery keeps working
+        PEF.release_job(ctx, c; delay=0)
+        c = PEF.claim_job(ctx; wait=1)
+        @test c isa PEF.ClaimedJob && c.job.package == "LongJob"
+        SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
+        Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => RUN_ID, "job_key" => "primary#LongJob")),
+                             "pkgeval-jobs"; aws_config=aws)
     end
 
     @testset "logs and report" begin
@@ -1304,11 +1334,21 @@ try
         job3 = only(PEF.run_jobs(ctx, run3))
         @test job3["status"] == "running"              # untouched, not errored
         @test PEF.get_run(ctx, run3)["status"] == "active"
+        # in the real lifecycle the worker's last build-wait re-ask RELEASED
+        # the claim (clearing the liveness stamp) before the message died to
+        # the DLQ — a message only dead-letters with no live holder. Without
+        # the release, the recycled message must bounce off the fresh stamp.
+        @test PEF.claim_job(ctx; wait=1) === nothing   # live claim: dup dropped
+        PEF.release_job(ctx, c3; delay=0)
+        withenv("PKGEVAL_BUILDS_TABLE" => "pkgeval-builds") do
+            PEF.FarmBot.handle_event(
+                sqs_event(["{\"run_id\":\"$run3\",\"config\":\"primary\",\"package\":\"Waiting\"}"]),
+                lctx2, gh_stub)
+        end
         recycled = PEF.claim_job(ctx; wait=1)          # the re-enqueued message
         @test recycled isa PEF.ClaimedJob
         @test recycled.job.package == "Waiting"
         PEF.record_result(ctx, recycled, PEF.JobResult(; status="test", duration=1.0))
-        PEF.release_job(ctx, c3; delay=0)
         for _ in 1:4                                    # swallow the stale duplicate
             PEF.claim_job(ctx; wait=1) === nothing && break
         end
@@ -2029,7 +2069,7 @@ try
                     PEF.ddb_item(Dict("run_id" => "deriv-otherns",
                                       "job_key" => PEF.job_key("deriv", key_z))),
                     "pkgeval-jobs",
-                    Dict("UpdateExpression" => "SET started_at = :old REMOVE enqueued_at",
+                    Dict("UpdateExpression" => "SET started_at = :old REMOVE enqueued_at, heartbeat_at",
                          "ExpressionAttributeValues" => PEF.ddb_item(Dict(
                              ":old" => PEF.isodate(Dates.now(Dates.UTC) - Dates.Hour(5)))));
                     aws_config=aws)

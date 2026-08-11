@@ -447,21 +447,33 @@ function claim_from_queues(ctx::FarmCtx, queues)
     job = JobRef(body)
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
 
-    # flip pending/running -> running; fails if the job is already done
+    # flip pending -> running. A job already `running` is re-claimable only
+    # when its worker looks dead (heartbeat_at stale beyond three beats, or
+    # cleared by release_job): a *live* long evaluation must not be
+    # re-executed by a stray duplicate message — those bounce off the fresh
+    # stamp and are deleted below, exactly like duplicates of finished jobs.
+    # A genuinely dead worker's redelivery arrives after the ≥30-minute
+    # visibility lapse, by which point the stamp is well past stale.
     try
         Dynamodb.update_item(
             ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
             ctx.cfg.jobs_table,
-            Dict("ConditionExpression" => "attribute_exists(run_id) AND #s IN (:pending, :running)",
-                 "UpdateExpression" => "SET #s = :running, worker = :worker, started_at = :now ADD attempts :one",
+            Dict("ConditionExpression" => "attribute_exists(run_id) AND " *
+                     "(#s = :pending OR (#s = :running AND " *
+                     "(attribute_not_exists(heartbeat_at) OR heartbeat_at < :stale)))",
+                 "UpdateExpression" => "SET #s = :running, worker = :worker, " *
+                                       "started_at = :now, heartbeat_at = :now ADD attempts :one",
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":pending" => "pending", ":running" => "running",
-                     ":worker" => worker_identity(), ":now" => isodate(), ":one" => 1)));
+                     ":worker" => worker_identity(), ":now" => isodate(),
+                     ":stale" => isodate(Dates.now(Dates.UTC) - Dates.Second(3 * HEARTBEAT_INTERVAL)),
+                     ":one" => 1)));
             aws_config=ctx.aws)
     catch err
         if is_conditional_failure(err)
-            # already finished (duplicate delivery), or the run item was deleted
+            # already finished, still live on another worker (duplicate
+            # delivery), or the run item was deleted
             SQS.delete_message(from_queue, receipt; aws_config=ctx.aws)
             return nothing
         end
@@ -472,11 +484,35 @@ end
 
 worker_identity() = string(get(ENV, "USER", "unknown"), "@", gethostname())
 
-"Extend the message visibility while the job is still being evaluated."
-heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
-          extend::Int=VISIBILITY_TIMEOUT) =
+"""
+Extend the message visibility while the job is still being evaluated, and
+stamp the job item's `heartbeat_at`: claims use the stamp to tell a *live*
+running job (a long precompile — stray duplicate messages must bounce off
+it, or they re-execute the whole thing) from an *abandoned* one (worker
+died; beats stopped; the ≥30-minute redelivery finds the stamp stale and
+re-claims). The stamp is best-effort — a missed write only risks one
+duplicate execution, which publication and recording already tolerate.
+"""
+function heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
+                   extend::Int=VISIBILITY_TIMEOUT)
     SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, extend;
                                   aws_config=ctx.aws)
+    claimed isa ClaimedJob || return
+    try
+        Dynamodb.update_item(
+            ddb_item(Dict("run_id" => claimed.job.run_id, "job_key" => job_key(claimed.job))),
+            ctx.cfg.jobs_table,
+            Dict("ConditionExpression" => "#s = :running",
+                 "UpdateExpression" => "SET heartbeat_at = :now",
+                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":running" => "running", ":now" => isodate())));
+            aws_config=ctx.aws)
+    catch err
+        is_conditional_failure(err) || @warn "job heartbeat stamp failed" err
+    end
+    return
+end
 
 """
 Terminally fail a run from the worker side (e.g. its Julia build failed) with
@@ -556,6 +592,24 @@ end
 
 "Give up on a claimed job without recording a result; it will be redelivered."
 function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
+    # clear the liveness stamp FIRST: a released message must be immediately
+    # re-claimable (drain fast-release, transient-error retries), and a fresh
+    # heartbeat_at would make the next claim mistake the job for still-live
+    # and delete the very message being released
+    if claimed isa ClaimedJob
+        try
+            Dynamodb.update_item(
+                ddb_item(Dict("run_id" => claimed.job.run_id, "job_key" => job_key(claimed.job))),
+                ctx.cfg.jobs_table,
+                Dict("ConditionExpression" => "#s = :running",
+                     "UpdateExpression" => "REMOVE heartbeat_at",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(":running" => "running")));
+                aws_config=ctx.aws)
+        catch err
+            is_conditional_failure(err) || @warn "failed to clear liveness stamp on release" err
+        end
+    end
     try
         SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, delay;
                                       aws_config=ctx.aws)
