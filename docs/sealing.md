@@ -195,8 +195,10 @@ requester compiles a private copy — bounded waste, versus the unbounded
 damage of idling until the job is killed. A terminally-failed derivation
 releases every holder as a 404, at which point a local compile is correct
 rather than a compromise. `docs/tla/DerivationLiveness.tla` model-checks
-this: without the re-arm the zombie is a liveness counterexample (the
-gh-5241627143 incident); with it, every hold provably releases.
+this protocol under crash-anywhere semantics (a death between item
+creation and message send, between the healer's CAS and its send, a
+dead-lettered redelivery): every hold provably releases, assuming only
+that time passes and not every attempt crashes.
 
 ### Extensions (v3 preimages)
 

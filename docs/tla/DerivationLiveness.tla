@@ -6,24 +6,19 @@
 (* Ground truth is the DynamoDB job item; SQS messages are hints. The      *)
 (* claim path makes duplicate messages harmless (conditional               *)
 (* pending/running -> running; strays for finished jobs are deleted), so   *)
-(* re-sending a message is always SAFE. This module is about whether it is *)
-(* ever NECESSARY: any party may die between creating the item and sending *)
-(* its message (modeled inside Ingest), and SQS may drop a claimed         *)
-(* message's redelivery to the dead-letter queue (CrashDrop). Loss is      *)
-(* therefore unavoidable; the protocol's liveness must come from healing.  *)
-(*                                                                         *)
-(* With Healing = FALSE (the protocol as first shipped: an existing        *)
-(* pending/running item is "already handled", nobody re-sends), TLC finds  *)
-(* the zombie: a lost message strands the item non-terminal forever and    *)
-(* every holder of that context blocks until its job is killed — exactly   *)
-(* what run gh-5241627143 hit (473 pending derivations with attempts=0     *)
-(* and no message; 2,462 consumer jobs killed at their time limits).       *)
-(*                                                                         *)
-(* With Healing = TRUE (rearm_derivation!: holders and fresh wants CAS the *)
-(* enqueued_at lease and re-send when the item shows no sign of life),     *)
-(* every hold releases, under fairness assumptions that say only: time     *)
-(* passes (leases expire), sends/claims that stay possible eventually      *)
-(* happen, and infinitely many derivation attempts do not all crash.       *)
+(* re-sending a message is always SAFE. Loss, in turn, is unavoidable:     *)
+(* any party may die between creating the item and sending its message     *)
+(* (modeled inside Ingest), a healer may die between its lease CAS and its *)
+(* send (RearmCrash), and SQS may drop a claimed message's redelivery to   *)
+(* the dead-letter queue (CrashDrop). Liveness therefore comes from        *)
+(* healing: whoever waits on the item re-sends its message whenever the    *)
+(* item shows no sign of life — `pending` past its enqueued_at lease, or   *)
+(* `running` past any legitimate worker lifetime — with the lease CAS      *)
+(* electing one healer per window (rearm_derivation!). On top of the       *)
+(* healing, every hold is capped inside PkgEval's inactivity window        *)
+(* (hold_limit): the cap bounds the damage of any modeling gap by          *)
+(* degrading to a local compile, but the property proved here is the       *)
+(* stronger one — every hold releases even without appealing to the cap.   *)
 (*                                                                         *)
 (* Abstractions: one context; one worker slot (extra workers add duplicate *)
 (* work, not new item-state behaviors — publication is create-only in S3); *)
@@ -32,18 +27,17 @@
 (* structural); "done" is any terminal status — sealed publishes the       *)
 (* artifact, unsealable/error do not, and either releases holders (a 404   *)
 (* makes the requester compile locally, which is then correct).            *)
+(* Underivable wants (want_derivable) never enter the hold path at all,    *)
+(* so they need no modeling here.                                          *)
 (*                                                                         *)
 (* Model-check (from this directory):                                      *)
-(*   java -cp tla2tools.jar tlc2.TLC -config Broken.cfg DerivationLiveness *)
-(*     => Temporal properties were violated (the zombie trace)             *)
-(*   java -cp tla2tools.jar tlc2.TLC -config Healed.cfg DerivationLiveness *)
+(*   java -cp tla2tools.jar tlc2.TLC -deadlock DerivationLiveness          *)
 (*     => no violations                                                    *)
 (***************************************************************************)
 EXTENDS Naturals
 
 CONSTANTS Requesters,   \* consumer jobs that may come to want this context
-          MaxMsgs,      \* bound on simultaneously outstanding messages
-          Healing       \* FALSE = shipped protocol, TRUE = with rearm_derivation!
+          MaxMsgs       \* bound on simultaneously outstanding messages
 
 VARIABLES item,       \* the job item: "none" | "pending" | "running" | "done"
           msgs,       \* live (deliverable) SQS messages for this context
@@ -76,8 +70,6 @@ Init ==
 (* unless the ingester dies in between (second disjunct). The requester    *)
 (* holds either way: other requesters of the same context survive even     *)
 (* when the ingesting worker died, and the item is now theirs to wait on.  *)
-(* Note the crash disjunct exists in BOTH protocol variants: the fix does  *)
-(* not (cannot) prevent the loss, it heals it.                             *)
 (***************************************************************************)
 Ingest(r) ==
     /\ pc[r] = "idle"
@@ -104,18 +96,17 @@ LeaseExpire ==
     /\ UNCHANGED <<item, msgs, busy, published, pc>>
 
 (***************************************************************************)
-(* The fix (rearm_derivation!): whoever waits, heals. A holder that       *)
-(* observes a non-terminal item past its lease re-sends the message,       *)
-(* CAS-renewing the lease so one healer is elected per window. The healer  *)
-(* itself may die between its CAS and its send (RearmCrash): that costs    *)
-(* one lease window — the lease expires and the next healer retries —      *)
-(* never liveness. RearmCrash is deliberately unfair (crashes need not     *)
-(* ever stop), while RearmSend gets strong fairness: it is enabled         *)
-(* infinitely often (each time a lease expires), and assuming it fires     *)
-(* eventually is exactly "healers do not ALL die forever".                 *)
+(* rearm_derivation!: whoever waits, heals. A holder (or a fresh identical *)
+(* want) that observes a non-terminal item past its lease re-sends the     *)
+(* message, CAS-renewing the lease so one healer is elected per window.    *)
+(* The healer itself may die between its CAS and its send (RearmCrash):    *)
+(* that costs one lease window — the lease expires and the next healer     *)
+(* retries — never liveness. RearmCrash is deliberately unfair (crashes    *)
+(* need not ever stop), while RearmSend gets strong fairness: it is        *)
+(* enabled infinitely often (each time a lease expires), and assuming it   *)
+(* fires eventually is exactly "healers do not ALL die forever".           *)
 (***************************************************************************)
 RearmEnabled ==
-    /\ Healing
     /\ \E r \in Requesters : pc[r] = "holding"
     /\ item \in {"pending", "running"}
     /\ ~lease
@@ -169,8 +160,8 @@ CrashRedeliver ==
     /\ UNCHANGED <<item, published, lease, pc>>
 
 \* the worker dies AND the message is lost (dead-lettered after
-\* maxReceiveCount, or retention expired): the item stays "running" forever
-\* unless someone re-arms it
+\* maxReceiveCount, or retention expired): the item stays "running" until
+\* someone re-arms it
 CrashDrop ==
     /\ busy
     /\ busy' = FALSE
