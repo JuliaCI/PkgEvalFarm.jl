@@ -1830,6 +1830,80 @@ try
                 # malformed preimages are rejected outright
                 @test ProxyHTTP.post("$base/ensure/v2/otherns"; body="v1\ngarbage",
                                      status_exception=false).status == 400
+
+                # --- crash-tolerant re-arm (the gh-5241627143 zombie class) --
+                # a pending derivation whose message was lost (the ingester
+                # died between item creation and send): a fresh want re-sends
+                # instead of treating "pending" as already handled
+                pre_z = join(["v2", "julia=1+a", "name=JSON", "uuid=$want_uuid",
+                              "version=1.4.0", "tree=$("55"^20)", "flags=1", "prefs=0"], "\n")
+                key_z = bytes2hex(PEF.SHA.sha256(codeunits(pre_z)))
+                Dynamodb.put_item(PEF.ddb_item(Dict(
+                        "run_id" => "deriv-otherns", "job_key" => PEF.job_key("deriv", key_z),
+                        "config" => "deriv", "package" => key_z, "kind" => "deriv",
+                        "name" => "JSON", "uuid" => want_uuid, "version" => "1.4.0",
+                        "preimage" => pre_z, "status" => "pending", "attempts" => 0,
+                        "blocked" => 0, "created_at" => PEF.isodate())),
+                    "pkgeval-jobs"; aws_config=aws)      # no enqueued_at, no message
+                @test PEF.claim_job(sctx; wait=1) === nothing        # truly no message
+                @test PEF.ingest_want(sctx, "otherns", pre_z) == key_z   # re-armed
+                cz = PEF.claim_job(sctx; wait=1)
+                @test cz isa PEF.ClaimedJob && cz.job.package == key_z
+                # a freshly-claimed derivation is alive: the same want must
+                # neither re-send nor disturb it
+                @test PEF.ingest_want(sctx, "otherns", pre_z) === nothing
+                @test PEF.claim_job(sctx; wait=1) === nothing
+
+                # a running derivation whose worker AND message died (spot
+                # churn plus DLQ): started_at past any heartbeat lifetime
+                # makes it re-armable
+                Dynamodb.update_item(
+                    PEF.ddb_item(Dict("run_id" => "deriv-otherns",
+                                      "job_key" => PEF.job_key("deriv", key_z))),
+                    "pkgeval-jobs",
+                    Dict("UpdateExpression" => "SET started_at = :old REMOVE enqueued_at",
+                         "ExpressionAttributeValues" => PEF.ddb_item(Dict(
+                             ":old" => PEF.isodate(Dates.now(Dates.UTC) - Dates.Hour(5)))));
+                    aws_config=aws)
+                @test PEF.ingest_want(sctx, "otherns", pre_z) == key_z
+                cz2 = PEF.claim_job(sctx; wait=1)
+                @test cz2 isa PEF.ClaimedJob && cz2.job.package == key_z
+
+                # holds are capped inside PkgEval's inactivity window, and the
+                # holder heals what it waits on: holding on a zombie times out
+                # (the requester then compiles locally) but leaves the
+                # derivation re-armed with a live message
+                Dynamodb.update_item(
+                    PEF.ddb_item(Dict("run_id" => "deriv-otherns",
+                                      "job_key" => PEF.job_key("deriv", key_z))),
+                    "pkgeval-jobs",
+                    Dict("UpdateExpression" => "SET #s = :pending REMOVE enqueued_at",
+                         "ExpressionAttributeNames" => Dict("#s" => "status"),
+                         "ExpressionAttributeValues" => PEF.ddb_item(Dict(":pending" => "pending")));
+                    aws_config=aws)
+                withenv("PKGEVAL_CACHE_HOLD_LIMIT" => "5") do
+                    t0 = time()
+                    @test PEF.hold_for_derivation(sctx, "otherns", want_uuid, key_z) === nothing
+                    @test 4.0 <= time() - t0 < 30.0
+                end
+                ch = PEF.claim_job(sctx; wait=1)     # the holder re-sent the message
+                @test ch isa PEF.ClaimedJob && ch.job.package == key_z
+                PEF.record_result(sctx, ch, PEF.JobResult(; status="unsealable",
+                                                          reason="precompile",
+                                                          duration=0.1))
+
+                # a deterministic conditional failure must fail fast, not burn
+                # the retry backoff (five delays would take several seconds)
+                t0 = time()
+                @test_throws AWS.AWSException PEF.aws_retry() do
+                    Dynamodb.put_item(PEF.ddb_item(Dict(
+                            "run_id" => "deriv-otherns",
+                            "job_key" => PEF.job_key("deriv", key_z))),
+                        "pkgeval-jobs",
+                        Dict("ConditionExpression" => "attribute_not_exists(run_id)");
+                        aws_config=aws)
+                end
+                @test time() - t0 < 3.0
             finally
                 PEF.stop_seal_proxy!()
             end

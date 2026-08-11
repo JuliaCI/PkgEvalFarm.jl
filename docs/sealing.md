@@ -176,13 +176,27 @@ has a derivation in flight is *held* by the proxy until the artifact lands
 widened for seal/derive goals to accommodate this), and the worker donates
 the held slot's capacity to seal-queue work — typically the very derivation
 being waited on. Wants are posted dep-before-dependent by the loader's
-bottom-up walk, so whole chains resolve within one pass. Holds have deliberately no timeout: releasing early would make the
-requester compile a private copy of what the rest of its job expects to
-share, silently breaking key convergence — failure is owned at the job
-level (evaluation time limits, heartbeat bounds), and a terminally-failed
-derivation releases every holder as a 404, at which point a local compile
-is correct rather than a compromise. Dead derivation items are re-armed by
-a fresh identical want rather than acting as tombstones.
+bottom-up walk, so whole chains resolve within one pass.
+
+Holds are bounded and self-healing. Anything can die at any time — in
+particular between creating a derivation's job item and sending its queue
+message, and SQS can dead-letter a message after repeated crashed claims —
+so a non-terminal item with no live message is a reachable state, and the
+item (not the message) is ground truth. Duplicate messages are dropped at
+claim time, which makes re-sending always safe; whoever *waits* therefore
+heals: a holder (or a fresh identical want) that observes an item with no
+sign of life — `pending` past its `enqueued_at` lease, or `running` past
+any legitimate worker lifetime — CAS-renews the lease and re-sends the
+message (`rearm_derivation!`). Dead (`unsealable`/`error`) items are
+re-armed by a fresh identical want rather than acting as tombstones. On
+top of the healing, every hold is capped inside PkgEval's inactivity
+window (`PKGEVAL_CACHE_HOLD_LIMIT`, default 20 min): past the cap the
+requester compiles a private copy — bounded waste, versus the unbounded
+damage of idling until the job is killed. A terminally-failed derivation
+releases every holder as a 404, at which point a local compile is correct
+rather than a compromise. `docs/tla/DerivationLiveness.tla` model-checks
+this: without the re-arm the zombie is a liveness counterexample (the
+gh-5241627143 incident); with it, every hold provably releases.
 
 ### Extensions (v3 preimages)
 

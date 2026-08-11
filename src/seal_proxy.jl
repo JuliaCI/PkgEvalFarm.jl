@@ -112,18 +112,26 @@ const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
 
 maybe_donate!() = ((donor = SEAL_DONOR[]) === nothing || donor(); nothing)
 
+"How long a hold may block before degrading to a local compile: it must
+resolve comfortably inside PkgEval's inactivity window (~40 min), or the very
+job the hold serves gets killed for idling — the one outcome worse than a
+private compile."
+hold_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_CACHE_HOLD_LIMIT", "")), 20.0 * 60)
+
 """
 Block a missed GET while `key`'s derivation is pending/running, until the
 artifact publishes or the derivation goes terminal (404: canonical will never
 exist, so a local compile is then *correct*, not a compromise).
 
-Deliberately no timeout: releasing early would make the requester compile a
-private copy of something the rest of its job — and its own produced keys —
-expect to share, silently breaking the setup. Failure is owned at the job
-level (evaluation time limits, worker heartbeat bounds); a derivation that
-dies terminally releases every holder through the status check. The hard cap
-here is task-hygiene only — beyond any legitimate job lifetime, so a holder
-whose requester already died doesn't poll forever.
+Releasing early makes the requester compile a private copy of something the
+rest of its job expects to share — waste, but bounded waste. Blocking past
+the requester's inactivity window gets the requester *killed* — unbounded
+damage. So holds are capped inside that window, and the holder heals what it
+waits on: it is the one party guaranteed to still exist while a derivation
+is wedged (the ingester may be long dead), so it re-arms the derivation's
+message whenever the item shows no sign of life (maybe_rearm_derivation!).
+A derivation that dies terminally releases every holder through the status
+check.
 """
 function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
                              key::AbstractString)
@@ -140,8 +148,8 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
     Threads.atomic_add!(ACTIVE_HOLDS, 1)
     try
         maybe_donate!()
-        hygiene_cap = time() + 4 * 3600
-        while time() < hygiene_cap
+        deadline = time() + hold_limit()
+        while time() < deadline
             sleep(3)
             body = get_kv(ctx, ns, uuid, key)
             body === nothing || return body
@@ -151,6 +159,11 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
             # one last store look after a terminal flip (publish precedes the
             # status write, but be safe about interleavings)
             terminal && return get_kv(ctx, ns, uuid, key)
+            try
+                maybe_rearm_derivation!(ctx, job.run_id, key, item)
+            catch err
+                @warn "holder re-arm failed" key=first(key, 12) err
+            end
         end
         return nothing
     finally
@@ -374,57 +387,152 @@ function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
     want === nothing && return nothing
     key = bytes2hex(SHA.sha256(codeunits(body)))
     run_id = ensure_deriv_run(ctx, ns)
-    try
-        Dynamodb.put_item(ddb_item(Dict(
-                "run_id" => run_id,
-                "job_key" => job_key("deriv", key),
-                "config" => "deriv",
-                "package" => key,
-                "kind" => "deriv",
-                "name" => want.name,
-                "uuid" => want.uuid,
-                "version" => want.version,
-                "preimage" => String(body),
-                "status" => "pending",
-                "attempts" => 0,
-                "blocked" => 0,
-                "created_at" => isodate())), ctx.cfg.jobs_table,
-            Dict("ConditionExpression" => "attribute_not_exists(run_id)");
-            aws_config=ctx.aws)
+    created = try
+        aws_retry() do
+            Dynamodb.put_item(ddb_item(Dict(
+                    "run_id" => run_id,
+                    "job_key" => job_key("deriv", key),
+                    "config" => "deriv",
+                    "package" => key,
+                    "kind" => "deriv",
+                    "name" => want.name,
+                    "uuid" => want.uuid,
+                    "version" => want.version,
+                    "preimage" => String(body),
+                    "status" => "pending",
+                    "attempts" => 0,
+                    "blocked" => 0,
+                    "created_at" => isodate(),
+                    # the send lease: re-arm may re-send the message once this
+                    # is older than the claim window (see rearm_derivation!)
+                    "enqueued_at" => isodate())), ctx.cfg.jobs_table,
+                Dict("ConditionExpression" => "attribute_not_exists(run_id)");
+                aws_config=ctx.aws)
+        end
+        true
     catch err
         is_conditional_failure(err) || rethrow()
-        # a dead earlier derivation of the same context must not tombstone the
-        # want forever: a fresh want re-arms it (its missing rungs may exist
-        # by now). In-flight/succeeded items stay untouched. Note: re-running
-        # a previously-counted job drifts the deriv run's completion counters,
-        # which are observability-only.
+        false
+    end
+    if created
+        # the message is this job's liveness: send it before anything
+        # best-effort can fail. A death right here leaves a pending item whose
+        # enqueued_at lease expires, after which any holder or later want
+        # re-sends (rearm_derivation!) — never a permanent zombie.
+        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
+        # run counters are observability only and this row is hot (every
+        # completing derivation transacts on it): they must never gate the
+        # message, and a conflict here must never poison the ingest
         try
-            Dynamodb.update_item(
-                ddb_item(Dict("run_id" => run_id, "job_key" => job_key("deriv", key))),
-                ctx.cfg.jobs_table,
-                Dict("ConditionExpression" => "#s IN (:uns, :err)",
-                     "UpdateExpression" => "SET #s = :pending, attempts = :zero, blocked = :zero",
-                     "ExpressionAttributeNames" => Dict("#s" => "status"),
-                     "ExpressionAttributeValues" => ddb_item(Dict(
-                         ":uns" => "unsealable", ":err" => "error",
-                         ":pending" => "pending", ":zero" => 0)));
-                aws_config=ctx.aws)
-        catch takeover_err
-            is_conditional_failure(takeover_err) || rethrow()
-            return nothing   # pending/running/sealed: already handled
+            aws_retry() do
+                Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+                    Dict("UpdateExpression" => "SET #s = :active REMOVE finished_at ADD total_jobs :one",
+                         "ExpressionAttributeNames" => Dict("#s" => "status"),
+                         "ExpressionAttributeValues" => ddb_item(Dict(":active" => "active", ":one" => 1)));
+                    aws_config=ctx.aws)
+            end
+        catch err
+            @warn "deriv run counter update failed (observability only)" run_id err
         end
+        @info "derivation enqueued" ns want.name want.version key=first(key, 12)
+        return key
+    end
+    # the item already exists. A dead earlier derivation of the same context
+    # must not tombstone the want forever: a fresh want re-arms it (its
+    # missing rungs may exist by now). In-flight/succeeded items stay
+    # untouched. Note: re-running a previously-counted job drifts the deriv
+    # run's completion counters, which are observability-only.
+    rearmed_dead = try
+        Dynamodb.update_item(
+            ddb_item(Dict("run_id" => run_id, "job_key" => job_key("deriv", key))),
+            ctx.cfg.jobs_table,
+            Dict("ConditionExpression" => "#s IN (:uns, :err)",
+                 "UpdateExpression" => "SET #s = :pending, attempts = :zero, blocked = :zero, enqueued_at = :now",
+                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":uns" => "unsealable", ":err" => "error",
+                     ":pending" => "pending", ":zero" => 0, ":now" => isodate())));
+            aws_config=ctx.aws)
+        true
+    catch err
+        is_conditional_failure(err) || rethrow()
+        false
+    end
+    if rearmed_dead
         enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
         @info "re-armed dead derivation" ns want.name key=first(key, 12)
         return key
     end
-    Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
-        Dict("UpdateExpression" => "SET #s = :active REMOVE finished_at ADD total_jobs :one",
-             "ExpressionAttributeNames" => Dict("#s" => "status"),
-             "ExpressionAttributeValues" => ddb_item(Dict(":active" => "active", ":one" => 1)));
-        aws_config=ctx.aws)
-    enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
-    @info "derivation enqueued" ns want.name want.version key=first(key, 12)
-    return key
+    # pending/running/sealed: normally live elsewhere — but a pending item
+    # whose send lease expired unclaimed (ingester died between create and
+    # send, message DLQ'd/expired) has no live message, and nothing but us
+    # knows it needs one
+    rearm_derivation!(ctx, run_id, key) && return key
+    return nothing
+end
+
+# How long a pending derivation may sit unclaimed before its message is
+# presumed lost (also the re-send lease period), and how long a running one
+# may sit unfinished before its worker *and* SQS redelivery are presumed dead
+# (the heartbeat cap is 3h and redelivery adds a 30-minute visibility window,
+# so 4h is beyond any legitimate lifetime).
+const REARM_PENDING_AFTER = Dates.Second(5 * 60)
+const REARM_RUNNING_AFTER = Dates.Second(4 * 3600)
+
+"""
+Re-send the queue message of a derivation that shows no sign of life: still
+`pending` past the claim window (a crash between item creation and message
+send, an expired or dead-lettered message), or still `running` past any
+legitimate worker lifetime. The `enqueued_at` CAS elects one healer per lease
+window — and a healer dying between its CAS and its send only delays the next
+election by one window. Duplicate messages are dropped at claim time, so
+over-sending is waste, never corruption. Returns whether this caller re-armed.
+"""
+function rearm_derivation!(ctx::FarmCtx, run_id::AbstractString, key::AbstractString)
+    now = Dates.now(UTC)
+    lease = isodate(now - REARM_PENDING_AFTER)
+    stale = isodate(now - REARM_RUNNING_AFTER)
+    for (status, condition) in (
+            ("pending", "#s = :status AND (attribute_not_exists(enqueued_at) OR enqueued_at < :lease)"),
+            ("running", "#s = :status AND started_at < :stale AND " *
+                        "(attribute_not_exists(enqueued_at) OR enqueued_at < :lease)"))
+        won = try
+            Dynamodb.update_item(
+                ddb_item(Dict("run_id" => run_id, "job_key" => job_key("deriv", key))),
+                ctx.cfg.jobs_table,
+                Dict("ConditionExpression" => condition,
+                     "UpdateExpression" => "SET enqueued_at = :now",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(
+                         ":status" => status, ":lease" => lease, ":now" => isodate(now),
+                         (status == "running" ? ((":stale" => stale),) : ())...)));
+                aws_config=ctx.aws)
+            true
+        catch err
+            is_conditional_failure(err) || rethrow()
+            false
+        end
+        if won
+            enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=ctx.cfg.seal_queue_url)
+            @info "re-armed stalled derivation" run_id status key=first(key, 12)
+            return true
+        end
+    end
+    return false
+end
+
+"Holder-side heal: CAS-attempt a re-arm only when the item in hand already looks stale."
+function maybe_rearm_derivation!(ctx::FarmCtx, run_id::AbstractString, key::AbstractString,
+                                 item::AbstractDict)
+    status = String(get(item, "status", ""))
+    now = Dates.now(UTC)
+    lease = isodate(now - REARM_PENDING_AFTER)
+    stale = String(get(item, "enqueued_at", "")) < lease &&
+            (status == "pending" ||
+             (status == "running" &&
+              String(get(item, "started_at", "")) < isodate(now - REARM_RUNNING_AFTER)))
+    stale || return false
+    return rearm_derivation!(ctx, run_id, key)
 end
 
 "Whether a uuid string carries uuid5's forced version-5 and IETF-variant bits

@@ -16,7 +16,11 @@ const BUILD_RETRY_DELAY = 10 * 60
 
 isodate(t=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
 
-aws_retry(f; n=5) = retry(f; delays=ExponentialBackOff(; n, first_delay=1, max_delay=30))()
+# retries transient faults (throttling, TransactionConflict, network); a
+# conditional failure is a deterministic answer, not a fault — fail fast so
+# dedup/lost-race paths see it immediately
+aws_retry(f; n=5) = retry(f; delays=ExponentialBackOff(; n, first_delay=1, max_delay=30),
+                          check=(s, e) -> !is_conditional_failure(e))()
 
 # real AWS uses the ConditionalCheckFailedException code; some emulators only carry
 # the human-readable message with a generic 400 code. A cancelled transaction

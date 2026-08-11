@@ -386,9 +386,12 @@ end
     hold_and_fill!(ctx, job, seal_run_id, cpu, run_cache, run_cache_lock) -> :terminal | :pending
 
 The claimed test job stays held (its heartbeat keeps running); this slot pulls
-seal jobs while `seal(X)` is pending. An empty seal queue while still gated is
-the cue to (throttled) reconcile — the waiting party heals the pipeline it
-waits on — and then to briefly idle: the wanted seal is in flight elsewhere.
+seal jobs while `seal(X)` is pending. Every iteration also offers a (throttled)
+reconcile — the waiting party heals the pipeline it waits on. The offer must
+not be gated on finding the queue empty: a wedged seal run generates a flood
+of consumer-miss derivations that keeps this very queue busy, and that flood
+would then starve the only mechanism able to unwedge it (seen live: run
+gh-5241627143, zero reconciles in 8h under constant derivation traffic).
 `:pending` on return means the deadline passed — run cold.
 """
 function hold_and_fill!(ctx::FarmCtx, job::JobRef, seal_run_id::AbstractString, cpu::Int,
@@ -396,6 +399,7 @@ function hold_and_fill!(ctx::FarmCtx, job::JobRef, seal_run_id::AbstractString, 
     deadline = time() + seal_wait_limit()
     @info "test job gated on sealing; filling the wait" job.package seal_run_id
     while time() < deadline
+        maybe_reconcile_seal_run(ctx, seal_run_id)
         filled = try
             claim_seal_job(ctx)
         catch err
@@ -408,7 +412,6 @@ function hold_and_fill!(ctx::FarmCtx, job::JobRef, seal_run_id::AbstractString, 
             # seal processing (seen live: 66 error'd derivations, trial run 1)
             process_job(ctx, filled, cpu, run_cache, run_cache_lock)
         else
-            maybe_reconcile_seal_run(ctx, seal_run_id)
             sleep(15)
         end
         seal_status(ctx, seal_run_id, job.package) == :pending || return :terminal

@@ -874,10 +874,15 @@ backstop that heals it (the flip fires the stream, which posts the report).
 function reconcile_stuck_runs(ctx::LiteCtx)
     start_key = ""
     while true
+        # deriv runs are perpetual bookkeeping whose counters drift by design
+        # (re-armed derivations re-count): completed >= total means nothing
+        # there, and a bogus `done` flip misleads anyone reading the table
         payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-                  "\"FilterExpression\":\"#s = :active AND completed_jobs >= total_jobs\"," *
+                  "\"FilterExpression\":\"#s = :active AND completed_jobs >= total_jobs" *
+                  " AND (attribute_not_exists(kind) OR kind <> :deriv)\"," *
                   "\"ExpressionAttributeNames\":{\"#s\":\"status\"}," *
-                  "\"ExpressionAttributeValues\":{\":active\":{\"S\":\"active\"}}" *
+                  "\"ExpressionAttributeValues\":{\":active\":{\"S\":\"active\"}," *
+                  "\":deriv\":{\"S\":\"deriv\"}}" *
                   (isempty(start_key) ? "" : ",\"ExclusiveStartKey\":$start_key") * "}"
         resp = parse_json(ddb(ctx, "Scan", payload), ItemsResp)
         for run in something(resp.Items, Item[])
