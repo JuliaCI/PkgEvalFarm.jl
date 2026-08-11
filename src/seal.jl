@@ -174,6 +174,7 @@ function seal_dep_graph(registry_dir::AbstractString, packages::Vector{String},
                         learned::AbstractDict=Dict{String,Vector{String}}())
     wanted = Set(packages)
     graph = registry_dep_graph(registry_dir, wanted)
+    registry_edges = Dict(pkg => Set(deps) for (pkg, deps) in graph)
     for (pkg, deps) in learned
         pkg in wanted || continue
         merged = Set(graph[pkg])
@@ -188,12 +189,43 @@ function seal_dep_graph(registry_dir::AbstractString, packages::Vector{String},
     # registry union across version ranges and the learned test-dep edges both
     # create them (a Compat <-> SHA cycle froze ~78% of every ecosystem seal
     # run at the same ~2,650-job prefix, runs seal-42eec8/seal-0c7a5 et al.).
-    # Collapse each strongly-connected component by dropping its internal
-    # edges: members then count only external deps, seal with their cyclic
-    # deps cold — wasted warmth, not wrongness (see add_seal_jobs).
+    # Untangling must preserve as much *order* as possible, not just break the
+    # deadlock: a member sealed before its real deps compiles them cold, and a
+    # cold-compiled dep bakes a sandbox-local build_id into every key the
+    # member publishes — keys no consumer ever computes, so the seal is wasted
+    # and a canonical-twin derivation (plus its first consumers' holds) must
+    # redo the work. At ecosystem hubs (Compat), that convoy is expensive.
+    #
+    # Pass 1: inside a component, keep the registry's own edges and drop only
+    # the learned ones — cycles are usually closed by a test-dep edge (A's
+    # tests use B, B's tests use A), and load-time dependency graphs are
+    # acyclic, so this usually recovers the true direction outright.
     comp = scc_ids(graph)
     for (pkg, deps) in graph
-        graph[pkg] = [d for d in deps if get(comp, d, 0) != comp[pkg]]
+        graph[pkg] = [d for d in deps if get(comp, d, 0) != comp[pkg] ||
+                                         d in registry_edges[pkg]]
+    end
+    # Pass 2: residual registry-level cycles (version-range unions) get a
+    # deterministic orientation instead of a blind drop: members keep
+    # intra-component deps only on lexicographically-earlier members, so the
+    # component seals as a chain, each member consuming its predecessors'
+    # published artifacts. Half the edges orient "right" instead of none.
+    comp = scc_ids(graph)
+    order = Dict{String,Int}()
+    members = Dict{Int,Vector{String}}()
+    for pkg in keys(graph)
+        push!(get!(Vector{String}, members, comp[pkg]), pkg)
+    end
+    for pkgs in values(members)
+        length(pkgs) >= 2 || continue
+        for (i, pkg) in enumerate(sort!(pkgs))
+            order[pkg] = i
+        end
+    end
+    for (pkg, deps) in graph
+        haskey(order, pkg) || continue
+        graph[pkg] = [d for d in deps if get(comp, d, 0) != comp[pkg] ||
+                                         order[d] < order[pkg]]
     end
     return graph
 end

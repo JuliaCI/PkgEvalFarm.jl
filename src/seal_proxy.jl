@@ -155,9 +155,14 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
     status in ("pending", "running") || return get_kv(ctx, ns, uuid, key)
     Threads.atomic_add!(ACTIVE_HOLDS, 1)
     try
-        maybe_donate!()
         deadline = time() + hold_limit()
         while time() < deadline
+            # a held slot's capacity is donated for the ENTIRE hold, not once:
+            # each donor runs a single seal-queue job and retires, so this must
+            # re-offer every iteration (the donor cap makes it idempotent —
+            # measured live: one-shot donation left slots idle for the
+            # remaining ~18 minutes of a capped hold, fleet at 30% CPU)
+            maybe_donate!()
             sleep(3)
             body = get_kv(ctx, ns, uuid, key)
             body === nothing || return body
@@ -508,8 +513,11 @@ end
 # presumed lost (also the re-send lease period), and how long a running one
 # may sit unfinished before its worker *and* SQS redelivery are presumed dead
 # (the heartbeat cap is 3h and redelivery adds a 30-minute visibility window,
-# so 4h is beyond any legitimate lifetime).
-const REARM_PENDING_AFTER = Dates.Second(5 * 60)
+# so 4h is beyond any legitimate lifetime). The pending window must cover
+# honest queue *wait* during cascade bursts, not just delivery: at 5 minutes
+# a few-thousand-deep seal queue made holders re-arm derivations that were
+# merely in line, flooding the queue with duplicates.
+const REARM_PENDING_AFTER = Dates.Second(15 * 60)
 const REARM_RUNNING_AFTER = Dates.Second(4 * 3600)
 
 """

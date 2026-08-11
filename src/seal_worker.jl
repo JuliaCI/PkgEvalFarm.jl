@@ -20,13 +20,20 @@ this trades duplicate compilation against latency, nothing more."
 seal_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_WAIT", "")), 20.0 * 60)
 
 "How long a test job's in-sandbox fetch may wait on a held `/ensure` before
-degrading to a local compile. Seal jobs get no client-side bound of their
-own — their holds are graph-ordered and productive, and precompilation is
-their entire job — though the proxy's hold_limit still caps every hold
-server-side. For a test job a hold is an accelerator that must never eat
-the remaining budget, so its client gives up well before that cap."
+degrading to a local compile. For a test job a hold is an accelerator that
+must never eat the remaining budget, so its client gives up well before the
+proxy's server-side hold cap."
 test_fetch_deadline() =
     something(tryparse(Float64, get(ENV, "PKGEVAL_TEST_FETCH_DEADLINE", "")), 600.0)
+
+# Seal jobs deliberately get NO client-side fetch bound (only the proxy's
+# server-side hold cap): a publishing job that gives up a hold compiles the
+# dep locally, which taints every downstream context with a sandbox-local
+# build_id — keys no consumer computes, so the publication would be wasted
+# and a canonical-twin derivation would redo the work anyway. Holding is the
+# cheaper trade for a publisher: the slot's capacity is donated for the whole
+# hold, so waiting costs wall clock only, while a local compile costs a
+# wasted seal plus a twin derivation plus its first consumers' holds.
 
 """
 Evaluation kwargs pointing a job's sandbox at the cache protocol: the loopback

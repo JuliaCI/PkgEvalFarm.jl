@@ -60,15 +60,39 @@ end
         @test merged["Crayons"] == ["Example"]
         @test merged["JSON"] == ["Crayons", "Example"]
 
-        # cycles deadlock the readiness counters, so the graph collapses each
-        # SCC by dropping its internal edges (the Compat <-> SHA class): a
-        # learned edge closing a Crayons -> JSON loop costs both directions,
-        # while edges out of the component survive
+        # cycles deadlock the readiness counters; untangling drops the LEARNED
+        # back-edge and keeps the registry direction, so the dependent still
+        # seals warm (the Compat <-> SHA class: cycles usually close via a
+        # test-dep edge)
         cyc = PEF.seal_dep_graph(reg, sort(collect(wanted)),
                                  Dict("Crayons" => ["JSON"]))
-        @test cyc["JSON"] == ["Example"]
-        @test cyc["Crayons"] == String[]
+        @test cyc["JSON"] == ["Crayons", "Example"]   # registry edge survives
+        @test cyc["Crayons"] == String[]              # the learned closure is the cut
         @test cyc["Example"] == String[]
+
+        # residual registry-level cycles (version-range unions) serialize as a
+        # lexicographic chain: the later member keeps its dep on the earlier,
+        # so it seals consuming its predecessor's artifact
+        mktempdir() do reg2
+            mkpath(joinpath(reg2, "A", "Alpha"))
+            mkpath(joinpath(reg2, "B", "Beta"))
+            write(joinpath(reg2, "Registry.toml"), """
+                [packages]
+                bbbbbbbb-0000-0000-0000-000000000001 = { name = "Alpha", path = "A/Alpha" }
+                bbbbbbbb-0000-0000-0000-000000000002 = { name = "Beta", path = "B/Beta" }
+                """)
+            write(joinpath(reg2, "A", "Alpha", "Deps.toml"), """
+                ["0"]
+                Beta = "bbbbbbbb-0000-0000-0000-000000000002"
+                """)
+            write(joinpath(reg2, "B", "Beta", "Deps.toml"), """
+                ["0"]
+                Alpha = "bbbbbbbb-0000-0000-0000-000000000001"
+                """)
+            chain = PEF.seal_dep_graph(reg2, ["Alpha", "Beta"])
+            @test chain["Alpha"] == String[]
+            @test chain["Beta"] == ["Alpha"]
+        end
     end
 
     @testset "strongly connected components" begin
