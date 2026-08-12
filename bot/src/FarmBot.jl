@@ -1616,10 +1616,15 @@ end
 #           page must not assume this run's
 #   sigs    [{label, n}, ...]  shared failure signatures: hard new failures
 #           (fail/crash on primary, baseline OK) clustered by their stored
-#           error_line, most common first; omitted when no lines were recorded
+#           error line, most common first; the line is each failure's first
+#           stored candidate (error_lines, falling back to error_line) that the
+#           baseline's passing log doesn't also contain (pass_sigs) — a line
+#           the pass shares is test noise, not the failure, and a package whose
+#           every candidate is shared stays unclustered; omitted when no lines
+#           were recorded
 #   nfsig   {package: sig index, ...}  cluster membership for those packages
 
-# grouping key for a stored error_line: collapse details that vary per package
+# grouping key for a stored error line: collapse details that vary per package
 # or process (addresses, source locations, LoadError nesting) but keep the
 # message; the raw line stays as the cluster's display label
 function normalize_error_line(line::String)
@@ -1627,6 +1632,24 @@ function normalize_error_line(line::String)
     s = replace(s, r" at [^ ]+\.jl:\d+" => " at LOC")
     s = replace(s, "LoadError: " => "")
     return String(strip(s))
+end
+
+# stable 64-bit FNV-1a of a normalized error line, as fixed-width hex. Workers
+# store these for the error-shaped lines of *passing* logs (pass_sigs), and the
+# report hashes a failure's candidates to match against them — so it must not
+# be Base.hash, which differs between the worker's and the bot's Julia builds.
+# Hex by hand: string(h; base, pad) doesn't survive the trim verifier
+function sig_hash(s::String)
+    h = 0xcbf29ce484222325
+    for b in codeunits(s)
+        h = (h ⊻ b) * 0x00000100000001b3
+    end
+    buf = Vector{UInt8}(undef, 16)
+    for i in 16:-1:1
+        buf[i] = codeunit("0123456789abcdef", Int(h & 0xf) + 1)
+        h >>= 4
+    end
+    return String(buf)
 end
 
 status_char(status::String) = status == "test"  ? "t" :
@@ -1771,8 +1794,26 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         if (pst == "fail" || pst == "crash") &&
            (against_name === nothing ||
             (a !== nothing && issuccess(str(something(a), "status"))))
-            el = opt_str(p, "error_line")
-            el === nothing || push!(nf_lines, (pkg, something(el)))
+            # signature: the first stored candidate line the baseline's passing
+            # log doesn't share — a line that also shows up when tests pass is
+            # noise the tests print, not the failure. pass_sigs is comma-joined
+            # fixed-width hex, so plain substring search is exact membership
+            # (an unaligned 16-char window always straddles a comma). Old
+            # records carry a single error_line and no pass_sigs: first
+            # candidate wins unconditionally, as before
+            els = opt_str(p, "error_lines")
+            els === nothing && (els = opt_str(p, "error_line"))
+            noise = a === nothing ? nothing : opt_str(something(a), "pass_sigs")
+            if els !== nothing
+                for cand in split(something(els), '\n')
+                    line = String(cand)
+                    if noise === nothing ||
+                       !occursin(sig_hash(normalize_error_line(line)), something(noise))
+                        push!(nf_lines, (pkg, line))
+                        break
+                    end
+                end
+            end
         end
         pver = opt_str(p, "version")
         aver = a === nothing ? nothing : opt_str(something(a), "version")

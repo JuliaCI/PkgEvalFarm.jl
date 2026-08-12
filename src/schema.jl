@@ -242,6 +242,51 @@ const ERROR_LINE_GENERIC = ("Some tests did not pass", "errored during testing",
                             "ProcessExited")
 const ANSI_OR_CR = r"\e\[[0-9;]*[A-Za-z]|\r"
 
+# how many candidate lines a failing job stores (error_lines) and how many
+# noise hashes a passing job stores (pass_sigs); both bound the free-form text
+# on DynamoDB items that every full `run_jobs` read pays for
+const ERROR_LINES_STORED = 4
+const PASS_SIGS_STORED = 16
+
+"""
+    error_line_candidates(log; limit) -> Vector{String}
+
+The meaningful error lines of a job's log, best-first — crash-class markers,
+then `ERROR:` lines, then plain test-failure locations — clipped, and
+deduplicated by their normalized form (`FarmBot.normalize_error_line`).
+Failing jobs store up to `ERROR_LINES_STORED` of these so the report can skip
+signature lines that the baseline's passing log shares (its tests print them
+even when passing, so they cannot be the failure); passing jobs store hashes
+of all theirs (`pass_sig_hashes`) to be that comparison's other side.
+"""
+function error_line_candidates(log::AbstractString; limit::Int)
+    lines = split(replace(log, ANSI_OR_CR => ""), '\n')
+    out = String[]
+    seen = Set{String}()
+    # returns true once the list is full; duplicates (modulo normalization) of
+    # an already-collected line are dropped
+    consider(line) = begin
+        c = error_line_clip(line)
+        k = FarmBot.normalize_error_line(c)
+        k in seen || (push!(seen, k); push!(out, c))
+        length(out) >= limit
+    end
+    for line in lines, pattern in ERROR_LINE_PRIORITY
+        occursin(pattern, line) && consider(line) && return out
+    end
+    for line in lines
+        l = lstrip(line)
+        if (startswith(l, "ERROR: ") || startswith(l, "UNHANDLED TASK ERROR: ")) &&
+           !any(g -> occursin(g, l), ERROR_LINE_GENERIC)
+            consider(line) && return out
+        end
+    end
+    for line in lines
+        occursin("Test Failed at", line) && consider(line) && return out
+    end
+    return out
+end
+
 """
     error_line(log) -> Union{String,Nothing}
 
@@ -250,22 +295,22 @@ can cluster shared failure signatures without refetching logs. Kept short: it is
 free-form text on a DynamoDB item that every full `run_jobs` read pays for.
 """
 function error_line(log::AbstractString)
-    lines = split(replace(log, ANSI_OR_CR => ""), '\n')
-    for line in lines, pattern in ERROR_LINE_PRIORITY
-        occursin(pattern, line) && return error_line_clip(line)
-    end
-    for line in lines
-        l = lstrip(line)
-        if (startswith(l, "ERROR: ") || startswith(l, "UNHANDLED TASK ERROR: ")) &&
-           !any(g -> occursin(g, l), ERROR_LINE_GENERIC)
-            return error_line_clip(line)
-        end
-    end
-    for line in lines
-        occursin("Test Failed at", line) && return error_line_clip(line)
-    end
-    return nothing
+    cands = error_line_candidates(log; limit=1)
+    return isempty(cands) ? nothing : cands[1]
 end
+
+"""
+    pass_sig_hashes(log; limit) -> Vector{String}
+
+`FarmBot.sig_hash`es of the normalized error-shaped lines of a *passing* job's
+log — anything matching the failure heuristics during a pass is by definition
+noise its tests print. Stored per passing job (`pass_sigs`, comma-joined) so
+the report can recognize failure signatures the pass shares without refetching
+logs.
+"""
+pass_sig_hashes(log::AbstractString; limit::Int=PASS_SIGS_STORED) =
+    [FarmBot.sig_hash(FarmBot.normalize_error_line(c))
+     for c in error_line_candidates(log; limit)]
 
 function error_line_clip(line::AbstractString)
     s = strip(line)
