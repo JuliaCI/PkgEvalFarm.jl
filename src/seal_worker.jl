@@ -35,12 +35,35 @@ test_fetch_deadline() =
 # hold, so waiting costs wall clock only, while a local compile costs a
 # wasted seal plus a twin derivation plus its first consumers' holds.
 
+# Publishers (seal and derivation jobs) generate pkgimages: native code paid
+# for once per sealed unit is what turns the cache into a performance cache
+# for every consumer instead of an inference-only one. The generated .so must
+# load on every instance type the fleet mixes (Skylake through Zen4), so
+# codegen is pinned to the fleet's minimum ISA rather than the publishing
+# host's: haswell (AVX2-class, minus rdrnd — the same fast tier the CI julia
+# binaries multiversion for) is the floor of every current x86 EC2 type.
+# Base.create_expr_cache reads JULIA_CPU_TARGET at object-generation time at
+# any spawn depth, so the sandbox env var covers the whole precompile tree.
+# Consumers stay on --pkgimages=existing: they load published images but
+# never generate any, and their cache keys stay unchanged (the client masks
+# the pkgimages cache flag, which describes the artifact, not the context).
+seal_cpu_target() = get(ENV, "PKGEVAL_SEAL_CPU_TARGET", "haswell,-rdrnd")
+
+"A publisher-job configuration: same as `config`, but generating pkgimages."
+publisher_config(config; kwargs...) =
+    PkgEval.Configuration(config;
+        julia_args=any(startswith("--pkgimages"), config.julia_args) ?
+            config.julia_args : [config.julia_args; "--pkgimages=yes"],
+        kwargs...)
+
 """
 Evaluation kwargs pointing a job's sandbox at the cache protocol: the loopback
 proxy address and its namespace. Empty when the proxy isn't running.
+`publisher` additionally pins pkgimage codegen to the fleet-portable ISA.
 """
 function seal_protocol_kwargs(seal_id::AbstractString;
-                              fetch_deadline::Union{Nothing,Float64}=nothing)
+                              fetch_deadline::Union{Nothing,Float64}=nothing,
+                              publisher::Bool=false)
     pkgeval_supports_seal() || return (;)
     # the expansion-side detection guarantees this julia carries the hook
     proxy = SEAL_PROXY[]
@@ -49,6 +72,9 @@ function seal_protocol_kwargs(seal_id::AbstractString;
                "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
     fetch_deadline === nothing ||
         (env["PKGEVAL_CACHE_FETCH_DEADLINE"] = string(fetch_deadline))
+    if publisher && !isempty(seal_cpu_target())   # empty target = host-native
+        env["JULIA_CPU_TARGET"] = seal_cpu_target()
+    end
     # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
     # rejection reasons in job logs when chasing convergence bugs
     dbg = get(ENV, "PKGEVAL_JULIA_DEBUG", "")
@@ -70,7 +96,7 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
         # rr instruments test execution; sealing has none, so always disable it
-        config = PkgEval.Configuration(config; cpus=[cpu], goal=:seal, rr=PkgEval.RRDisabled)
+        config = publisher_config(config; cpus=[cpu], goal=:seal, rr=PkgEval.RRDisabled)
 
         eval_started = time()
         scratch = mktempdir(prefix="pkgeval_seal_")
@@ -79,7 +105,7 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             mkpath(export_dir)
             # deps arrive on demand through the proxy; publication happens
             # below, namespaced by the registry
-            eval_kwargs = seal_protocol_kwargs(seal_id)
+            eval_kwargs = seal_protocol_kwargs(seal_id; publisher=true)
 
             r = PkgEval.evaluate_seal(config, PkgEval.Package(; name=job.package);
                                       use_cache=claimed.attempts <= 1,
@@ -218,7 +244,7 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             seal_run = job_run(ctx, JobRef(seal_run_id(ns), SEAL_CONFIG_NAME, ""),
                                run_cache, run_cache_lock)
             config = config_from_dict(only(seal_run["configs"]))
-            config = PkgEval.Configuration(config; cpus=[cpu], rr=PkgEval.RRDisabled)
+            config = publisher_config(config; cpus=[cpu], rr=PkgEval.RRDisabled)
 
             eval_started = time()
             scratch = mktempdir(prefix="pkgeval_derive_")
@@ -241,24 +267,27 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                     end
                     export_dir = joinpath(scratch, "export")
                     mkpath(export_dir)
+                    env = Dict("PKGEVAL_CACHE_SERVER" => proxy_url(),
+                               "PKGEVAL_CACHE_NAMESPACE" => ns,
+                               # probe-only fetch: canonical deps come
+                               # from the store, so the produced preimage
+                               # carries the build_ids consumers want —
+                               # but nothing ever holds: holding on an
+                               # unpublished key deadlocks the derivation
+                               # against itself (seen live: TestEnv
+                               # derive + 5 test jobs inactivity-killed)
+                               "PKGEVAL_CACHE_NOHOLD" => "1",
+                               # extension unit: install pins only; the
+                               # ext compiles once parent+triggers land
+                               "PKGEVAL_DERIVE_EXT" => is_ext ? "1" : "0")
+                    isempty(seal_cpu_target()) ||
+                        (env["JULIA_CPU_TARGET"] = seal_cpu_target())
                     r = PkgEval.evaluate_derive(config,
                             PkgEval.Package(; name=want.name,
                                             uuid=UUID(want.uuid),
                                             version=VersionNumber(want.version));
                             use_cache=claimed.attempts <= 1, export_dir, pins_file,
-                            env=Dict("PKGEVAL_CACHE_SERVER" => proxy_url(),
-                                     "PKGEVAL_CACHE_NAMESPACE" => ns,
-                                     # probe-only fetch: canonical deps come
-                                     # from the store, so the produced preimage
-                                     # carries the build_ids consumers want —
-                                     # but nothing ever holds: holding on an
-                                     # unpublished key deadlocks the derivation
-                                     # against itself (seen live: TestEnv
-                                     # derive + 5 test jobs inactivity-killed)
-                                     "PKGEVAL_CACHE_NOHOLD" => "1",
-                                     # extension unit: install pins only; the
-                                     # ext compiles once parent+triggers land
-                                     "PKGEVAL_DERIVE_EXT" => is_ext ? "1" : "0"))
+                            env)
                     log = r.log === missing ? "" : String(r.log)
                     if String(r.status) == "derive"
                         unit_uuid = if is_ext

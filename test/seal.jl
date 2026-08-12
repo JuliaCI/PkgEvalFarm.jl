@@ -7,6 +7,7 @@ using Test
 using PkgEvalFarm
 using TOML
 using UUIDs: UUID, uuid5
+import PkgEval
 
 const PEF = PkgEvalFarm
 
@@ -200,6 +201,23 @@ end
     @test pins["aaaaaaaa-0000-0000-0000-000000000002"]["version"] == "4.1.0"
     @test !haskey(pins["aaaaaaaa-0000-0000-0000-000000000002"], "name")
     @test pins["aaaaaaaa-0000-0000-0000-000000000004"]["name"] == "FromMeta"
+end
+
+@testset "publisher pkgimages" begin
+    cfg = PkgEval.Configuration(; julia_args=["--threads=2"])
+    pub = PEF.publisher_config(cfg; goal=:seal)
+    @test pub.julia_args == ["--threads=2", "--pkgimages=yes"]
+    @test pub.goal === :seal
+    # an explicit pkgimages choice in the run's julia_args wins
+    cfg2 = PkgEval.Configuration(; julia_args=["--pkgimages=no"])
+    @test PEF.publisher_config(cfg2).julia_args == ["--pkgimages=no"]
+    # fleet-portable codegen target, overridable; empty opts out entirely
+    withenv("PKGEVAL_SEAL_CPU_TARGET" => nothing) do
+        @test PEF.seal_cpu_target() == "haswell,-rdrnd"
+    end
+    withenv("PKGEVAL_SEAL_CPU_TARGET" => "znver3") do
+        @test PEF.seal_cpu_target() == "znver3"
+    end
 end
 
 end # module

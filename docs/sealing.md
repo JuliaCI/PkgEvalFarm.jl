@@ -49,10 +49,18 @@ context, so an inexact reproduction produces a different key, never a wrong
 hit; and Julia's loader validates every fetched candidate itself, so a stale
 or mismatched artifact degrades to a local compile, never to a wrong result.
 
-By default seal jobs produce what PkgEval test jobs produce today (`.ji` under
-`--pkgimages=existing`), keeping test behavior byte-identical to the unsealed
-farm. Generating native pkgimages (the package-server payload) is a deliberate
-future flip of the seal config's flags, not a code change.
+Publisher jobs (seal and derivation) run `--pkgimages=yes` with
+`JULIA_CPU_TARGET` pinned to the fleet's minimum ISA (`haswell,-rdrnd` by
+default; `PKGEVAL_SEAL_CPU_TARGET` overrides, empty = host-native), so sealed
+artifacts are `.ji`+`.so` pairs whose native code loads on every instance
+type the fleet mixes. Consumers stay on `--pkgimages=existing`: they load
+published images but never spend test time generating any. The pkgimages
+cache flag is masked out of the preimage canon on both sides (it describes
+the artifact, not the build context — existing-mode loads either kind), which
+keeps publisher and consumer keys identical. One asymmetry to know: a
+`--pkgimages=yes` process rejects `.ji`-only cachefiles as flag-mismatched,
+so publishers can't reuse entries sealed before this flip — a transition cost
+paid once per namespace, and namespaces roll with the julia sha anyway.
 
 ## Scheduling: static graph + counters, dynamic discovery as the miss path
 
