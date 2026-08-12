@@ -1206,7 +1206,8 @@ try
         end
 
         @test PEF.drain_decision(0, 32)             # 32 slots ahead, empty queue
-        @test !PEF.drain_decision(0, 0)             # the most senior never drains
+        @test PEF.drain_decision(0, 0)              # empty queue: even the senior lets go
+        @test !PEF.drain_decision(1, 0)             # any work: the most senior holds on
         @test !PEF.drain_decision(64, 32)           # plenty of work: keep claiming
         @test PEF.drain_decision(31, 32)
 

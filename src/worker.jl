@@ -514,8 +514,16 @@ function heartbeat_generation(ctx::FarmCtx)
     return nothing
 end
 
-"An instance drains iff the backlog is below the summed slots of instances ranked ahead of it (so the most senior, with 0 ahead, never drains)."
-drain_decision(backlog::Int, slots_ahead::Int) = backlog < slots_ahead
+"""
+An instance drains iff the backlog is below the summed slots of instances
+ranked ahead of it, so while any work remains the most senior (0 ahead) keeps
+claiming. An empty backlog drains everyone *including* the senior instance:
+draining is also the sole gate on removing scale-in protection, and without
+this clause the last instance would stay protected forever and outlive the
+idle policy's scale-to-zero. If work reappears before the ASG reaps it, the
+next fleet check (≤60s) re-protects and resumes claims.
+"""
+drain_decision(backlog::Int, slots_ahead::Int) = backlog < slots_ahead || backlog == 0
 
 """
 Ask the build-request broker to have CI build a missing Julia, via the plain
