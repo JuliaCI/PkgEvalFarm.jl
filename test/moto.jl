@@ -116,6 +116,11 @@ try
             status == "fail" &&
                 (log = "ERROR: MethodError: no method matching parse(::Foo)\n" * log)
             status == "crash" && (log = "Unreachable reached at 0x1234\n" * log)
+            # JSON's tests print an error-shaped line even when passing — noise
+            # ahead of the real error on the failing side, and the pass side's
+            # evidence that it is noise
+            claimed.job.package == "JSON" &&
+                (log = "ERROR: Ignore this expected error\n" * log)
             result = PEF.JobResult(; status,
                 reason=status == "fail" ? "test_failures" :
                        status == "crash" ? "segfault" : nothing,
@@ -131,13 +136,23 @@ try
         end
         @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["wall"] == 84.0
         @test all(j -> j["peak_rss"] == 1_234_567_890, jobs)
-        # failing jobs get their first error line extracted; passing jobs
-        # don't carry the attribute at all
+        # failing jobs get their candidate error lines extracted (error_line =
+        # the first, error_lines only when there are several); passing jobs
+        # instead carry hashes of their error-shaped noise lines, and only when
+        # they have any
+        noise_sig = PEF.FarmBot.sig_hash(
+            PEF.FarmBot.normalize_error_line("ERROR: Ignore this expected error"))
         @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["error_line"] ==
+              "ERROR: Ignore this expected error"
+        @test only(filter(j -> j["job_key"] == "primary#JSON", jobs))["error_lines"] ==
+              "ERROR: Ignore this expected error\n" *
               "ERROR: MethodError: no method matching parse(::Foo)"
         @test only(filter(j -> j["job_key"] == "primary#Crayons", jobs))["error_line"] ==
               "Unreachable reached at 0x1234"
+        @test !haskey(only(filter(j -> j["job_key"] == "primary#Crayons", jobs)), "error_lines")
         @test !haskey(only(filter(j -> j["job_key"] == "against#JSON", jobs)), "error_line")
+        @test only(filter(j -> j["job_key"] == "against#JSON", jobs))["pass_sigs"] == noise_sig
+        @test !haskey(only(filter(j -> j["job_key"] == "against#Example", jobs)), "pass_sigs")
 
         run = PEF.get_run(ctx, RUN_ID)
         @test run["completed_jobs"] == 6
@@ -256,8 +271,10 @@ try
         # log locations come from each job's log_key
         @test rj["logdirs"][rows["JSON"][10] + 1] == "runs/$RUN_ID/logs/primary"
         @test rj["logdirs"][rows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
-        # the new failure's stored error_line becomes a failure signature;
-        # Crayons fails on both builds, so it is not clustered
+        # the new failure's stored candidates become a failure signature — but
+        # not the first one: the baseline's passing log shares it (pass_sigs),
+        # so the noise line is skipped for the real error below it. Crayons
+        # fails on both builds, so it is not clustered
         @test rj["sigs"] == [Dict("label" => "ERROR: MethodError: no method matching parse(::Foo)",
                                   "n" => 1)]
         @test rj["nfsig"] == Dict("JSON" => 0)
@@ -324,10 +341,14 @@ try
         @test all(j -> j["config"] == "against", reused)
         @test all(j -> j["reused_from"] == RUN_ID, reused)
         # the donor's error_line rides along for its crashed job, and stays
-        # absent for jobs that passed there
+        # absent for jobs that passed there — which carry the donor's noise
+        # hashes instead
         @test only(filter(j -> j["job_key"] == "against#Crayons", jobs))["error_line"] ==
               "Unreachable reached at 0x1234"
         @test !haskey(only(filter(j -> j["job_key"] == "against#JSON", jobs)), "error_line")
+        @test only(filter(j -> j["job_key"] == "against#JSON", jobs))["pass_sigs"] ==
+              PEF.FarmBot.sig_hash(
+                  PEF.FarmBot.normalize_error_line("ERROR: Ignore this expected error"))
         @test only(filter(j -> j["job_key"] == "against#Example", jobs))["status"] == "test"
         @test startswith(only(filter(j -> j["job_key"] == "against#JSON", jobs))["log_key"],
                          "runs/$RUN_ID/")

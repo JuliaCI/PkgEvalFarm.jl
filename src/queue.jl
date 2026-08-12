@@ -244,6 +244,10 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::Abstr
                 "log_key" => get(donor, "log_key", nothing),
                 (get(donor, "error_line", nothing) === nothing ? () :
                  (("error_line" => donor["error_line"]),))...,
+                (get(donor, "error_lines", nothing) === nothing ? () :
+                 (("error_lines" => donor["error_lines"]),))...,
+                (get(donor, "pass_sigs", nothing) === nothing ? () :
+                 (("pass_sigs" => donor["pass_sigs"]),))...,
                 "reused_from" => donor_id,
                 "finished_at" => now,
                 "attempts" => 0))))
@@ -660,11 +664,26 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
             end
         end
     end
-    # first meaningful error line of hard failures, so the report can cluster
-    # shared failure signatures without the logs; absent on other jobs to keep
-    # the items (fetched wholesale by every run_jobs read) small
-    line = result.status in ("fail", "crash") && stored_log !== nothing ?
-           error_line(something(stored_log)) : nothing
+    # first meaningful error lines of hard failures, so the report can cluster
+    # shared failure signatures without the logs (error_line = first candidate,
+    # error_lines = the full list when there is more than one); passing jobs
+    # instead carry hashes of their error-shaped lines — noise their tests
+    # print — so the report can skip signatures the pass shares. All absent
+    # when empty, to keep the items (fetched wholesale by every run_jobs read)
+    # small
+    line = nothing
+    lines = nothing
+    pass_sigs = nothing
+    if stored_log !== nothing
+        if result.status in ("fail", "crash")
+            cands = error_line_candidates(something(stored_log); limit=ERROR_LINES_STORED)
+            isempty(cands) || (line = cands[1])
+            length(cands) > 1 && (lines = join(cands, '\n'))
+        elseif issuccess(result.status)
+            hashes = pass_sig_hashes(something(stored_log))
+            isempty(hashes) || (pass_sigs = join(hashes, ','))
+        end
+    end
 
     # The terminal-status write and the counter bump must be one atomic unit: a
     # worker dying between two separate writes leaves every job terminal but the
@@ -682,7 +701,9 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, wall = :wall, finished_at = :now, " *
                                        "log_key = :log_key, cost = :cost, peak_rss = :peak_rss" *
-                                       (line === nothing ? "" : ", error_line = :error_line"),
+                                       (line === nothing ? "" : ", error_line = :error_line") *
+                                       (lines === nothing ? "" : ", error_lines = :error_lines") *
+                                       (pass_sigs === nothing ? "" : ", pass_sigs = :pass_sigs"),
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
@@ -703,7 +724,9 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                 3600 * something(SLOT_HOURLY_RATE[]) * result.slots,
                      ":peak_rss" => result.peak_rss,
                      ":log_key" => result.log === nothing ? nothing : key,
-                     (line === nothing ? () : ((":error_line" => line),))...)))),
+                     (line === nothing ? () : ((":error_line" => line),))...,
+                     (lines === nothing ? () : ((":error_lines" => lines),))...,
+                     (pass_sigs === nothing ? () : ((":pass_sigs" => pass_sigs),))...)))),
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),
