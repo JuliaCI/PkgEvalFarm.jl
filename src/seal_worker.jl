@@ -49,11 +49,56 @@ test_fetch_deadline() =
 # the pkgimages cache flag, which describes the artifact, not the context).
 seal_cpu_target() = get(ENV, "PKGEVAL_SEAL_CPU_TARGET", "haswell,-rdrnd")
 
-"A publisher-job configuration: same as `config`, but generating pkgimages."
+# Publisher jobs are the one workload the farm runs *above* one-per-core (the
+# seal overcommit in worker.jl), so their memory promises are what the
+# no-overcommit-above-swap budget is computed from: worker.jl sizes the spill
+# so that (slots + spill) * publisher_memory_limit() fits in the pkgeval.slice
+# budget (90% of RAM+swap; see the userdata template). 4 GiB covers pkgimage
+# generation for all but the heaviest packages; those die a contained cgroup
+# death and the consumer side just compiles without a cache entry.
+publisher_memory_limit() =
+    something(tryparse(Int, get(ENV, "PKGEVAL_SEAL_MEM", "")), 4*2^30)
+
+"Total configured swap in bytes (0 when unknown)."
+function swap_total()
+    try
+        for line in eachline("/proc/meminfo")
+            m = match(r"^SwapTotal:\s+(\d+) kB", line)
+            m === nothing || return parse(Int, m.captures[1]) * 1024
+        end
+    catch
+    end
+    return 0
+end
+
+"""
+Memory-aware seal overcommit: extra publisher slots beyond one-per-core, capped
+so the concurrent publishers' memory promises never exceed what the host can
+deliver — 90% of RAM plus swap, the pkgeval.slice budget (the missing 10% is
+the infrastructure reserve; see the worker userdata template). Overcommitting
+*into* swap is deliberate; overcommitting above it is how a pkgimage seal storm
+once OOM-killed the user manager, failing every subsequent sandbox launch and
+silently turning whole runs into skips.
+"""
+function default_seal_spill(ninstances::Int)
+    budget = round(Int, 0.9 * (Sys.total_memory() + swap_total()))
+    clamp(fld(budget, publisher_memory_limit()) - ninstances, 0, cld(ninstances, 2))
+end
+
+"""
+A publisher-job configuration: same as `config`, but generating pkgimages, and
+right-sized for overcommitted execution — a small memory promise plus an equal
+swap allowance (test jobs keep swap disabled for timing comparability; a
+publisher's wall clock feeds no estimate, so swapping beats dying). Explicit
+limits in the job spec win.
+"""
 publisher_config(config; kwargs...) =
     PkgEval.Configuration(config;
         julia_args=any(startswith("--pkgimages"), config.julia_args) ?
             config.julia_args : [config.julia_args; "--pkgimages=yes"],
+        (PkgEval.ismodified(config, :memory_limit) ? (;) :
+            (; memory_limit=publisher_memory_limit(),
+               swap_limit=publisher_memory_limit()))...,
         kwargs...)
 
 """
@@ -72,8 +117,13 @@ function seal_protocol_kwargs(seal_id::AbstractString;
                "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
     fetch_deadline === nothing ||
         (env["PKGEVAL_CACHE_FETCH_DEADLINE"] = string(fetch_deadline))
-    if publisher && !isempty(seal_cpu_target())   # empty target = host-native
-        env["JULIA_CPU_TARGET"] = seal_cpu_target()
+    if publisher
+        if !isempty(seal_cpu_target())            # empty target = host-native
+            env["JULIA_CPU_TARGET"] = seal_cpu_target()
+        end
+        # each publisher owns one core; parallel image codegen would multiply
+        # its memory spike, and the memory budget assumes it doesn't
+        env["JULIA_IMAGE_THREADS"] = "1"
     end
     # e.g. PKGEVAL_JULIA_DEBUG=loading: surface the loader's cachefile
     # rejection reasons in job logs when chasing convergence bugs

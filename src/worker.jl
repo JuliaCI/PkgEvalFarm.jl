@@ -106,10 +106,11 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # extra seal-queue jobs overlap those latency phases. Test jobs never run
     # on spill (their durations feed estimates and time limits, so they keep
     # exclusive cores); CPU pinning collides nominally, exactly like the
-    # donor path below.
+    # donor path below. The spill count is memory-bounded, not just CPU-bounded
+    # — see default_seal_spill.
     nspill = sealing_enabled(ctx.cfg) && pkgeval_supports_seal() ?
              something(tryparse(Int, get(ENV, "PKGEVAL_SEAL_OVERCOMMIT", "")),
-                       cld(ninstances, 2)) : 0
+                       default_seal_spill(ninstances)) : 0
     spill_cpus = Channel{Int}(max(nspill, 1))
     foreach(c -> put!(spill_cpus, c % max(ninstances, 1)), 0:nspill-1)
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)

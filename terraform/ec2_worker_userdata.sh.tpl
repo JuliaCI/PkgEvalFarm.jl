@@ -81,6 +81,47 @@ setup_local_ssd() {
 }
 setup_local_ssd || echo "local NVMe scratch unavailable; staying on EBS"
 
+# --- swap + sandbox memory containment ----------------------------------------
+# Seal jobs run overcommitted (the spill in worker.jl), and pkgimage generation
+# gives each a multi-GB spike; on 2026-08-15 a seal storm OOMed a host, the
+# kernel killed the worker's user manager, and every later sandbox launch died
+# with "sd-bus call: Interactive authentication required" — silently turning
+# whole runs into skips. Defenses, in depth:
+#   1. swap absorbs memory-promise overcommit (worker.jl budgets seal
+#      concurrency as "never promise more than 90% of RAM+swap");
+#   2. every sandbox lands in pkgeval.slice (PKGEVAL_SANDBOX_SLICE below),
+#      capped at 90% of RAM and of swap — a memory storm now OOMs *inside* the
+#      slice, killing a sandbox, never dbus or the user manager, and the other
+#      10% is the infrastructure reserve;
+#   3. the worker unit is BindsTo= the user manager, so if that still ever dies
+#      the worker fail-stops (ExecStop fast-releases its claims) instead of
+#      converting the whole queue to skips.
+MEM_B=$(awk '/^MemTotal:/ {print $2*1024}' /proc/meminfo)
+SWAP_B=$((MEM_B / 2))
+[ "$SWAP_B" -gt $((64*1024*1024*1024)) ] && SWAP_B=$((64*1024*1024*1024))
+SWAPFILE=/swapfile
+mountpoint -q /mnt/scratch && SWAPFILE=/mnt/scratch/swapfile
+# never starve the depot/rootfs caches sharing this filesystem
+FREE_B=$(df --output=avail -B1 "$(dirname "$SWAPFILE")" | tail -1)
+[ "$SWAP_B" -gt $((FREE_B / 4)) ] && SWAP_B=$((FREE_B / 4))
+if fallocate -l "$SWAP_B" "$SWAPFILE" && chmod 600 "$SWAPFILE" &&
+   mkswap -q "$SWAPFILE" && swapon "$SWAPFILE"; then
+    echo "swap active: $SWAP_B bytes on $SWAPFILE"
+else
+    rm -f "$SWAPFILE"
+    SWAP_B=0
+    echo "swap setup failed; continuing without" >&2
+fi
+mkdir -p /etc/systemd/user
+cat >/etc/systemd/user/pkgeval.slice <<SLICE
+[Unit]
+Description=PkgEval sandboxes: aggregate memory cap, 10% infrastructure reserve
+
+[Slice]
+MemoryMax=$((MEM_B * 90 / 100))
+MemorySwapMax=$((SWAP_B * 90 / 100))
+SLICE
+
 # PkgEval drives containers with `crun --systemd-cgroup`, which for a rootless
 # container asks the *user's* systemd (over its session D-Bus) to create the
 # transient scope. A `User=` system service has neither, so every container --
@@ -294,7 +335,10 @@ cat >/etc/systemd/system/pkgeval-worker.service <<UNIT
 [Unit]
 Description=PkgEval farm worker
 After=network-online.target pkgeval-imds-proxy.service user@$WORKER_UID.service
-Wants=network-online.target user@$WORKER_UID.service
+Wants=network-online.target
+# fail-stop with the user session: without it, a worker that lost its session
+# D-Bus keeps claiming jobs it can only skip (all-skip incident, 2026-08-15)
+BindsTo=user@$WORKER_UID.service
 Requires=pkgeval-imds-proxy.service
 
 [Service]
@@ -307,6 +351,8 @@ Environment=HOME=/home/worker
 # crun --systemd-cgroup talks to the user manager over this bus
 Environment=XDG_RUNTIME_DIR=/run/user/$WORKER_UID
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$WORKER_UID/bus
+# aggregate sandbox memory cap (the slice written above)
+Environment=PKGEVAL_SANDBOX_SLICE=pkgeval.slice
 Environment=JULIA=/home/worker/.juliaup/bin/julia
 # PKGEVAL_SYSIMAGE (if cloud-init got one) comes from the EnvironmentFile below;
 # bin/farm passes it to julia as -J

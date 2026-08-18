@@ -62,6 +62,17 @@ keeps publisher and consumer keys identical. One asymmetry to know: a
 so publishers can't reuse entries sealed before this flip — a transition cost
 paid once per namespace, and namespaces roll with the julia sha anyway.
 
+Image generation is also why publisher memory is budgeted, not merely
+overcommitted (a pkgimage seal storm once OOM-killed a worker's user manager,
+turning entire runs into silent skips). Publishers get a small memory promise
+plus an equal swap allowance (`publisher_memory_limit()`, `PKGEVAL_SEAL_MEM`
+overrides) and `JULIA_IMAGE_THREADS=1`; the seal spill in `worker.jl` is sized
+so concurrent publisher promises never exceed 90% of RAM+swap, and every
+sandbox runs inside `pkgeval.slice`, whose cap reserves the remaining 10% for
+infrastructure (see the worker userdata template). A publisher that outgrows
+its promise dies a contained cgroup death; consumers compile that package
+locally, exactly like any other cache miss.
+
 ## Scheduling: static graph + counters, dynamic discovery as the miss path
 
 Expansion builds a *static* dependency graph from the registry (union of

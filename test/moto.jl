@@ -261,6 +261,29 @@ try
         @test rj["sigs"] == [Dict("label" => "ERROR: MethodError: no method matching parse(::Foo)",
                                   "n" => 1)]
         @test rj["nfsig"] == Dict("JSON" => 0)
+
+        # an all-skip run (sandboxes failing to launch) must warn, never report
+        # a clean pass: skips are excluded from the comparison buckets
+        skip_run = PEF.create_run(ctx,
+            PEF.RunSpec(configs, ["Alpha", "Beta"], Dict{String,Any}());
+            submitter="tester")
+        expand_claim = PEF.claim_job(ctx; wait=1)
+        @test expand_claim isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, skip_run, ["Alpha", "Beta"]) == 4
+        SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle;
+                           aws_config=aws)
+        for _ in 1:4
+            c = PEF.claim_job(ctx; wait=1)
+            @test c isa PEF.ClaimedJob
+            status = c.job.config == "primary" ? "skip" : "test"
+            PEF.record_result(ctx, c, PEF.JobResult(; status,
+                reason=status == "skip" ? "uninstallable" : nothing,
+                duration=1.0, log="log"))
+        end
+        skip_report = PEF.FarmBot.generate_report(lite, skip_run)
+        @test occursin("infrastructure failure", skip_report.summary)
+        @test occursin("2 of 2 primary evaluations were skipped", skip_report.summary)
+        @test skip_report.new_fails == 0
     end
 
     @testset "worker error handling" begin
@@ -1786,6 +1809,12 @@ try
                 @test kwargs.env["PKGEVAL_CACHE_SERVER"] == base
                 @test kwargs.env["PKGEVAL_CACHE_NAMESPACE"] == ns
                 @test !haskey(kwargs, :mounts)
+                # consumers never pin codegen; publishers pin ISA and image threads
+                @test !haskey(kwargs.env, "JULIA_CPU_TARGET")
+                @test !haskey(kwargs.env, "JULIA_IMAGE_THREADS")
+                pub_kwargs = PEF.seal_protocol_kwargs(ns; publisher=true)
+                @test pub_kwargs.env["JULIA_CPU_TARGET"] == PEF.seal_cpu_target()
+                @test pub_kwargs.env["JULIA_IMAGE_THREADS"] == "1"
 
                 # --- stage 2: wants become derivation jobs -------------------
                 frame_rt = PEF.unframe_pair(PEF.frame_pair(Vector{UInt8}(b"JI"), Vector{UInt8}(b"SO")))

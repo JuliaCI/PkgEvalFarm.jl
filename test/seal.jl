@@ -208,9 +208,23 @@ end
     pub = PEF.publisher_config(cfg; goal=:seal)
     @test pub.julia_args == ["--threads=2", "--pkgimages=yes"]
     @test pub.goal === :seal
+    # right-sized for overcommitted execution, with an equal swap allowance
+    @test pub.memory_limit == PEF.publisher_memory_limit()
+    @test pub.swap_limit == PEF.publisher_memory_limit()
     # an explicit pkgimages choice in the run's julia_args wins
     cfg2 = PkgEval.Configuration(; julia_args=["--pkgimages=no"])
     @test PEF.publisher_config(cfg2).julia_args == ["--pkgimages=no"]
+    # ... and so does an explicit memory limit in the job spec
+    cfg3 = PkgEval.Configuration(; memory_limit=7*2^30)
+    @test PEF.publisher_config(cfg3).memory_limit == 7*2^30
+    @test PEF.publisher_config(cfg3).swap_limit == 0
+    # spill never promises past 90% of RAM+swap, and never exceeds cores/2
+    withenv("PKGEVAL_SEAL_MEM" => nothing) do
+        budget = round(Int, 0.9 * (Sys.total_memory() + PEF.swap_total()))
+        room = fld(budget, PEF.publisher_memory_limit())
+        @test PEF.default_seal_spill(8) == clamp(room - 8, 0, 4)
+        @test PEF.default_seal_spill(room + 1) == 0   # no memory headroom left
+    end
     # fleet-portable codegen target, overridable; empty opts out entirely
     withenv("PKGEVAL_SEAL_CPU_TARGET" => nothing) do
         @test PEF.seal_cpu_target() == "haswell,-rdrnd"

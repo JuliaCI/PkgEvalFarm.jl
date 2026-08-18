@@ -1555,8 +1555,20 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             end
         end
         new_fails = length(new_failures)
-        summary = isempty(new_failures) ? "no new package failures ✅" :
-                  "possible new issues: $(length(new_failures)) package$(length(new_failures) == 1 ? "" : "s") ❌"
+        # skips are excluded from every comparison bucket above, so a run whose
+        # sandboxes all failed to launch would otherwise report as a clean pass
+        # (seen live: two all-skip runs commented "no new package failures ✅")
+        nprimary = count(j -> str(j, "config") == config_names[1], jobs)
+        nprimary_skip = count(j -> str(j, "config") == config_names[1] &&
+                                   str(j, "status") == "skip", jobs)
+        summary = if nprimary > 0 && 2 * nprimary_skip >= nprimary
+            "⚠️ $nprimary_skip of $nprimary primary evaluations were skipped — " *
+            "likely an infrastructure failure; results are not meaningful"
+        elseif isempty(new_failures)
+            "no new package failures ✅"
+        else
+            "possible new issues: $(length(new_failures)) package$(length(new_failures) == 1 ? "" : "s") ❌"
+        end
         println(io, "**", summary, "**\n")
         for (title, entries, open) in (
                 ("❌ Packages that failed on primary but not on against", new_failures, true),
