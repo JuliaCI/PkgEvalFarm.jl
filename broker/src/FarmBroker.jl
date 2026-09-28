@@ -121,7 +121,7 @@ isnullval(v::LazyVal) = jsontype(v) == JSON.JSONTypes.NULL
 function json_string(v::LazyVal)
     jsontype(v) == JSON.JSONTypes.STRING || json_expected("string")
     s, pos = JSON.parsestring(v)
-    return convert(String, s)::String, pos
+    return String(s)::String, pos
 end
 
 function json_bool(v::LazyVal)
@@ -135,7 +135,7 @@ function json_string_dict(v::LazyVal)
     dict = Dict{String,String}()
     pos = JSON.applyobject(v) do k, val
         s, p = json_string(val)
-        dict[convert(String, k)::String] = s
+        dict[String(k)::String] = s
         return p
     end
     return dict, pos::Int
