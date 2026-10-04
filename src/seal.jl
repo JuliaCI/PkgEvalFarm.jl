@@ -578,8 +578,8 @@ function reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString)
 end
 
 
-"PkgEval fork support for `goal = :seal` evaluations (see the farm branch of
-KenoAIStaging/PkgEval.jl); without it workers neither poll the seal queue nor
+"PkgEval support for `goal = :seal` evaluations (PkgEval.jl master since
+JuliaCI/PkgEval.jl#314); without it workers neither poll the seal queue nor
 gate test jobs — the pre-sealing farm, exactly."
 pkgeval_supports_seal() = isdefined(PkgEval, :evaluate_seal)
 
