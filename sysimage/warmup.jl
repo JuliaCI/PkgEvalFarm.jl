@@ -4,7 +4,7 @@ using PkgEvalFarm
 using PkgEvalFarm: JobRef, JobResult, FarmConfig, RunSpec,
                    config_to_dict, config_from_dict, json_message, job_key, split_job_key,
                    ddb_item, ddb_unwrap, new_run_id, log_key, report_key, cli_main,
-                   error_line
+                   error_line, error_line_candidates, pass_sig_hashes
 import PkgEval
 import JSON
 
@@ -20,6 +20,8 @@ log_key(job.run_id, job.config, job.package)
 report_key(job.run_id, "index.html")
 JobResult(; status="test", duration=1.0)
 error_line("\e[31mERROR: MethodError: no method matching f()\e[0m\n")
+error_line_candidates("ERROR: noise\nERROR: MethodError: no method matching f()\n"; limit=4)
+pass_sig_hashes("ERROR: noise\n")
 
 for (k, v) in ddb_item(Dict("s" => "x", "n" => 3, "f" => 1.5, "b" => true,
                             "l" => ["a"], "m" => Dict("k" => "v"), "nul" => nothing))

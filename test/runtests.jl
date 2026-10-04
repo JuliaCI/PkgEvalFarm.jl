@@ -80,6 +80,37 @@ include("motohelpers.jl")
         long = "ERROR: " * "x"^300
         @test length(something(el(long))) == 240
         @test endswith(something(el(long)), "…")
+
+        # candidate lists: log order within a tier, deduplicated by normalized
+        # form (the /b variant collapses into the /a one), capped by `limit`
+        elc = PEF.error_line_candidates
+        @test elc("ERROR: Shared noise\n" *
+                  "ERROR: MethodError: no method matching f() at /a/x.jl:1\n" *
+                  "ERROR: MethodError: no method matching f() at /b/y.jl:2\n"; limit=4) ==
+              ["ERROR: Shared noise",
+               "ERROR: MethodError: no method matching f() at /a/x.jl:1"]
+        # crash-class markers outrank ERROR: lines in the list, as for error_line
+        @test elc("ERROR: x\nInternal error: boom\n"; limit=4) ==
+              ["Internal error: boom", "ERROR: x"]
+        @test length(elc(join(["ERROR: e$i" for i in 1:10], '\n'); limit=4)) == 4
+        # error_line stays the first candidate
+        @test el("ERROR: a\nERROR: b\n") == "ERROR: a"
+
+        # pass-side noise hashes: one per distinct error-shaped line, empty for
+        # a clean log (=> the attribute is omitted entirely)
+        nh = PEF.pass_sig_hashes("ok\nERROR: expected error at /x/y.jl:3\nfine\n")
+        @test nh == [PEF.FarmBot.sig_hash(
+                        PEF.FarmBot.normalize_error_line("ERROR: expected error at /x/y.jl:3"))]
+        @test isempty(PEF.pass_sig_hashes("all good\n"))
+    end
+
+    @testset "sig_hash" begin
+        # FNV-1a 64: known vectors, since worker and bot must agree across
+        # Julia versions (which Base.hash does not guarantee)
+        sh = PEF.FarmBot.sig_hash
+        @test sh("") == "cbf29ce484222325"     # offset basis
+        @test sh("a") == "af63dc4c8601ec8c"
+        @test length(sh("any other text")) == 16
     end
 end
 
@@ -93,10 +124,12 @@ end
     run = FB.FarmLite.Item("run_id" => attr("RID"), "submitter" => attr("kc"),
                            "created_at" => attr("2026-07-30T06:00:00Z"),
                            "total_jobs" => attr(6))
-    job(cfg, pkg, status; error_line=nothing) = begin
+    job(cfg, pkg, status; error_line=nothing, error_lines=nothing, pass_sigs=nothing) = begin
         it = FB.FarmLite.Item("config" => attr(cfg), "package" => attr(pkg),
                               "status" => attr(status), "duration" => attr(10.0))
         error_line === nothing || (it["error_line"] = attr(error_line))
+        error_lines === nothing || (it["error_lines"] = attr(error_lines))
+        pass_sigs === nothing || (it["pass_sigs"] = attr(pass_sigs))
         it
     end
     configs = [FB.ConfigInfo("primary", "JuliaLang/julia#abc", nothing),
@@ -118,14 +151,30 @@ end
         # hard new failure without a recorded line: not in nfsig
         job("primary", "E", "fail"),
         job("against", "E", "test"),
+        # the pass log shares the first candidate (its tests print that error
+        # even when passing), so the signature comes from the second
+        job("primary", "F", "fail";
+            error_line="ERROR: Shared error between pass and fail",
+            error_lines="ERROR: Shared error between pass and fail\n" *
+                        "ERROR: Unique error on the failing side"),
+        job("against", "F", "test";
+            pass_sigs=FB.sig_hash(FB.normalize_error_line(
+                "ERROR: Shared error between pass and fail"))),
+        # every candidate shared with the pass: dropped from clustering
+        job("primary", "G", "fail";
+            error_line="ERROR: Shared error between pass and fail"),
+        job("against", "G", "test";
+            pass_sigs=FB.sig_hash(FB.normalize_error_line(
+                "ERROR: Shared error between pass and fail"))),
     ]
     d = JSON.parse(FB.report_json(ctx, run, jobs, configs, 0.0, false))
-    @test length(d["sigs"]) == 2
+    @test length(d["sigs"]) == 3
     @test d["sigs"][1]["n"] == 2  # most common first
     @test occursin("MethodError", d["sigs"][1]["label"])
     @test d["sigs"][2]["n"] == 1
-    @test d["nfsig"] == Dict("A" => 0, "B" => 0, "C" => 1)
-    @test !haskey(d["nfsig"], "D") && !haskey(d["nfsig"], "E")
+    @test d["sigs"][3]["label"] == "ERROR: Unique error on the failing side"
+    @test d["nfsig"] == Dict("A" => 0, "B" => 0, "C" => 1, "F" => 2)
+    @test !haskey(d["nfsig"], "D") && !haskey(d["nfsig"], "E") && !haskey(d["nfsig"], "G")
     # no error lines recorded => the fields are omitted entirely
     d0 = JSON.parse(FB.report_json(ctx, run, [job("primary", "A", "fail"),
                                               job("against", "A", "test")],
