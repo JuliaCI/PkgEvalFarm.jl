@@ -11,8 +11,7 @@
 # unreachable from the root set, so runtime mutations lose their old->young
 # edges and the GC frees live objects (use-after-free segfaults in production;
 # see ../juliac-segfault-issue.md). Fixed by JuliaLang/julia#61474 (backported
-# in #62009): any release-1.13 build after rc1 — CI uses the `1.13-nightly`
-# channel until rc2 binaries are published.
+# in #62009): any release-1.13 build after rc1.
 VERSION > v"1.13.0-rc1" ||
     error("refusing to build with julia $VERSION: juliac --trim images built " *
           "before 1.13.0-rc2 (JuliaLang/julia#62009) segfault at runtime")
@@ -43,9 +42,6 @@ function build_lambda_bundle(app_dir::String;
     Pkg.activate(app_dir)
     Pkg.instantiate()
 
-    juliac = normpath(Sys.BINDIR, "..", "share", "julia", "juliac", "juliac.jl")
-    isfile(juliac) || error("juliac not found at $juliac; use Julia >= 1.13")
-
     rm(stage_dir; force=true, recursive=true)
     mkpath(stage_dir)
     exe = joinpath(stage_dir, "bootstrap")
@@ -59,28 +55,20 @@ function build_lambda_bundle(app_dir::String;
     # plausible worker), new enough that codegen inlines `floor` & co. instead of
     # calling libm — juliac's link line has no `-lm`, so a `generic` build fails
     # to link. A single target (rather than a multiversioned `a;b;c` string) also
-    # keeps `julia -C $target -e ...` legal, which the cache warm-up below needs.
+    # matches the caches juliac precompiles, which use only the first target.
     cpu_target = get(ENV, "JULIA_CPU_TARGET", "sandybridge")
 
+    # Julia no longer ships juliac; it comes from the JuliaC package, run in its
+    # own environment (see juliac/compile.jl)
     @info "compiling $app with juliac" trim cpu_target
-    env = copy(ENV)
-    env["JULIA_PROJECT"] = app_dir
-    env["JULIA_CPU_TARGET"] = cpu_target
-
-    # Warm the precompile caches *for the target CPU* first. juliac runs its own
-    # `Pkg.precompile()` but without the target flag (juliac.jl:162 uses
-    # `julia_cmd`, not `julia_cmd_target`), so the caches it builds are the wrong
-    # ones and the build script then tries to precompile mid-compile — which
-    # fails with "cannot register new atexit hook; already exiting".
-    run(setenv(`$(Base.julia_cmd()[1]) -C $cpu_target --startup-file=no
-                -e "using Pkg; Pkg.instantiate(); Pkg.precompile()"`,
-               env; dir=app_dir))
-    run(setenv(`$(Base.julia_cmd()[1]) $juliac --output-exe $exe --experimental $trim
-                --relative-rpath $(joinpath(app_dir, "src", "main.jl"))`,
-               env; dir=app_dir))
+    juliac_env = joinpath(@__DIR__, "juliac")
+    julia = Base.julia_cmd()[1]
+    run(`$julia --project=$juliac_env --startup-file=no -e "using Pkg; Pkg.instantiate()"`)
+    run(`$julia --project=$juliac_env --startup-file=no $(joinpath(juliac_env, "compile.jl"))
+         $app_dir $exe $trim $cpu_target`)
 
     # bundle the Julia runtime libraries next to the executable ("julia/" is where
-    # --relative-rpath points the executable's RPATH). Everything is laid out flat
+    # the executable's RPATH points). Everything is laid out flat
     # in that folder; the julia loader additionally expects libjulia's private
     # libraries in a "julia/" subdir next to libjulia itself, which a self-symlink
     # satisfies.
