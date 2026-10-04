@@ -19,7 +19,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [sources]
-PkgEval = {rev = "farm", url = "https://github.com/KenoAIStaging/PkgEval.jl"}
+PkgEval = {rev = "master", url = "https://github.com/JuliaCI/PkgEval.jl"}
 
 [compat]
 AWS = "1.98"
