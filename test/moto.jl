@@ -164,8 +164,15 @@ try
                 "started_at" => PEF.isodate(), "heartbeat_at" => PEF.isodate())),
             "pkgeval-jobs"; aws_config=aws)
         PEF.enqueue_jobs(ctx, [PEF.JobRef(RUN_ID, "primary", "LongJob")])
-        @test PEF.claim_job(ctx; wait=1) === nothing   # live: duplicate deleted
-        # ...but once the beats stop (worker death), redelivery re-claims
+        @test PEF.claim_job(ctx; wait=1) === nothing   # live: not claimed
+        # ...but kept, delayed, since it may be the job's last message
+        @test PEF.claim_job(ctx; wait=0) === nothing
+        delayed() = parse(Int, SQS.get_queue_attributes(queue_url,
+            Dict("AttributeNames" => ["ApproximateNumberOfMessagesDelayed"]);
+            aws_config=aws)["Attributes"]["ApproximateNumberOfMessagesDelayed"])
+        @test delayed() == 1
+        SQS.purge_queue(queue_url; aws_config=aws)
+        # ...and once the beats stop (worker death), redelivery re-claims
         Dynamodb.update_item(
             PEF.ddb_item(Dict("run_id" => RUN_ID, "job_key" => "primary#LongJob")),
             "pkgeval-jobs",
@@ -181,6 +188,14 @@ try
         PEF.release_job(ctx, c; delay=0)
         c = PEF.claim_job(ctx; wait=1)
         @test c isa PEF.ClaimedJob && c.job.package == "LongJob"
+        # if the stamp can't be cleared, an early release would get the message
+        # deleted as a duplicate, so release leaves it invisible instead
+        broken = PEF.FarmCtx(PEF.FarmConfig(; region="us-east-1", queue_url,
+                                            slow_queue_url, runs_table="pkgeval-runs",
+                                            jobs_table="no-such-table",
+                                            bucket="pkgeval-results"), aws)
+        PEF.release_job(broken, c; delay=0)
+        @test PEF.claim_job(ctx; wait=1) === nothing
         SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)
         Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => RUN_ID, "job_key" => "primary#LongJob")),
                              "pkgeval-jobs"; aws_config=aws)

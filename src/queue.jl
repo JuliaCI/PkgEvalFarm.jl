@@ -483,12 +483,38 @@ function claim_from_queues(ctx::FarmCtx, queues)
         if is_conditional_failure(err)
             # already finished, still live on another worker (duplicate
             # delivery), or the run item was deleted
+            job_is_running(ctx, job) && defer_duplicate(ctx, from_queue, message["Body"])
             SQS.delete_message(from_queue, receipt; aws_config=ctx.aws)
             return nothing
         end
         rethrow()
     end
     return ClaimedJob(job, receipt, receive_count, from_queue)
+end
+
+function job_is_running(ctx::FarmCtx, job::JobRef)
+    resp = Dynamodb.get_item(
+        ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+        ctx.cfg.jobs_table, Dict("ConsistentRead" => true);
+        aws_config=ctx.aws)
+    haskey(resp, "Item") || return false
+    return ddb_parse(resp["Item"])["status"] == "running"
+end
+
+"""
+Put a duplicate of a live job back on the queue, delayed until the job's
+heartbeat stamp would have gone stale. The live job's own message can be lost
+(a dying worker releases it while the stamp is still fresh, and its redelivery
+lands here), so this copy may be the only one left. It is a fresh message, not
+a visibility change, so repeated bounces never push it into the dead-letter
+queue.
+"""
+function defer_duplicate(ctx::FarmCtx, queue_url::AbstractString, body::AbstractString)
+    aws_retry() do
+        SQS.send_message(body, queue_url,
+                         Dict("DelaySeconds" => 3 * HEARTBEAT_INTERVAL);
+                         aws_config=ctx.aws)
+    end
 end
 
 worker_identity() = string(get(ENV, "USER", "unknown"), "@", gethostname())
@@ -616,7 +642,12 @@ function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; del
                      "ExpressionAttributeValues" => ddb_item(Dict(":running" => "running")));
                 aws_config=ctx.aws)
         catch err
-            is_conditional_failure(err) || @warn "failed to clear liveness stamp on release" err
+            if !is_conditional_failure(err)
+                # releasing early with the stamp still fresh would get the
+                # message deleted as a duplicate; let it time out instead
+                @warn "failed to clear liveness stamp; leaving the job to the visibility timeout" err
+                return
+            end
         end
     end
     try
