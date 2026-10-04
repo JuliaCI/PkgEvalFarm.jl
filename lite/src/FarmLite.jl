@@ -226,7 +226,7 @@ isnullval(v::LazyVal) = jsontype(v) == JSON.JSONTypes.NULL
 function json_string(v::LazyVal)
     jsontype(v) == JSON.JSONTypes.STRING || json_expected("string")
     s, pos = JSON.parsestring(v)
-    return convert(String, s)::String, pos
+    return String(s)::String, pos
 end
 
 function json_bool(v::LazyVal)
@@ -367,7 +367,7 @@ function json_make(::Type{Item}, x::LazyVal)::Tuple{Item,Int}
     item = Item()
     pos = JSON.applyobject(x) do k, v
         a, p = json_make(Attr, v)
-        item[convert(String, k)::String] = a
+        item[String(k)::String] = a
         return p
     end
     return item, pos::Int

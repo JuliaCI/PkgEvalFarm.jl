@@ -2051,7 +2051,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
         elseif k == "headers"
             return JSON.applyobject(v) do hk, hv
                 isnullval(hv) && return nothing
-                header = lowercase(convert(String, hk)::String)  # hk is a lazy PtrString
+                header = lowercase(String(hk)::String)  # hk is a lazy PtrString
                 if header == "x-hub-signature-256"
                     hstr, hpos = json_string(hv); signature[] = hstr; return hpos
                 elseif header == "x-github-event"
