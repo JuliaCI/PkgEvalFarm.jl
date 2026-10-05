@@ -871,6 +871,33 @@ try
             @test JSON.parse(PEF.FarmBot.handle_event(stream2, lite, gh))["ok"] == true  # no double
             @test length(posted) == n8p2
 
+            # 9. the daily schedule submits julia master, against the previous finished daily
+            master_sha = Ref("1" ^ 40)
+            TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/commits/master",
+                req -> TestHTTP.Response(200, JSON.json(Dict("sha" => master_sha[]))))
+            day1 = Date(2026, 1, 1)
+            @test PEF.FarmBot.submit_daily(lite, gh; day=day1)
+            daily1 = PEF.get_run(ctx, "daily-2026-01-01")
+            @test [c["name"] for c in daily1["configs"]] == ["primary"]  # no earlier daily
+            @test daily1["configs"][1]["julia"] == "JuliaLang/julia#$("1" ^ 40)"
+            @test daily1["context"]["daily"] == "2026-01-01"
+            @test !PEF.FarmBot.submit_daily(lite, gh; day=day1)  # once per day
+            Dynamodb.update_item(PEF.ddb_item(Dict("run_id" => "daily-2026-01-01")), cfg.runs_table,
+                Dict("UpdateExpression" => "SET #s = :d", "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => PEF.ddb_item(Dict(":d" => "done")));
+                aws_config=aws)
+            master_sha[] = "2" ^ 40
+            @test PEF.FarmBot.submit_daily(lite, gh; day=day1 + Day(2))  # a skipped day is fine
+            daily3 = PEF.get_run(ctx, "daily-2026-01-03")
+            @test [c["name"] for c in daily3["configs"]] == ["primary", "against"]
+            @test daily3["configs"][1]["julia"] == "JuliaLang/julia#$("2" ^ 40)"
+            @test daily3["configs"][2]["julia"] == "JuliaLang/julia#$("1" ^ 40)"
+            # identical settings on both sides, so the earlier daily is a baseline donor
+            @test daily3["configs"][1]["buildflags"] == daily3["configs"][2]["buildflags"]
+            # the scheduled rule's input routes to the same path
+            @test JSON.parse(PEF.FarmBot.handle_event("{\"daily\":true}", lite, gh))["ok"] == true
+            @test PEF.get_run(ctx, PEF.FarmBot.daily_run_id(Date(Dates.now(Dates.UTC))))["status"] == "expanding"
+
             # retire the failed runs' stray expand messages
             while (c = PEF.claim_job(ctx; wait=1)) !== nothing
                 SQS.delete_message(c.queue_url, c.receipt_handle; aws_config=aws)

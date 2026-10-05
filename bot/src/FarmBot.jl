@@ -429,6 +429,60 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
 end
 
 
+## daily runs
+#
+# The replacement for Nanosoldier's daily PkgEval: once a day, test the current julia
+# master against the previous daily's master commit. Both sides use the same configuration
+# as PR runs, so the previous daily's primary results are reused as the baseline and a
+# daily costs about one configuration's worth of jobs.
+
+const DAILY_REPO = "JuliaLang/julia"
+
+daily_run_id(day::Date) = "daily-" * Dates.format(day, dateformat"yyyy-mm-dd")
+
+"The primary Julia spec of the most recent finished daily before `day`, looking back up to 30 days."
+function previous_daily_julia(ctx::LiteCtx, day::Date)
+    for back in 1:30
+        payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                  "\"Key\":{\"run_id\":{\"S\":$(JSON.json(daily_run_id(day - Day(back))))}}}"
+        found = parse_json(ddb(ctx, "GetItem", payload), ItemResp).Item
+        found === nothing && continue
+        run = something(found)
+        str(run, "status", "") == "done" || continue
+        for c in parse_json(str(run, "configs", "[]"), Vector{ConfigInfo})
+            if something(c.name, "") == "primary" && c.julia !== nothing
+                return something(c.julia)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    submit_daily(ctx, gh; day) -> created::Bool
+
+Submit the daily run for `day` (UTC). The run id is derived from the date, so a repeated
+trigger on the same day does not submit a second run. Without a previous daily (or when
+master hasn't moved since) the run evaluates master alone.
+"""
+function submit_daily(ctx::LiteCtx, gh::GitHubCtx; day::Date=Date(Dates.now(UTC)))
+    primary = pin_commit(gh, DAILY_REPO * "#master")
+    occursin(r"#[0-9a-f]{40}$", primary) ||
+        error("could not resolve " * DAILY_REPO * " master to a commit")
+    against = previous_daily_julia(ctx, day)
+    configs = config_json("primary", primary; assertions=true)
+    if against !== nothing && something(against) != primary
+        configs *= "," * config_json("against", something(against); assertions=true)
+    end
+    run_id = daily_run_id(day)
+    created = create_run(ctx; run_id, configs_json="[" * configs * "]", packages=String[],
+                         context_json="{\"daily\":" * JSON.json(Dates.format(day, dateformat"yyyy-mm-dd")) * "}",
+                         submitter="daily")
+    @info "daily run" run_id created primary against
+    return created
+end
+
+
 ## polling GitHub for commands
 
 # Secrets come from SSM SecureString parameters when *_PARAM names one (the
@@ -2008,6 +2062,7 @@ struct TopEvent
     body::Union{Nothing,String}
     is_base64::Bool
     canary::Union{Nothing,String}       # direct invoke: forensic parse of this run
+    daily::Bool                         # the daily EventBridge rule: submit the daily run
 end
 
 function json_make(::Type{GhRepoFull}, x::LazyVal)
@@ -2052,6 +2107,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
     body = Ref{Union{Nothing,String}}(nothing)
     is_base64 = Ref(false)
     canary = Ref{Union{Nothing,String}}(nothing)
+    daily = Ref(false)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         # NB: locals in the nested closures carry unique names — reusing an outer
@@ -2106,10 +2162,13 @@ function json_make(::Type{TopEvent}, x::LazyVal)
             cs, cp = json_string(v); canary[] = cs; return cp
         elseif k == "isBase64Encoded"
             b, p = json_bool(v); is_base64[] = b; return p
+        elseif k == "daily"
+            db, dp = json_bool(v); daily[] = db; return dp
         end
         return nothing
     end
-    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[]),
+    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[],
+                    daily[]),
            pos::Int
 end
 
@@ -2150,8 +2209,8 @@ end
 """
     handle_event(event_body::String, ctx=ctx_from_env(), gh=bot_gh()) -> String
 
-Dispatch one Lambda invocation: webhook delivery, DynamoDB stream batch, or the
-scheduled fallback poll. Returns the response JSON.
+Dispatch one Lambda invocation: webhook delivery, DynamoDB stream batch, the daily
+schedule, or the scheduled fallback poll. Returns the response JSON.
 """
 function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
                       gh::GitHubCtx=bot_gh())
@@ -2162,6 +2221,10 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         jobs = run_jobs(ctx, something(event.canary))
         @info "forensic canary parse survived" n=length(jobs)
         return "{\"ok\":true,\"jobs\":" * string(length(jobs)) * "}"
+    end
+    if event.daily
+        created = submit_daily(ctx, gh)
+        return "{\"ok\":true,\"created\":" * string(created) * "}"
     end
     if !isempty(event.dead_bodies)
         # the jobs DLQ: messages the queue gave up on become recorded results,
