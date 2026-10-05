@@ -12,3 +12,24 @@ resource "aws_ce_cost_allocation_tag" "component" {
   tag_key = "Component"
   status  = "Active"
 }
+
+# The farm's costs as a custom billing view: pick "PkgEvalFarm" in Cost
+# Explorer's billing view selector, then group by the Component tag or by
+# service. It can be shared with other accounts through AWS RAM. It shows
+# gross usage; the account's credits are not tagged, so they fall outside it.
+# It misses the workers' public IPv4 charges, which AWS bills to the VPC
+# untagged (a few dollars a month), and usage from before the tags were
+# activated in late July 2026.
+resource "aws_billing_view" "pkgeval" {
+  provider     = aws.us_east_1 # billing is a global service served from us-east-1
+  name         = "PkgEvalFarm"
+  description  = "PkgEval farm costs: everything tagged Project=pkgeval"
+  source_views = ["arn:aws:billing::${data.aws_caller_identity.current.account_id}:billingview/primary"]
+
+  data_filter_expression {
+    tags {
+      key    = "Project"
+      values = ["pkgeval"]
+    }
+  }
+}
