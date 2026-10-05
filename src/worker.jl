@@ -739,6 +739,11 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
         config = PkgEval.Configuration(config; cpus=something(cpus, [cpu]))
+        # packages the daily runs show failing most of the time are only installed and
+        # loaded, on both sides of the comparison
+        if job.package in job_run(ctx, job, run_cache, run_cache_lock)["unreliable"]
+            config = PkgEval.Configuration(config; goal=:load)
+        end
         # redeliveries skip the package cache: cache interactions are the most likely
         # source of irreproducible failures (mirrors evaluate()'s retry behavior).
         # The seal gate and cache protocol are skipped too, for the same reason.

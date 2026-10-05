@@ -697,6 +697,23 @@ try
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#1.9.9") == "JuliaLang/julia#$pin_sha"
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#nosuchref") == "JuliaLang/julia#nosuchref"
 
+            # PR runs carry the published unreliable-package list; without one they still run
+            TestHTTP.register!(router, "GET", "/daily/unreliable.json",
+                req -> TestHTTP.Response(200, JSON.json(Dict(
+                    "generated" => "2026-10-05T00:00:00", "unreliable" => ["Flaky", "Flakier"]))))
+            withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/daily/unreliable.json") do
+                @test PEF.FarmBot.fetch_unreliable() == ["Flaky", "Flakier"]
+            end
+            withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/no/such/list.json") do
+                @test PEF.FarmBot.fetch_unreliable() == String[]
+            end
+            @test PEF.FarmBot.create_run(lite; run_id="unreliable-run", packages=String[],
+                configs_json="[" * PEF.FarmBot.config_json("primary", "JuliaLang/julia#" * "c"^40; assertions=true) * "]",
+                context_json="{}", submitter="tester", unreliable=["Flaky"])
+            @test PEF.get_run(ctx, "unreliable-run")["unreliable"] == Set(["Flaky"])
+            @test PEF.get_run(ctx, RUN_ID)["unreliable"] == Set{String}()  # older runs carry none
+            Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => "unreliable-run")), cfg.runs_table; aws_config=aws)
+
             # 1. a mention arrives -> bot submits a run and acks
             notifications[] = JSON.json([Dict(
                 "id" => "42", "reason" => "mention",

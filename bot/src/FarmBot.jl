@@ -384,6 +384,43 @@ function config_json(name::String, julia::String; assertions::Bool)
     "{\"name\":$(JSON.json(name)),\"julia\":$(JSON.json(julia)),\"buildflags\":$flags}"
 end
 
+## unreliable packages
+#
+# PR runs only install and load packages that the daily runs show failing most of the
+# time, since their failures say little about the change being tested. The site
+# publishes the list (daily/analyze.jl), and each run keeps the list it was submitted
+# with, so its workers all agree.
+
+unreliable_url() = get(ENV, "PKGEVAL_UNRELIABLE_URL",
+                       "https://pkgeval-reports.julialang.org/daily/unreliable.json")
+
+struct UnreliableList
+    unreliable::Vector{String}
+end
+
+function json_make(::Type{UnreliableList}, x::LazyVal)
+    packages = String[]
+    pos = JSON.applyobject(x) do k, v
+        k == "unreliable" || return nothing
+        list, list_pos = json_string_vector(v)
+        append!(packages, list)
+        return list_pos
+    end
+    return UnreliableList(packages), pos::Int
+end
+
+"The current unreliable-package list; empty when it can't be fetched, so runs still go ahead."
+function fetch_unreliable()
+    try
+        resp = http_request("GET", unreliable_url())
+        resp.status == 200 || return String[]
+        return parse_json(resp.body, UnreliableList).unreliable
+    catch err
+        @warn "could not fetch the unreliable-package list" msg=error_message(err)
+        return String[]
+    end
+end
+
 """
     create_run(ctx; run_id, ...) -> created::Bool
 
@@ -396,7 +433,7 @@ could strand a run whose first submission crashed between put and send.
 """
 function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
                     packages::Vector{String}, context_json::String, submitter::String,
-                    reuse::Bool=true)
+                    reuse::Bool=true, unreliable::Vector{String}=String[])
     item = Item(
         "run_id" => attr(run_id),
         "created_at" => attr(isodate()),
@@ -408,6 +445,7 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
         "total_jobs" => attr(0),
         "completed_jobs" => attr(0),
         "reuse" => attr(reuse))
+    isempty(unreliable) || (item["unreliable"] = attr(JSON.json(unreliable)))
     payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
               "\"Item\":$(json_item(item))," *
               "\"ConditionExpression\":\"attribute_not_exists(run_id)\"}"
@@ -786,9 +824,11 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     # the fallback poll rediscovering the same mention, and webhook+poll overlap
     # all collapse into one run (kicking off a run is expensive)
     run_id = comment_id === nothing ? new_run_id() : "gh-$(something(comment_id))"
+    # an explicit package list asks for exactly those tests, as with Nanosoldier
+    unreliable = isempty(command.packages) ? fetch_unreliable() : String[]
     created = create_run(ctx; run_id, configs_json, packages=command.packages,
                          context_json, submitter="$requester via @$name",
-                         reuse=!command.fresh_baseline)
+                         reuse=!command.fresh_baseline, unreliable)
     if !created
         @info "command already processed; skipping duplicate delivery" run_id repo number
         return
