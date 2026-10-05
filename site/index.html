@@ -975,12 +975,17 @@ function timeChart(el, { dates, series, stacked = false, yMin, yMax, baseline, y
       upper.forEach((v, i) => { lower[i] = v; });
     }
   } else {
+    const has = (v) => v !== null && v !== undefined;
     for (const s of series) {
       let d = "", pen = false;
       s.values.forEach((v, i) => {
-        if (v === null || v === undefined) { pen = false; return; }
+        if (!has(v)) { pen = false; return; }
         d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " ";
         pen = true;
+        // a point with no neighbour draws no line, so it gets a dot
+        if (!has(s.values[i - 1]) && !has(s.values[i + 1])) {
+          marks += `<circle cx="${x(i)}" cy="${y(v)}" r="4" fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+        }
       });
       marks += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
     }

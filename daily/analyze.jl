@@ -57,9 +57,11 @@ function load_dailies(cache)
         end
         summary = JSON.parsefile(file; dicttype=Dict{String,Any})
         sha = String(summary["build"]["sha"])
-        version = get!(versions, sha) do
+        version = get(versions, sha, "")
+        if isempty(version)
+            # not cached when missing, so a later build tries again
             text = fetch_text("https://raw.githubusercontent.com/JuliaLang/julia/$sha/VERSION")
-            text === nothing ? "" : strip(text)
+            text === nothing || (version = versions[sha] = String(strip(text)))
         end
         push!(dailies, Daily(date, run, sha, version, summary["tests"]))
     end
@@ -127,7 +129,9 @@ end
 
 # Like `simple_ratios`, but also uses package versions that the newest daily didn't test:
 # each version's durations are compared with its own latest test, and that daily's ratio
-# carries the comparison forward to the newest.
+# carries the comparison forward to the newest. (Nanosoldier's chart described this but
+# added the intermediate comparisons without that last step, understating the chained
+# ratios; the numbers here differ from its chart accordingly.)
 function full_ratios(dailies, rows)
     days = sort!(unique(first.(rows)))
     n = length(days)
@@ -155,7 +159,9 @@ function full_ratios(dailies, rows)
         weight = weights[k, n]
         duration = ratios[k, n] * weight
         for k′ in k+1:n-1
-            duration += ratios[k, k′] * weights[k, k′]
+            chained = result[days[k′]]   # day k′ relative to the newest, computed above
+            chained === nothing && continue
+            duration += ratios[k, k′] * chained * weights[k, k′]
             weight += weights[k, k′]
         end
         weight > 0 && (result[days[k]] = duration / weight)
