@@ -959,12 +959,21 @@ try
             @test daily3["configs"][2]["julia"] == "JuliaLang/julia#$("1" ^ 40)"
             # identical settings on both sides, so the earlier daily is a baseline donor
             @test daily3["configs"][1]["buildflags"] == daily3["configs"][2]["buildflags"]
+            # master still at the commit of a daily that is still running: nothing new to test
+            @test !PEF.FarmBot.submit_daily(lite, gh; day=day1 + Day(3))
+            @test PEF.FarmBot.find_run(lite, "daily-2026-01-04") === nothing
             # the hourly poll submits the day's run once it is due, and only once
             master_sha[] = "3" ^ 40
             @test !PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 9, 59))
             @test PEF.FarmBot.find_run(lite, "daily-2026-01-05") === nothing
             @test PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 10, 8))
+            # ...and re-sends the expand message of a run still waiting to be expanded
+            queued() = parse(Int, SQS.get_queue_attributes(PEF.FarmLite.slow_queue(lite),
+                Dict("AttributeNames" => ["ApproximateNumberOfMessages"]);
+                aws_config=aws)["Attributes"]["ApproximateNumberOfMessages"])
+            before = queued()
             @test !PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 11, 8))
+            @test queued() == before + 1
             # a manual `{"daily": true}` invocation takes the same path
             @test PEF.FarmBot.parse_json("{\"daily\":true}", PEF.FarmBot.TopEvent).daily
             @test !PEF.FarmBot.parse_json("{}", PEF.FarmBot.TopEvent).daily
@@ -991,6 +1000,17 @@ try
             @test summary["tests"]["Loads"]["status"] == "test"
             @test summary["tests"]["Broken"]["status"] == "fail"
             @test summary["tests"]["Broken"]["reason"] == "worker_exception"
+            @test PEF.get_run(ctx, "daily-2026-01-01")["daily_published"] == true
+            # a finished daily whose summary wasn't published is caught up by the hourly poll
+            Dynamodb.update_item(PEF.ddb_item(Dict("run_id" => "daily-2026-01-03")), cfg.runs_table,
+                Dict("UpdateExpression" => "SET #s = :d", "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => PEF.ddb_item(Dict(":d" => "done")));
+                aws_config=aws)
+            PEF.FarmBot.publish_missing_daily_summaries(lite; now=DateTime(2026, 1, 5, 12))
+            @test PEF.get_run(ctx, "daily-2026-01-03")["daily_published"] == true
+            @test JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key("daily-2026-01-03", "daily.json"), Dict("return_raw" => true);
+                aws_config=aws))))["build"]["sha"] == "2" ^ 40
 
             # retire the failed runs' stray expand messages
             while (c = PEF.claim_job(ctx; wait=1)) !== nothing
