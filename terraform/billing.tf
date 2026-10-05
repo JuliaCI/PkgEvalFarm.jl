@@ -33,3 +33,11 @@ resource "aws_billing_view" "pkgeval" {
     }
   }
 }
+
+# The view was created with the CLI from a machine without this configuration's
+# state (there is no remote backend), so adopt it rather than create a second
+# one. Safe to delete once an apply has imported it.
+import {
+  to = aws_billing_view.pkgeval
+  id = "arn:aws:billing::873569884612:billingview/custom-fde41164-7de5-4a39-a3b5-41187baf29cb"
+}
