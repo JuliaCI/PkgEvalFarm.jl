@@ -1,14 +1,18 @@
 # Publishes site/ (the interactive report page) to GitHub Pages. The page is
 # a fixed static asset: it takes ?run=<run_id> and loads that run's
 # report.json straight from the results bucket, so it deploys once per change
-# here rather than once per run. Requires Pages to be enabled for the repo
+# here rather than once per run. The exception is the Daily page's data
+# (site/daily/), which daily/analyze.jl derives from the daily runs, so the
+# site is also rebuilt on a schedule. Requires Pages to be enabled for the repo
 # with "GitHub Actions" as the source (Settings → Pages).
 name: Pages
 
 on:
   push:
     branches: [master]
-    paths: ['site/**', '.github/workflows/pages.yml']
+    paths: ['site/**', 'daily/**', '.github/workflows/pages.yml']
+  schedule:
+    - cron: '20 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -28,6 +32,19 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      # published daily summaries never change, so only new days are downloaded
+      - uses: actions/cache@v4
+        with:
+          path: daily/.cache
+          key: daily-summaries-${{ github.run_id }}
+          restore-keys: daily-summaries-
+      - name: Analyze the daily runs
+        run: |
+          julia --project=daily -e 'using Pkg; Pkg.instantiate()'
+          julia --project=daily daily/analyze.jl site/daily daily/.cache
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
