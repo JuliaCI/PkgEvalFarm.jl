@@ -87,12 +87,6 @@ variable "bot_schedule" {
   default     = "rate(1 hour)"
 }
 
-variable "bot_daily_schedule" {
-  description = "EventBridge schedule for submitting the daily run of julia master (UTC)."
-  type        = string
-  default     = "cron(0 10 * * ? *)"
-}
-
 variable "ec2_worker_max" {
   description = "Capacity ceiling for EC2 workers, in job slots = vCPUs (0 disables everything EC2-worker related; 384 ≈ twelve 8xlarge, or four 24xlarge). Scaling within [min, max] is queue-driven."
   type        = number
