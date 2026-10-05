@@ -948,6 +948,9 @@ try
                 Dict("UpdateExpression" => "SET #s = :d", "ExpressionAttributeNames" => Dict("#s" => "status"),
                      "ExpressionAttributeValues" => PEF.ddb_item(Dict(":d" => "done")));
                 aws_config=aws)
+            # nothing to compare while master is still at the previous daily's commit
+            @test !PEF.FarmBot.submit_daily(lite, gh; day=day1 + Day(1))
+            @test PEF.FarmBot.find_run(lite, "daily-2026-01-02") === nothing
             master_sha[] = "2" ^ 40
             @test PEF.FarmBot.submit_daily(lite, gh; day=day1 + Day(2))  # a skipped day is fine
             daily3 = PEF.get_run(ctx, "daily-2026-01-03")
@@ -956,9 +959,38 @@ try
             @test daily3["configs"][2]["julia"] == "JuliaLang/julia#$("1" ^ 40)"
             # identical settings on both sides, so the earlier daily is a baseline donor
             @test daily3["configs"][1]["buildflags"] == daily3["configs"][2]["buildflags"]
-            # the scheduled rule's input routes to the same path
-            @test JSON.parse(PEF.FarmBot.handle_event("{\"daily\":true}", lite, gh))["ok"] == true
-            @test PEF.get_run(ctx, PEF.FarmBot.daily_run_id(Date(Dates.now(Dates.UTC))))["status"] == "expanding"
+            # the hourly poll submits the day's run once it is due, and only once
+            master_sha[] = "3" ^ 40
+            @test !PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 9, 59))
+            @test PEF.FarmBot.find_run(lite, "daily-2026-01-05") === nothing
+            @test PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 10, 8))
+            @test !PEF.FarmBot.maybe_submit_daily(lite, gh; now=DateTime(2026, 1, 5, 11, 8))
+            # a manual `{"daily": true}` invocation takes the same path
+            @test PEF.FarmBot.parse_json("{\"daily\":true}", PEF.FarmBot.TopEvent).daily
+            @test !PEF.FarmBot.parse_json("{}", PEF.FarmBot.TopEvent).daily
+
+            # a finished daily publishes its primary results in Nanosoldier's db.json shape
+            for (config, pkg, status, reason, version) in
+                    (("primary", "Good", "test", nothing, "1.2.3"), ("primary", "Loads", "load", nothing, "0.1.0"),
+                     ("primary", "Broken", "error", "worker_exception", nothing), ("against", "Good", "fail", "test_failures", "1.2.3"))
+                Dynamodb.put_item(PEF.ddb_item(Dict{String,Any}(
+                        "run_id" => "daily-2026-01-01", "job_key" => "$config#$pkg", "config" => config,
+                        "package" => pkg, "status" => status, "duration" => 12.5,
+                        (reason === nothing ? () : ("reason" => reason,))...,
+                        (version === nothing ? () : ("version" => version,))...)),
+                    cfg.jobs_table; aws_config=aws)
+            end
+            PEF.FarmBot.publish_daily_summary(lite, something(PEF.FarmBot.find_run(lite, "daily-2026-01-01")))
+            summary = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+                PEF.report_key("daily-2026-01-01", "daily.json"), Dict("return_raw" => true); aws_config=aws))))
+            @test summary["date"] == "2026-01-01"
+            @test summary["build"]["sha"] == "1" ^ 40 && summary["build"]["repo"] == "JuliaLang/julia"
+            @test sort(collect(keys(summary["tests"]))) == ["Broken", "Good", "Loads"]  # primary only
+            @test summary["tests"]["Good"] == Dict("status" => "test", "reason" => nothing,
+                                                   "duration" => 12.5, "version" => "1.2.3")
+            @test summary["tests"]["Loads"]["status"] == "test"
+            @test summary["tests"]["Broken"]["status"] == "fail"
+            @test summary["tests"]["Broken"]["reason"] == "worker_exception"
 
             # retire the failed runs' stray expand messages
             while (c = PEF.claim_job(ctx; wait=1)) !== nothing

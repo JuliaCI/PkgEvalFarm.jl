@@ -293,27 +293,3 @@ resource "aws_lambda_permission" "bot_schedule" {
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.bot_schedule[0].arn
 }
-
-# --- Trigger 4: the daily run of julia master ----------------------------------
-
-resource "aws_cloudwatch_event_rule" "bot_daily" {
-  count               = local.bot_enabled
-  name                = "${var.name_prefix}-bot-daily"
-  schedule_expression = var.bot_daily_schedule
-}
-
-resource "aws_cloudwatch_event_target" "bot_daily" {
-  count = local.bot_enabled
-  rule  = aws_cloudwatch_event_rule.bot_daily[0].name
-  arn   = aws_lambda_function.bot[0].arn
-  input = jsonencode({ daily = true })
-}
-
-resource "aws_lambda_permission" "bot_daily" {
-  count         = local.bot_enabled
-  statement_id  = "AllowEventBridgeDailyInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.bot[0].function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.bot_daily[0].arn
-}

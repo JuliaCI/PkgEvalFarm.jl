@@ -433,27 +433,38 @@ end
 #
 # The replacement for Nanosoldier's daily PkgEval: once a day, test the current julia
 # master against the previous daily's master commit. Both sides use the same configuration
-# as PR runs, so the previous daily's primary results are reused as the baseline and a
-# daily costs about one configuration's worth of jobs.
+# as PR runs, so finished dailies donate baseline results to the next one. The hourly poll
+# submits the day's run, so a failed attempt is retried an hour later. Finished dailies
+# publish a summary that the site's analysis (and perf.julialang.org) read.
 
 const DAILY_REPO = "JuliaLang/julia"
+const DAILY_HOUR = 10  # UTC
 
 daily_run_id(day::Date) = "daily-" * Dates.format(day, dateformat"yyyy-mm-dd")
+is_daily(run_id::String) = startswith(run_id, "daily-")
+
+function find_run(ctx::LiteCtx, run_id::String)
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}}"
+    return parse_json(ddb(ctx, "GetItem", payload), ItemResp).Item
+end
+
+function primary_julia(run::Item)
+    for c in parse_json(str(run, "configs", "[]"), Vector{ConfigInfo})
+        something(c.name, "") == "primary" && c.julia !== nothing && return something(c.julia)
+    end
+    return nothing
+end
 
 "The primary Julia spec of the most recent finished daily before `day`, looking back up to 30 days."
 function previous_daily_julia(ctx::LiteCtx, day::Date)
     for back in 1:30
-        payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-                  "\"Key\":{\"run_id\":{\"S\":$(JSON.json(daily_run_id(day - Day(back))))}}}"
-        found = parse_json(ddb(ctx, "GetItem", payload), ItemResp).Item
+        found = find_run(ctx, daily_run_id(day - Day(back)))
         found === nothing && continue
         run = something(found)
         str(run, "status", "") == "done" || continue
-        for c in parse_json(str(run, "configs", "[]"), Vector{ConfigInfo})
-            if something(c.name, "") == "primary" && c.julia !== nothing
-                return something(c.julia)
-            end
-        end
+        julia = primary_julia(run)
+        julia === nothing || return julia
     end
     return nothing
 end
@@ -462,24 +473,71 @@ end
     submit_daily(ctx, gh; day) -> created::Bool
 
 Submit the daily run for `day` (UTC). The run id is derived from the date, so a repeated
-trigger on the same day does not submit a second run. Without a previous daily (or when
-master hasn't moved since) the run evaluates master alone.
+trigger on the same day does not submit a second run. Nothing is submitted while master is
+still at the previous daily's commit; without a previous daily, master runs alone.
 """
 function submit_daily(ctx::LiteCtx, gh::GitHubCtx; day::Date=Date(Dates.now(UTC)))
     primary = pin_commit(gh, DAILY_REPO * "#master")
     occursin(r"#[0-9a-f]{40}$", primary) ||
         error("could not resolve " * DAILY_REPO * " master to a commit")
     against = previous_daily_julia(ctx, day)
-    configs = config_json("primary", primary; assertions=true)
-    if against !== nothing && something(against) != primary
-        configs *= "," * config_json("against", something(against); assertions=true)
+    if against !== nothing && something(against) == primary
+        @info "daily run skipped: master has not moved" primary
+        return false
     end
+    configs = config_json("primary", primary; assertions=true)
+    against === nothing || (configs *= "," * config_json("against", something(against); assertions=true))
     run_id = daily_run_id(day)
     created = create_run(ctx; run_id, configs_json="[" * configs * "]", packages=String[],
                          context_json="{\"daily\":" * JSON.json(Dates.format(day, dateformat"yyyy-mm-dd")) * "}",
                          submitter="daily")
     @info "daily run" run_id created primary against
     return created
+end
+
+"Submit today's daily from the hourly poll once it is due and not yet submitted."
+function maybe_submit_daily(ctx::LiteCtx, gh::GitHubCtx; now::DateTime=Dates.now(UTC))
+    Dates.hour(now) >= DAILY_HOUR || return false
+    day = Date(now)
+    find_run(ctx, daily_run_id(day)) === nothing || return false
+    return submit_daily(ctx, gh; day)
+end
+
+# Nanosoldier's status names, which perf.julialang.org and older tooling count by
+nanosoldier_status(status::String) =
+    status == "load" ? "test" : status == "error" ? "fail" : status
+
+"""
+Publish a finished daily's primary results as `daily.json` next to its report, in the
+shape of the `db.json` Nanosoldier wrote for its dailies: `date`, `build` and per-package
+`tests`. The Julia version is left to the readers, which can look it up by commit.
+"""
+function publish_daily_summary(ctx::LiteCtx, run::Item)
+    run_id = str(run, "run_id")
+    julia = something(primary_julia(run), "#")
+    repo, sha = String(split(julia, '#')[1]), String(split(julia, '#')[end])
+    io = IOBuffer()
+    print(io, "{\"date\":", JSON.json(String(chop(run_id; head=length("daily-"), tail=0))),
+          ",\"run\":", JSON.json(run_id),
+          ",\"build\":{\"repo\":", JSON.json(repo), ",\"sha\":", JSON.json(sha), ",\"version\":null}",
+          ",\"tests\":{")
+    first_entry = true
+    for job in run_jobs(ctx, run_id)
+        str(job, "config", "") == "primary" || continue
+        status = str(job, "status", "")
+        status in TERMINAL_STATUSES || continue
+        first_entry || print(io, ",")
+        first_entry = false
+        reason = opt_str(job, "reason")
+        version = opt_str(job, "version")
+        print(io, JSON.json(str(job, "package")), ":{\"status\":", JSON.json(nanosoldier_status(status)),
+              ",\"reason\":", reason === nothing ? "null" : JSON.json(something(reason)),
+              ",\"duration\":", string(flt(job, "duration", 0.0)),
+              ",\"version\":", version === nothing ? "null" : JSON.json(something(version)), "}")
+    end
+    print(io, "}}")
+    s3_put(ctx, report_key(run_id, "daily.json"), String(take!(io)); content_type="application/json")
+    return nothing
 end
 
 
@@ -1033,6 +1091,7 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     end
 
     report = generate_report(ctx, run_id; run)
+    is_daily(run_id) && publish_daily_summary(ctx, run)
     # annotate the run item with the two scalars the dashboard's verdict chips
     # need, so it can render them straight off its Scan instead of fetching
     # report.json per run; best-effort — without it the page falls back to the
@@ -2010,6 +2069,12 @@ function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
     # after the checks above: a run that just finished or failed is reported
     # there and excluded from the status scan, instead of racing it
     update_status_comments(ctx, gh)
+    try
+        maybe_submit_daily(ctx, gh)
+    catch err
+        # retried by the next poll
+        @error "failed to submit the daily run" msg=error_message(err)
+    end
     return nothing
 end
 
