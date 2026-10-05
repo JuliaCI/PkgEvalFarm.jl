@@ -180,6 +180,16 @@ end
                                               job("against", "A", "test")],
                                    configs, 0.0, false))
     @test !haskey(d0, "sigs") && !haskey(d0, "nfsig")
+
+    # a retry's non-canonical log key is listed whole; canonical ones by dir
+    logged(it, key) = (it["log_key"] = attr(key); it)
+    dl = JSON.parse(FB.report_json(ctx, run,
+        [logged(job("primary", "A", "test"), "runs/RID/logs/primary/A.2.log"),
+         logged(job("against", "A", "test"), "runs/RID/logs/against/A.log")],
+        configs, 0.0, false))
+    row = only(dl["pkgs"])
+    @test dl["logdirs"][row[10] + 1] == "runs/RID/logs/primary/A.2.log"
+    @test dl["logdirs"][row[11] + 1] == "runs/RID/logs/against"
 end
 
 @testset "bot command parsing" begin

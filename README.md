@@ -88,9 +88,11 @@ bin/farm report <run-id>    # aggregate results into a Nanosoldier-style report
    (skipping jobs that are already done — SQS is at-least-once), and starts a PkgEval
    evaluation. While evaluating it extends the SQS visibility timeout as a heartbeat,
    so a crashed/killed worker's jobs simply reappear on the queue.
-3. On completion the worker uploads `runs/<run>/logs/<config>/<pkg>.log` and the result
-   record to S3, updates the job item (final status: `ok`/`fail`/`crash`/`kill`/`skip`
-   + reason), increments the run's completion counter, and deletes the SQS message.
+3. On completion the worker uploads `runs/<run>/logs/<config>/<pkg>.log` (create-only;
+   if a dead earlier attempt already took that key, `<pkg>.2.log`, … instead — the
+   job's `log_key` records where it landed) and the result record to S3, updates the
+   job item (final status: `ok`/`fail`/`crash`/`kill`/`skip` + reason), increments the
+   run's completion counter, and deletes the SQS message.
 4. When the counter reaches the total, whoever wants the report runs the aggregation
    (the bot does this automatically and posts back to GitHub).
 

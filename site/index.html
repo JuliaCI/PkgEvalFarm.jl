@@ -18,7 +18,8 @@
     runs/<run_id>/report/db.json      full per-job records
     <logdirs[i]>/<Package>.log        per-package logs — build the path from
         `logdirs` (reused baseline results keep their donor run's prefix,
-        so it is not always this run's prefix)
+        so it is not always this run's prefix); an entry ending in ".log"
+        is already the full key (a retry's <Package>.<n>.log)
 
   The landing page (no ?run=) lists runs from the DynamoDB table
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
@@ -1096,9 +1097,14 @@ function main(D) {
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   // log locations come from each job's log_key (via D.logdirs): a reused
-  // baseline's log lives under the donor run's prefix, not this run's
-  const logHref = (r, li) => (li >= 0 && D.logdirs[li]
-    ? `${D.run.bucket}/${D.logdirs[li]}/${encodeURIComponent(r[0])}.log` : null);
+  // baseline's log lives under the donor run's prefix, not this run's, and a
+  // retry's non-canonical key (<pkg>.<n>.log) is listed whole
+  const logHref = (r, li) => {
+    const d = li >= 0 ? D.logdirs[li] : null;
+    if (!d) return null;
+    return d.endsWith(".log") ? `${D.run.bucket}/${d}`
+                              : `${D.run.bucket}/${d}/${encodeURIComponent(r[0])}.log`;
+  };
   const plog = (r) => logHref(r, r[PLOG]);
   const alog = (r) => logHref(r, r[ALOG]);
   const fmtDur = (s) => {

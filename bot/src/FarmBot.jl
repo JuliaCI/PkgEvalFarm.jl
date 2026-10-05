@@ -1630,7 +1630,8 @@ end
 #   logdirs ["runs/<id>/logs/<config>", ...]  log directory of each job's
 #           log_key, indexed by plogdir/alogdir (-1 = no log recorded); a
 #           reused baseline's log lives under the donor run's prefix, so the
-#           page must not assume this run's
+#           page must not assume this run's. A non-canonical log_key (a
+#           retry's <pkg>.<n>.log) is listed whole, ending in ".log"
 #   sigs    [{label, n}, ...]  shared failure signatures: hard new failures
 #           (fail/crash on primary, baseline OK) clustered by their stored
 #           error line, most common first; the line is each failure's first
@@ -1779,7 +1780,10 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
             end
         end
         slash == 0 && return -1
-        dir = key[1:prevind(key, slash)]
+        # a retry whose canonical key was taken by a dead attempt logs under
+        # <pkg>.<n>.log: list that key whole, as the page can't rebuild it
+        dir = key[nextind(key, slash):end] == str(job, "package") * ".log" ?
+              key[1:prevind(key, slash)] : key
         get!(logdir_ids, dir) do
             push!(logdirs, dir)
             length(logdirs) - 1
