@@ -177,19 +177,22 @@ end
 
 """
 Find reusable baseline results for a run: the `against` config's jobs, taken
-from the most recent `done` run containing a config with the same content
-fingerprint. Reuse is sound only when the julia spec is immutable (exact sha or
-release tag) — the bot pins branch specs to shas at submission for this reason
-— and the submitter can veto it (`reuse = false` / `--fresh-baseline`) when the
+from `done` runs containing a config with the same content fingerprint. Each
+package's result comes from the most recent such run that has one, so a recent
+run that tested only a few packages doesn't hide an older run that tested them
+all. Reuse is sound only when the julia spec is immutable (exact sha or release
+tag) — the bot pins branch specs to shas at submission for this reason — and
+the submitter can veto it (`reuse = false` / `--fresh-baseline`) when the
 existing baseline looks flaky.
 
-Returns `(config_name, donor_run_id, Dict(package => donor job item))`, with an
+Returns `(config_name, donor_run_ids, Dict(package => donor job item))`, with an
 empty dict when there is nothing to reuse. Infrastructure failures ("error")
 are never reused; real results (including fail/crash/kill) are.
 """
 function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String},
-                             completed::Vector{<:Tuple}=completed_runs(ctx))
-    none = ("", "", Dict{String,Dict{String,Any}}())
+                             completed::Vector{<:Tuple}=completed_runs(ctx);
+                             max_donors::Int=5)
+    none = ("", String[], Dict{String,Dict{String,Any}}())
     get(run, "reuse", true) == true || return none
     i = findfirst(c -> c["name"] == "against", run["configs"])
     i === nothing && return none
@@ -208,22 +211,29 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
     isempty(donors) && return none
 
     wanted = Set(packages)
-    for (_, donor_id, donor_cfg) in donors
-        results = Dict{String,Dict{String,Any}}()
+    results = Dict{String,Dict{String,Any}}()
+    used = String[]
+    # each donor read fetches all of its jobs, so bound how far back we look
+    for (_, donor_id, donor_cfg) in first(donors, max_donors)
+        found = false
         for job in run_jobs(ctx, donor_id)
             job["config"] == donor_cfg || continue
-            job["package"] in wanted || continue
+            pkg = String(job["package"])
+            pkg in wanted && !haskey(results, pkg) || continue
             status = get(job, "status", "")
             status in TERMINAL_STATUSES && status != "error" || continue
-            results[String(job["package"])] = job
+            results[pkg] = job
+            found = true
         end
-        isempty(results) || return ("against", donor_id, results)
+        found && push!(used, donor_id)
+        length(results) == length(wanted) && break
     end
-    return none
+    isempty(results) && return none
+    return ("against", used, results)
 end
 
-"Write already-completed job items carrying a donor's results (batched)."
-function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::AbstractString,
+"Write already-completed job items carrying donors' results (batched)."
+function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString,
                            jobs::Vector{JobRef}, results::AbstractDict)
     now = isodate()
     for batch in Iterators.partition(jobs, 25)
@@ -248,7 +258,7 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString, donor_id::Abstr
                  (("error_lines" => donor["error_lines"]),))...,
                 (get(donor, "pass_sigs", nothing) === nothing ? () :
                  (("pass_sigs" => donor["pass_sigs"]),))...,
-                "reused_from" => donor_id,
+                "reused_from" => donor["run_id"],
                 "finished_at" => now,
                 "attempts" => 0))))
         end
@@ -307,10 +317,10 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
 
     # baseline reuse: against-side jobs with a matching prior result are written
     # pre-completed (pointing at the donor's log) and never enqueued
-    reuse_cfg, donor_id, reused_results = baseline_reuse_plan(ctx, run, packages, completed)
+    reuse_cfg, donor_ids, reused_results = baseline_reuse_plan(ctx, run, packages, completed)
     reused = [j for j in jobs if j.config == reuse_cfg && haskey(reused_results, j.package)]
     fresh = setdiff(jobs, reused)
-    isempty(reused) || @info "reusing baseline results" run_id donor_id n=length(reused)
+    isempty(reused) || @info "reusing baseline results" run_id donor_ids n=length(reused)
 
     # straggler avoidance: jobs above the (run-mix-derived) duration cutoff go
     # to the slow queue, which workers drain first
@@ -323,7 +333,7 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     # redelivered expand message only needs to make sure the messages went out
     if run["status"] == "expanding"
         write_jobs(ctx, fresh; est=job_est)
-        isempty(reused) || write_reused_jobs(ctx, run_id, donor_id, reused, reused_results)
+        isempty(reused) || write_reused_jobs(ctx, run_id, reused, reused_results)
     end
 
     # sealing (docs/sealing.md): idempotent, so a redelivered expand message

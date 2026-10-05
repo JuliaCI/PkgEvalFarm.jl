@@ -522,6 +522,37 @@ try
         @test any(d -> d[4] >= 6, PEF.completed_runs(ctx))
     end
 
+    @testset "baseline reuse merges donors" begin
+        # a newer run that tested a few packages must not hide an older one that tested
+        # them all: each package's result comes from the newest donor that has one
+        julia = "JuliaLang/julia#" * "a"^40
+        put_result(run, pkg, status) = Dynamodb.put_item(PEF.ddb_item(Dict(
+            "run_id" => run, "job_key" => "primary#$pkg", "config" => "primary",
+            "package" => pkg, "status" => status, "duration" => 1.0)),
+            cfg.jobs_table; aws_config=aws)
+        put_result("reuse-full", "Alpha", "fail")
+        put_result("reuse-full", "Beta", "test")
+        put_result("reuse-full", "Gamma", "test")
+        put_result("reuse-subset", "Alpha", "test")
+        put_result("reuse-subset", "Gamma", "error")   # never reused
+        donor_cfg = Any[Dict{String,Any}("name" => "primary", "julia" => julia, "buildflags" => Any[])]
+        donors = [("2026-03-02T00:00:00Z", "reuse-subset", donor_cfg, 2),
+                  ("2026-03-01T00:00:00Z", "reuse-full", donor_cfg, 3)]
+        run = Dict{String,Any}("run_id" => "reuse-taker", "reuse" => true, "configs" => Any[
+            Dict{String,Any}("name" => "primary", "julia" => "JuliaLang/julia#" * "b"^40, "buildflags" => Any[]),
+            Dict{String,Any}("name" => "against", "julia" => julia, "buildflags" => Any[])])
+        cfg_name, used, results = PEF.baseline_reuse_plan(ctx, run, ["Alpha", "Beta", "Gamma", "Delta"], donors)
+        @test cfg_name == "against"
+        @test used == ["reuse-subset", "reuse-full"]
+        @test results["Alpha"]["run_id"] == "reuse-subset" && results["Alpha"]["status"] == "test"
+        @test results["Beta"]["run_id"] == "reuse-full"
+        @test results["Gamma"]["run_id"] == "reuse-full"   # the newer donor only had an error
+        @test !haskey(results, "Delta")
+        # the search stops at max_donors
+        _, used1, results1 = PEF.baseline_reuse_plan(ctx, run, ["Alpha", "Beta"], donors; max_donors=1)
+        @test used1 == ["reuse-subset"] && collect(keys(results1)) == ["Alpha"]
+    end
+
     @testset "submitter requirement parsing" begin
         # "TEAM" gates on a GITHUB_ORG team; "ORG/TEAM" carries its own org
         # (matching the broker's spec format); "" is plain org membership
