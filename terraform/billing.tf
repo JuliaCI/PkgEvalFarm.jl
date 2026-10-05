@@ -23,7 +23,7 @@ resource "aws_ce_cost_allocation_tag" "component" {
 resource "aws_billing_view" "pkgeval" {
   provider     = aws.us_east_1 # billing is a global service served from us-east-1
   name         = "PkgEvalFarm"
-  description  = "PkgEval farm costs: everything tagged Project=pkgeval"
+  description  = "PkgEval farm costs - everything tagged Project=pkgeval" # no colons or commas allowed
   source_views = ["arn:aws:billing::${data.aws_caller_identity.current.account_id}:billingview/primary"]
 
   data_filter_expression {
