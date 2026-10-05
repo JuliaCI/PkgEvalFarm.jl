@@ -584,6 +584,24 @@ try
         @test used1 == ["reuse-subset"] && collect(keys(results1)) == ["Alpha"]
     end
 
+    @testset "load-only results are not reused" begin
+        # a PR run only loads unreliable packages; that can't be another run's tested baseline
+        julia = "JuliaLang/julia#" * "d"^40
+        for (pkg, status) in (("Loaded", "load"), ("Tested", "test"))
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                "run_id" => "load-donor", "job_key" => "primary#$pkg", "config" => "primary",
+                "package" => pkg, "status" => status, "duration" => 1.0)),
+                cfg.jobs_table; aws_config=aws)
+        end
+        donor_cfg = Any[Dict{String,Any}("name" => "primary", "julia" => julia, "buildflags" => Any[])]
+        run = Dict{String,Any}("run_id" => "load-taker", "reuse" => true, "configs" => Any[
+            Dict{String,Any}("name" => "primary", "julia" => "JuliaLang/julia#" * "e"^40, "buildflags" => Any[]),
+            Dict{String,Any}("name" => "against", "julia" => julia, "buildflags" => Any[])])
+        _, _, results = PEF.baseline_reuse_plan(ctx, run, ["Loaded", "Tested"],
+                                                [("2026-03-01T00:00:00Z", "load-donor", donor_cfg, 2)])
+        @test collect(keys(results)) == ["Tested"]
+    end
+
     @testset "submitter requirement parsing" begin
         # "TEAM" gates on a GITHUB_ORG team; "ORG/TEAM" carries its own org
         # (matching the broker's spec format); "" is plain org membership
