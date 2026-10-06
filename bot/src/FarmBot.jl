@@ -1393,25 +1393,29 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
         err isa ErrorException && is_conditional_failure(err) && return nothing
         rethrow()
     end
+    # the ETA is stored for every active run, not only those with a comment, so the
+    # report site can show it too
+    eta = nothing
+    if status == "active" && isempty(str(run, "kind", ""))
+        work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
+        if remaining >= 0
+            eta = eta_from_work(str(run, "status_commented_at", ""),
+                                flt(run, "status_work_done", -1.0),
+                                work_done, remaining, now)
+        end
+        # whole seconds: string(::Float64) can go scientific, which DynamoDB's
+        # number grammar does not accept
+        snapshot = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+                   "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
+                   "\"UpdateExpression\":\"SET status_work_done = :w" *
+                   (eta === nothing ? " REMOVE eta_at\"," : ", eta_at = :e\",") *
+                   "\"ExpressionAttributeValues\":{\":w\":{\"N\":\"$(round(Int, work_done))\"}" *
+                   (eta === nothing ? "" : ",\":e\":{\"S\":" * JSON.json(isodate(something(eta))) * "}") * "}}"
+        ddb(ctx, "UpdateItem", snapshot)
+    end
     comment_id = int(run, "comment_id", 0)
     context = parse_json(str(run, "context", "{}"), RunContext)
     if comment_id > 0 && context.repo !== nothing && context.issue !== nothing
-        eta = nothing
-        if status == "active"
-            work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
-            if remaining >= 0
-                eta = eta_from_work(str(run, "status_commented_at", ""),
-                                    flt(run, "status_work_done", -1.0),
-                                    work_done, remaining, now)
-            end
-            # whole seconds: string(::Float64) can go scientific, which DynamoDB's
-            # number grammar does not accept
-            snapshot = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-                       "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}," *
-                       "\"UpdateExpression\":\"SET status_work_done = :w\"," *
-                       "\"ExpressionAttributeValues\":{\":w\":{\"N\":\"$(round(Int, work_done))\"}}}"
-            ddb(ctx, "UpdateItem", snapshot)
-        end
         body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
                                    status, completed, total, now, eta)
         update_comment(gh, something(context.repo), comment_id, body)

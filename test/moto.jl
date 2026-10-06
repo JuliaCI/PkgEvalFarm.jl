@@ -854,6 +854,11 @@ try
                     @test wip["run"]["done_jobs"] == 1
                     @test haskey(wip["run"], "as_of")
                     @test length(wip["pkgs"]) <= 1   # only terminal jobs appear
+                    # the tick stores its work snapshot on the run; with no earlier
+                    # snapshot to measure a rate from, there is no ETA yet
+                    ticked = PEF.get_run(ctx, run_id)
+                    @test haskey(ticked, "status_work_done")
+                    @test !haskey(ticked, "eta_at")
                 end
             end
             @test PEF.get_run(ctx, run_id)["status"] == "done"

@@ -25,7 +25,7 @@
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
   credentials from the Cognito identity pool in IDENTITY_POOL below with
   GetId + GetCredentialsForIdentity, then Scan/GetItem — live runs carry
-  status/completed_jobs/total_jobs/updated_at, plus `waiting` (the Julia
+  status/completed_jobs/total_jobs/updated_at and the bot's hourly `eta_at`, plus `waiting` (the Julia
   builds a stalled run is blocked on CI producing, keyed by config name,
   each with sha/variant and the Buildkite url) and `seal_runs` (per
   config, the id of the shared `seal-*` run item — same table — whose
@@ -1252,8 +1252,18 @@ async function dashboard(params) {
           }
           const ago = tick
             ? Math.round((Date.now() - Date.parse(tick)) / 60000) : null;
-          gauge = `<span class="n">${done} of ${total} jobs${
-              phase ? " · " + phase : ""}${esc(
+          // the bot's hourly estimate, left out once it is more than 90 minutes
+          // old (the bot is behind) or already past
+          let eta = "";
+          const etaAt = r.eta_at ? Date.parse(r.eta_at) : NaN;
+          const etaFrom = r.status_commented_at ? Date.parse(r.status_commented_at) : NaN;
+          if (!phase && etaAt > Date.now() && Date.now() - etaFrom < 90 * 60000) {
+            const mins = Math.round((etaAt - Date.now()) / 60000);
+            const left = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
+            eta = ` · about ${left} left`;
+          }
+          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(r.eta_at) : ""}">${done} of ${total} jobs${
+              phase ? " · " + phase : ""}${esc(eta)}${esc(
               ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
             }</span><span class="bar"><i style="width:${
               Math.min(100, Math.round(done / total * 100))}%"></i></span>`;
