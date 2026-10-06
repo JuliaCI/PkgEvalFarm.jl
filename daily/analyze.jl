@@ -71,21 +71,42 @@ end
 
 package_version(test) = test["version"] === nothing ? nothing : tryparse(VersionNumber, test["version"])
 
+function status_counts(daily)
+    counts = Dict(s => 0 for s in STATUSES)
+    for test in values(daily.tests)
+        status = test["status"]
+        counts[status in STATUSES ? status : "fail"] += 1
+    end
+    return counts
+end
+
+# Days that look like infrastructure trouble rather than Julia's doing: far fewer packages
+# passed than on the week of dailies before, or far fewer were evaluated. Nanosoldier's
+# chart instead flagged any day where under half the packages passed, which on master has
+# been most days since 2025 (its normal pass rate is about 48%).
+function fluke_days(dailies; window=7, min_pass_ratio=0.8)
+    counts = status_counts.(dailies)
+    passed = [c["test"] for c in counts]
+    totals = [sum(values(c)) for c in counts]
+    return map(eachindex(dailies)) do i
+        passed[i] < 0.2 * totals[i] && return true
+        prev = max(1, i - window):i-1
+        isempty(prev) && return false
+        return passed[i] < min_pass_ratio * median(passed[prev]) ||
+               totals[i] < median(totals[prev]) - 100
+    end
+end
+
+median(xs) = (s = sort(xs); n = length(s); isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
+
 function index_entries(dailies)
+    flukes = fluke_days(dailies)
     entries = Dict{String,Any}[]
-    kept_total = nothing
     for (i, daily) in enumerate(dailies)
-        counts = Dict(s => 0 for s in STATUSES)
-        for test in values(daily.tests)
-            status = test["status"]
-            counts[status in STATUSES ? status : "fail"] += 1
-        end
+        counts = status_counts(daily)
         total = sum(values(counts))
-        # Nanosoldier's chart skipped days that look like infrastructure trouble rather
-        # than Julia's doing, except the newest so the chart stays current
-        outlier = i < length(dailies) &&
-            (counts["test"] < 0.5 * total || (kept_total !== nothing && total < kept_total - 100))
-        outlier || (kept_total = total)
+        # the newest day is always drawn, so the chart stays current
+        outlier = flukes[i] && i < length(dailies)
         push!(entries, Dict("date" => string(daily.date), "run" => daily.run, "sha" => daily.sha,
                             "version" => daily.version, "counts" => counts, "total" => total,
                             "outlier" => outlier,
@@ -171,12 +192,17 @@ end
 
 # Packages whose latest version failed at least 75% of at least 5 tests in the last 30 days.
 # PR runs only install and load these, since their failures say little about the PR.
-function unreliable_packages(dailies; window=Day(30), min_tests=5, min_failure_ratio=0.75)
-    since = Date(now(UTC)) - window
+# Fluke days and skips are left out: neither says anything about the package. (Nanosoldier
+# counted both, so its list also held every package skipped as uninstallable or untestable.)
+function unreliable_packages(dailies; window=Day(30), min_tests=5, min_failure_ratio=0.75,
+                             today=Date(now(UTC)))
+    since = today - window
+    flukes = fluke_days(dailies)
     history = Dict{String,Vector{Tuple{Union{Nothing,VersionNumber},Bool}}}()
-    for daily in dailies
-        daily.date >= since || continue
+    for (daily, fluke) in zip(dailies, flukes)
+        daily.date >= since && !fluke || continue
         for (pkg, test) in daily.tests
+            test["status"] == "skip" && continue
             push!(get!(history, pkg, Tuple{Union{Nothing,VersionNumber},Bool}[]),
                   (package_version(test), test["status"] != "test"))
         end
