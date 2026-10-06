@@ -429,6 +429,154 @@ function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::Str
 end
 
 
+## daily runs
+#
+# The replacement for Nanosoldier's daily PkgEval: once a day, test the current julia
+# master against the previous daily's master commit. Both sides use the same configuration
+# as PR runs, so finished dailies donate baseline results to the next one. The hourly poll
+# submits the day's run, so a failed attempt is retried an hour later. Finished dailies
+# publish a summary that the site's analysis (and perf.julialang.org) read.
+
+const DAILY_REPO = "JuliaLang/julia"
+const DAILY_HOUR = 10  # UTC
+
+daily_run_id(day::Date) = "daily-" * Dates.format(day, dateformat"yyyy-mm-dd")
+is_daily(run_id::String) = startswith(run_id, "daily-")
+
+function find_run(ctx::LiteCtx, run_id::String)
+    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
+              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}}"
+    return parse_json(ddb(ctx, "GetItem", payload), ItemResp).Item
+end
+
+function primary_julia(run::Item)
+    for c in parse_json(str(run, "configs", "[]"), Vector{ConfigInfo})
+        something(c.name, "") == "primary" && c.julia !== nothing && return something(c.julia)
+    end
+    return nothing
+end
+
+"""
+The primary Julia spec of the most recent daily before `day`, looking back up to 30 days:
+of a finished one with `done_only`, otherwise of any that didn't fail.
+"""
+function previous_daily_julia(ctx::LiteCtx, day::Date; done_only::Bool=true)
+    for back in 1:30
+        found = find_run(ctx, daily_run_id(day - Day(back)))
+        found === nothing && continue
+        run = something(found)
+        status = str(run, "status", "")
+        (done_only ? status == "done" : status != "failed") || continue
+        julia = primary_julia(run)
+        julia === nothing || return julia
+    end
+    return nothing
+end
+
+"""
+    submit_daily(ctx, gh; day) -> created::Bool
+
+Submit the daily run for `day` (UTC). The run id is derived from the date, so a repeated
+trigger on the same day does not submit a second run. Nothing is submitted while master is
+still at the commit of the previous daily, even one that is still running. The comparison
+is with the previous finished daily, whose results become the baseline; without one,
+master runs alone.
+"""
+function submit_daily(ctx::LiteCtx, gh::GitHubCtx; day::Date=Date(Dates.now(UTC)))
+    primary = pin_commit(gh, DAILY_REPO * "#master")
+    occursin(r"#[0-9a-f]{40}$", primary) ||
+        error("could not resolve " * DAILY_REPO * " master to a commit")
+    if previous_daily_julia(ctx, day; done_only=false) == primary
+        @info "daily run skipped: master has not moved" primary
+        return false
+    end
+    against = previous_daily_julia(ctx, day)
+    configs = config_json("primary", primary; assertions=true)
+    against === nothing || (configs *= "," * config_json("against", something(against); assertions=true))
+    run_id = daily_run_id(day)
+    created = create_run(ctx; run_id, configs_json="[" * configs * "]", packages=String[],
+                         context_json="{\"daily\":" * JSON.json(Dates.format(day, dateformat"yyyy-mm-dd")) * "}",
+                         submitter="daily")
+    @info "daily run" run_id created primary against
+    return created
+end
+
+"""
+Submit today's daily from the hourly poll once it is due and not yet submitted. A run
+still waiting to be expanded gets its expand message again, in case the submission died
+between creating the run and sending it (duplicates are harmless).
+"""
+function maybe_submit_daily(ctx::LiteCtx, gh::GitHubCtx; now::DateTime=Dates.now(UTC))
+    Dates.hour(now) >= DAILY_HOUR || return false
+    day = Date(now)
+    run_id = daily_run_id(day)
+    found = find_run(ctx, run_id)
+    if found !== nothing
+        if str(something(found), "status", "") == "expanding"
+            sqs_send_message(ctx, "{\"run_id\":" * JSON.json(run_id) * ",\"expand\":true}";
+                             queue_url=FarmLite.slow_queue(ctx))
+        end
+        return false
+    end
+    return submit_daily(ctx, gh; day)
+end
+
+"Publish the summaries of the past week's finished dailies that don't have one yet."
+function publish_missing_daily_summaries(ctx::LiteCtx; now::DateTime=Dates.now(UTC))
+    for back in 0:7
+        found = find_run(ctx, daily_run_id(Date(now) - Day(back)))
+        found === nothing && continue
+        run = something(found)
+        str(run, "status", "") == "done" && !haskey(run, "daily_published") || continue
+        publish_daily_summary(ctx, run)
+    end
+end
+
+# Nanosoldier's status names, which perf.julialang.org and older tooling count by
+nanosoldier_status(status::String) =
+    status == "load" ? "test" : status == "error" ? "fail" : status
+
+"""
+Publish a finished daily's primary results as `daily.json` next to its report, in the
+shape of the `db.json` Nanosoldier wrote for its dailies: `date`, `build` and per-package
+`tests`. The Julia version is left to the readers, which can look it up by commit. The
+run is then marked, so the hourly poll can publish summaries that failed here.
+"""
+function publish_daily_summary(ctx::LiteCtx, run::Item;
+                               jobs::Vector{Item}=run_jobs(ctx, str(run, "run_id")))
+    run_id = str(run, "run_id")
+    julia = something(primary_julia(run), "#")
+    repo, sha = String(split(julia, '#')[1]), String(split(julia, '#')[end])
+    io = IOBuffer()
+    print(io, "{\"date\":", JSON.json(String(chop(run_id; head=length("daily-"), tail=0))),
+          ",\"run\":", JSON.json(run_id),
+          ",\"build\":{\"repo\":", JSON.json(repo), ",\"sha\":", JSON.json(sha), ",\"version\":null}",
+          ",\"tests\":{")
+    first_entry = true
+    for job in jobs
+        str(job, "config", "") == "primary" || continue
+        status = str(job, "status", "")
+        status in TERMINAL_STATUSES || continue
+        first_entry || print(io, ",")
+        first_entry = false
+        reason = opt_str(job, "reason")
+        version = opt_str(job, "version")
+        print(io, JSON.json(str(job, "package")), ":{\"status\":", JSON.json(nanosoldier_status(status)),
+              ",\"reason\":", reason === nothing ? "null" : JSON.json(something(reason)),
+              ",\"duration\":", string(flt(job, "duration", 0.0)),
+              ",\"version\":", version === nothing ? "null" : JSON.json(something(version)), "}")
+    end
+    print(io, "}}")
+    s3_put(ctx, report_key(run_id, "daily.json"), String(take!(io)); content_type="application/json")
+    mark = "{\"TableName\":" * JSON.json(ctx.runs_table) * "," *
+           "\"Key\":{\"run_id\":{\"S\":" * JSON.json(run_id) * "}}," *
+           "\"UpdateExpression\":\"SET daily_published = :t\"," *
+           "\"ExpressionAttributeValues\":{\":t\":{\"BOOL\":true}}}"
+    ddb(ctx, "UpdateItem", mark)
+    return nothing
+end
+
+
 ## polling GitHub for commands
 
 # Secrets come from SSM SecureString parameters when *_PARAM names one (the
@@ -979,6 +1127,13 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     end
 
     report = generate_report(ctx, run_id; run)
+    if is_daily(run_id)
+        try
+            publish_daily_summary(ctx, run; jobs=report.jobs)
+        catch err
+            @error "failed to publish the daily summary; the next poll retries" run_id msg=error_message(err)
+        end
+    end
     # annotate the run item with the two scalars the dashboard's verdict chips
     # need, so it can render them straight off its Scan instead of fetching
     # report.json per run; best-effort — without it the page falls back to the
@@ -1465,7 +1620,7 @@ function dollars(x::Float64)
 end
 
 """
-    generate_report(ctx, run_id) -> (; summary, markdown, url, cost, cost_partial, new_fails)
+    generate_report(ctx, run_id) -> (; summary, markdown, url, cost, cost_partial, new_fails, jobs)
 
 Aggregate all job results into a markdown comparison report + `db.json`, uploaded to
 `runs/<run_id>/report/` in S3. `new_fails` counts the packages the dashboard's
@@ -1609,7 +1764,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
            report_json(ctx, run, jobs, configs, total_cost, nmetered < nran);
            content_type="application/json")
     return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
-            cost_partial=(nmetered < nran), new_fails)
+            cost_partial=(nmetered < nran), new_fails, jobs)
 end
 
 ## compact per-package dataset rendered by the report page
@@ -1944,8 +2099,20 @@ end
 
 ## entry points
 
-"One poll iteration: handle new commands, report finished runs, edit progress."
+"One poll iteration: the daily run, then new commands, finished runs and progress edits."
 function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
+    # first, so that a failure in the steps below can't hold up the daily run;
+    # anything that fails here is retried by the next poll
+    try
+        maybe_submit_daily(ctx, gh)
+    catch err
+        @error "failed to submit the daily run" msg=error_message(err)
+    end
+    try
+        publish_missing_daily_summaries(ctx)
+    catch err
+        @error "failed to publish daily summaries" msg=error_message(err)
+    end
     name = bot_name()
     poll_mentions(ctx, gh, name)
     # heal finished-but-stuck runs first, so check_finished_runs can report
@@ -2012,6 +2179,7 @@ struct TopEvent
     body::Union{Nothing,String}
     is_base64::Bool
     canary::Union{Nothing,String}       # direct invoke: forensic parse of this run
+    daily::Bool                         # the daily EventBridge rule: submit the daily run
 end
 
 function json_make(::Type{GhRepoFull}, x::LazyVal)
@@ -2056,6 +2224,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
     body = Ref{Union{Nothing,String}}(nothing)
     is_base64 = Ref(false)
     canary = Ref{Union{Nothing,String}}(nothing)
+    daily = Ref(false)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         # NB: locals in the nested closures carry unique names — reusing an outer
@@ -2110,10 +2279,13 @@ function json_make(::Type{TopEvent}, x::LazyVal)
             cs, cp = json_string(v); canary[] = cs; return cp
         elseif k == "isBase64Encoded"
             b, p = json_bool(v); is_base64[] = b; return p
+        elseif k == "daily"
+            db, dp = json_bool(v); daily[] = db; return dp
         end
         return nothing
     end
-    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[]),
+    return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[],
+                    daily[]),
            pos::Int
 end
 
@@ -2154,8 +2326,8 @@ end
 """
     handle_event(event_body::String, ctx=ctx_from_env(), gh=bot_gh()) -> String
 
-Dispatch one Lambda invocation: webhook delivery, DynamoDB stream batch, or the
-scheduled fallback poll. Returns the response JSON.
+Dispatch one Lambda invocation: webhook delivery, DynamoDB stream batch, the daily
+schedule, or the scheduled fallback poll. Returns the response JSON.
 """
 function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
                       gh::GitHubCtx=bot_gh())
@@ -2166,6 +2338,10 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         jobs = run_jobs(ctx, something(event.canary))
         @info "forensic canary parse survived" n=length(jobs)
         return "{\"ok\":true,\"jobs\":" * string(length(jobs)) * "}"
+    end
+    if event.daily
+        created = submit_daily(ctx, gh)
+        return "{\"ok\":true,\"created\":" * string(created) * "}"
     end
     if !isempty(event.dead_bodies)
         # the jobs DLQ: messages the queue gave up on become recorded results,

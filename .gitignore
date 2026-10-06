@@ -13,3 +13,5 @@ buildreq/build/bootstrap.zip
 buildreq/Manifest.toml
 sysimage/build/
 .simtmp/
+daily/.cache/
+site/daily/

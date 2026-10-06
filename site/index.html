@@ -46,6 +46,12 @@
     --surface-2: #f4f2f7;
     --qviz-1: #2a78d6;
     --qviz-2: #eb6834;
+    /* daily outcome bands, in stacking order; validated as a set in both modes */
+    --dv-test: #008300;
+    --dv-skip: #2a78d6;
+    --dv-fail: #eb6834;
+    --dv-kill: #4a3aa7;
+    --dv-crash: #b3261e;
     --ink: #1c1a21;
     --ink-2: #5b5766;
     --ink-3: #8d8896;
@@ -80,6 +86,11 @@
       --surface-2: #242029;
       --qviz-1: #3987e5;
       --qviz-2: #d95926;
+      --dv-test: #2f9e44;
+      --dv-skip: #3987e5;
+      --dv-fail: #d95926;
+      --dv-kill: #7b6ad6;
+      --dv-crash: #e05e5e;
       --ink: #f0eef4;
       --ink-2: #b5b0c0;
       --ink-3: #7f7a8a;
@@ -486,6 +497,27 @@
   }
   .runidx-prog .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
 
+  .dchart { margin: 8px 0 0; position: relative; }
+  .dchart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .dchart .axis { font-size: 11px; fill: var(--ink-3); }
+  .dchart .grid { stroke: var(--hairline); stroke-width: 1; }
+  .dchart .base { stroke: var(--hairline-2); stroke-width: 1; stroke-dasharray: 4 3; }
+  .dchart .cross { stroke: var(--ink-3); stroke-width: 1; }
+  .dtip {
+    position: absolute; pointer-events: none; z-index: 2; min-width: 150px;
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
+    box-shadow: var(--shadow); padding: 8px 10px; font-size: 12px; color: var(--ink);
+  }
+  .dtip .row { display: flex; align-items: center; gap: 6px; color: var(--ink-2); }
+  .dtip .row b { margin-left: auto; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .dtip i, .qviz-legend i.sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
+  .dtable { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .dtable th, .dtable td { padding: 4px 8px; border-bottom: 1px solid var(--hairline); text-align: right; white-space: nowrap; }
+  .dtable th:first-child, .dtable td:first-child, .dtable td.l { text-align: left; }
+  .dtable tr.outlier td { color: var(--ink-3); }
+  .dtable-wrap { overflow-x: auto; }
+  .unrel { columns: 3 14em; font-size: 12.5px; margin: 8px 0 0; padding: 0; list-style: none; }
+
   footer {
     margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--hairline);
     color: var(--ink-3); font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 4px 20px;
@@ -508,13 +540,41 @@
     <section class="block">
       <h2>Recent runs <span class="n" id="runidx-n"></span></h2>
       <p class="lede">Reports published by this farm, newest first. Open one, or link a report
-        directly as <span class="mono" style="white-space: nowrap">?run=&lt;run id&gt;</span>.</p>
+        directly as <span class="mono" style="white-space: nowrap">?run=&lt;run id&gt;</span>.
+        The <a href="?daily" target="_self">daily evaluation</a> of julia master has its own page.</p>
       <div class="runidx-rows" id="runidx-rows"></div>
     </section>
     <!-- zero API calls unless a human opens it -->
     <details class="block qdebug" id="qdebug">
       <summary>Queue depths (debug)</summary>
       <div class="mono" id="qdebug-body">…</div>
+    </details>
+  </div>
+  <div id="daily" hidden>
+    <section class="block">
+      <h2>Daily evaluation of julia master</h2>
+      <p class="lede" id="daily-lede"></p>
+      <figure class="dchart" id="daily-outcomes" aria-label="Packages by outcome per daily run"></figure>
+    </section>
+    <section class="block">
+      <h2>Success rate</h2>
+      <figure class="dchart" id="daily-rate" aria-label="Share of packages whose tests passed per daily run"></figure>
+    </section>
+    <section class="block">
+      <h2>Package test time</h2>
+      <p class="lede">Total test time of passing packages relative to the newest daily, so 1.1 means
+        10% slower than today. <b>Same versions</b> compares only the package versions the newest
+        daily tested; <b>all versions</b> also chains in versions tested on earlier dailies.</p>
+      <figure class="dchart" id="daily-time" aria-label="Relative package test time per daily run"></figure>
+    </section>
+    <section class="block">
+      <h2>Unreliable packages <span class="n" id="daily-unrel-n"></span></h2>
+      <p class="lede" id="daily-unrel-lede"></p>
+      <ul class="unrel mono" id="daily-unrel"></ul>
+    </section>
+    <details class="block">
+      <summary>Data table</summary>
+      <div class="dtable-wrap" id="daily-table"></div>
     </details>
   </div>
   <div id="app" hidden>
@@ -615,6 +675,7 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   const runId = params.get("run");
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
+  if (params.has("daily")) return dailyView();
   if (!runId) return dashboard(params);
   const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
   try {
@@ -785,6 +846,188 @@ function ddbClient(params) {
       return out;
     },
   };
+}
+
+// ---- ?daily: the daily evaluation of julia master ---------------------------
+// The data is daily/*.json next to this page, which the Pages build derives from
+// the daily runs (daily/analyze.jl). These are the charts Nanosoldier published for
+// its dailies, without the second y-axis: the success rate has its own chart.
+async function dailyView() {
+  const esc = escHtml;
+  const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
+  $("runid").textContent = "daily";
+  let index, perf, unrel;
+  try {
+    [index, perf, unrel] = await Promise.all(
+      ["index", "performance", "unreliable"].map((f) => fetchJson(`daily/${f}.json`)));
+  } catch (err) {
+    $("loadstate").innerHTML = `Could not load the daily data (${esc(err.message)}).` + back;
+    return;
+  }
+  if (!index.length) {
+    $("loadstate").innerHTML = "No daily run has finished yet." + back;
+    return;
+  }
+  $("loadstate").hidden = true;
+  $("daily").hidden = false;
+
+  const fmtN = (n) => n.toLocaleString("en-US");
+  const pct = (x) => (100 * x).toFixed(1) + "%";
+  const latest = index[index.length - 1];
+  const rate = (e) => e.counts.test / e.total;
+  $("daily-lede").innerHTML =
+    `Newest: <b>${esc(latest.date)}</b>, julia ${esc(latest.version || "?")} at ` +
+    `<a class="mono" href="https://github.com/JuliaLang/julia/commit/${esc(latest.sha)}">` +
+    `${esc(latest.sha.slice(0, 10))}</a>: ${fmtN(latest.total)} packages, ${pct(rate(latest))} passed ` +
+    `(<a href="?run=${encodeURIComponent(latest.run)}" target="_self">report</a>).`;
+
+  // like Nanosoldier's chart, leave out days that look like infrastructure trouble
+  const kept = index.filter((e) => !e.outlier);
+  const outcomes = [
+    ["test", "success"], ["skip", "skip"], ["fail", "failure"], ["kill", "kill"], ["crash", "crash"],
+  ];
+  timeChart($("daily-outcomes"), {
+    dates: kept.map((e) => e.date), stacked: true, yFormat: fmtN,
+    series: outcomes.map(([k, label]) => ({
+      label, color: `var(--dv-${k})`, values: kept.map((e) => e.counts[k]) })),
+  });
+  timeChart($("daily-rate"), {
+    dates: kept.map((e) => e.date), yMin: 0, yMax: 1, yFormat: (y) => Math.round(100 * y) + "%",
+    valueFormat: pct,
+    series: [{ label: "success rate", color: "var(--accent)", values: kept.map(rate) }],
+  });
+  const timed = perf.filter((p) => p.simple !== null || p.full !== null);
+  timeChart($("daily-time"), {
+    dates: timed.map((p) => p.date), baseline: 1, yFormat: (y) => y.toFixed(2),
+    series: [
+      { label: "same versions", color: "var(--qviz-1)", values: timed.map((p) => p.simple) },
+      { label: "all versions", color: "var(--qviz-2)", values: timed.map((p) => p.full) },
+    ],
+  });
+
+  $("daily-unrel-n").textContent = unrel.unreliable.length;
+  $("daily-unrel-lede").innerHTML =
+    `Packages whose latest version failed at least ${Math.round(100 * unrel.min_failure_ratio)}% ` +
+    `of at least ${unrel.min_tests} dailies in the last ${unrel.window_days} days. ` +
+    `PR runs only install and load these, since their failures say little about the change being tested.`;
+  $("daily-unrel").innerHTML = unrel.unreliable.map((p) => `<li>${esc(p)}</li>`).join("");
+
+  const perfBy = new Map(perf.map((p) => [p.date, p]));
+  const ratio = (x) => x === null || x === undefined ? "" : x.toFixed(3);
+  $("daily-table").innerHTML = `<table class="dtable"><thead><tr>
+      <th>date</th><th>commit</th><th>julia</th>${outcomes.map(([, l]) => `<th>${l}</th>`).join("")}
+      <th>total</th><th>success rate</th><th>time (same versions)</th><th>time (all versions)</th><th></th>
+    </tr></thead><tbody>${index.slice().reverse().map((e) => `
+      <tr class="${e.outlier ? "outlier" : ""}" title="${e.outlier ? "left out of the charts" : ""}">
+        <td>${esc(e.date)}</td>
+        <td class="l mono"><a href="https://github.com/JuliaLang/julia/commit/${esc(e.sha)}">${esc(e.sha.slice(0, 10))}</a></td>
+        <td class="l">${esc(e.version || "")}</td>
+        ${outcomes.map(([k]) => `<td>${fmtN(e.counts[k])}</td>`).join("")}
+        <td>${fmtN(e.total)}</td><td>${pct(rate(e))}</td>
+        <td>${ratio(perfBy.get(e.date)?.simple)}</td><td>${ratio(perfBy.get(e.date)?.full)}</td>
+        <td><a href="?run=${encodeURIComponent(e.run)}" target="_self">report</a></td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+// A time-series chart of one or more series over dates (YYYY-MM-DD), as lines or as
+// stacked areas, with a legend carrying each series' newest value and a hover crosshair.
+// `null` values leave a gap in lines.
+function timeChart(el, { dates, series, stacked = false, yMin, yMax, baseline, yFormat, valueFormat }) {
+  const esc = escHtml;
+  const fmtV = valueFormat || yFormat;
+  // drawn at the container's width, so the text stays legible on phones
+  const W = Math.max(300, Math.round(el.clientWidth || 760)), H = 240, L = 56, R = 12, T = 10, B = 24;
+  const t = dates.map((d) => Date.parse(d + "T00:00:00Z"));
+  const n = t.length;
+  const tops = stacked
+    ? t.map((_, i) => series.reduce((s, ser) => s + (ser.values[i] || 0), 0))
+    : series.flatMap((s) => s.values.filter((v) => v !== null && v !== undefined));
+  let lo = yMin ?? (stacked ? 0 : Math.min(...tops, baseline ?? Infinity));
+  let hi = yMax ?? Math.max(...tops, baseline ?? -Infinity);
+  if (!(hi > lo)) { lo -= 0.5; hi += 0.5; }
+  if (yMax === undefined) hi += (hi - lo) * 0.05;
+  if (yMin === undefined && !stacked) lo -= (hi - lo) * 0.05;
+  const x = (i) => n < 2 ? L + (W - L - R) / 2 : L + (W - L - R) * (t[i] - t[0]) / (t[n - 1] - t[0]);
+  const y = (v) => T + (H - T - B) * (1 - (v - lo) / (hi - lo));
+
+  const step = niceStep((hi - lo) / 4);
+  let grid = "";
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) {
+    grid += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+      `<text class="axis" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${esc(yFormat(v))}</text>`;
+  }
+  const labelEvery = Math.max(1, Math.ceil(n / Math.max(2, Math.floor((W - L - R) / 90))));
+  let xaxis = "";
+  for (let i = 0; i < n; i += labelEvery) {
+    xaxis += `<text class="axis" x="${x(i)}" y="${H - 6}" text-anchor="middle">${esc(dates[i].slice(5))}</text>`;
+  }
+
+  let marks = "";
+  if (stacked) {
+    const lower = t.map(() => 0);
+    for (const s of series) {
+      const upper = lower.map((b, i) => b + (s.values[i] || 0));
+      const pts = [...upper.map((v, i) => `${x(i)},${y(v)}`),
+                   ...lower.map((v, i) => `${x(i)},${y(v)}`).reverse()];
+      // the surface-colored stroke is the 2px gap between bands
+      marks += n < 2
+        ? `<rect x="${x(0) - 6}" y="${y(upper[0])}" width="12" height="${y(lower[0]) - y(upper[0])}" fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`
+        : `<polygon points="${pts.join(" ")}" fill="${s.color}" fill-opacity="0.85" stroke="var(--surface)" stroke-width="2" stroke-linejoin="round"/>`;
+      upper.forEach((v, i) => { lower[i] = v; });
+    }
+  } else {
+    const has = (v) => v !== null && v !== undefined;
+    for (const s of series) {
+      let d = "", pen = false;
+      s.values.forEach((v, i) => {
+        if (!has(v)) { pen = false; return; }
+        d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1) + " ";
+        pen = true;
+        // a point with no neighbour draws no line, so it gets a dot
+        if (!has(s.values[i - 1]) && !has(s.values[i + 1])) {
+          marks += `<circle cx="${x(i)}" cy="${y(v)}" r="4" fill="${s.color}" stroke="var(--surface)" stroke-width="2"/>`;
+        }
+      });
+      marks += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
+  }
+  const base = baseline === undefined ? "" :
+    `<line class="base" x1="${L}" x2="${W - R}" y1="${y(baseline)}" y2="${y(baseline)}"/>`;
+
+  const last = (s) => { for (let i = n - 1; i >= 0; i--) if (s.values[i] !== null && s.values[i] !== undefined) return s.values[i]; return null; };
+  const legend = series.length < 2 ? "" : `<div class="qviz-legend">` + series.map((s) =>
+    `<span><i class="sw" style="background:${s.color}"></i>${esc(s.label)}` +
+    (last(s) === null ? "" : `: ${esc(fmtV(last(s)))}`) + `</span>`).join("") + `</div>`;
+  el.innerHTML = legend +
+    `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${base}${marks}${xaxis}` +
+    `<line class="cross" y1="${T}" y2="${H - B}" visibility="hidden"/>` +
+    `<rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent"/></svg>` +
+    `<div class="dtip" hidden></div>`;
+
+  const svg = el.querySelector("svg"), cross = el.querySelector(".cross"), tip = el.querySelector(".dtip");
+  const hover = (ev) => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * W / box.width;
+    let best = 0;
+    for (let i = 1; i < n; i++) if (Math.abs(x(i) - px) < Math.abs(x(best) - px)) best = i;
+    cross.setAttribute("x1", x(best)); cross.setAttribute("x2", x(best));
+    cross.setAttribute("visibility", "visible");
+    tip.innerHTML = `<div><b>${esc(dates[best])}</b></div>` + series.slice().reverse().map((s) =>
+      `<div class="row"><i style="background:${s.color}"></i>${esc(s.label)}` +
+      `<b>${s.values[best] === null || s.values[best] === undefined ? "–" : esc(fmtV(s.values[best]))}</b></div>`).join("");
+    tip.hidden = false;
+    const left = x(best) * box.width / W;
+    tip.style.left = Math.min(left + 12, box.width - tip.offsetWidth) + "px";
+    tip.style.top = (el.querySelector(".qviz-legend")?.offsetHeight || 0) + 8 + "px";
+  };
+  svg.addEventListener("pointermove", hover);
+  svg.addEventListener("pointerleave", () => { tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+}
+
+function niceStep(raw) {
+  const mag = 10 ** Math.floor(Math.log10(raw || 1));
+  const f = raw / mag;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * mag;
 }
 
 // ---- landing page: the farm dashboard -------------------------------------
