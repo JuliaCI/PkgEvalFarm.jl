@@ -187,7 +187,8 @@ existing baseline looks flaky.
 
 Returns `(config_name, donor_run_ids, Dict(package => donor job item))`, with an
 empty dict when there is nothing to reuse. Infrastructure failures ("error")
-are never reused; real results (including fail/crash/kill) are.
+are never reused, nor are load-only results ("load"), which can't stand in for a
+test; real results (including fail/crash/kill) are.
 """
 function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String},
                              completed::Vector{<:Tuple}=completed_runs(ctx);
@@ -221,7 +222,7 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
             pkg = String(job["package"])
             pkg in wanted && !haskey(results, pkg) || continue
             status = get(job, "status", "")
-            status in TERMINAL_STATUSES && status != "error" || continue
+            status in TERMINAL_STATUSES && status != "error" && status != "load" || continue
             results[pkg] = job
             found = true
         end
@@ -318,7 +319,10 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
     # baseline reuse: against-side jobs with a matching prior result are written
     # pre-completed (pointing at the donor's log) and never enqueued
     reuse_cfg, donor_ids, reused_results = baseline_reuse_plan(ctx, run, packages, completed)
-    reused = [j for j in jobs if j.config == reuse_cfg && haskey(reused_results, j.package)]
+    # unreliable packages are only loaded on both sides, so a donor's full test result
+    # wouldn't compare like with like
+    reused = [j for j in jobs if j.config == reuse_cfg && haskey(reused_results, j.package) &&
+                                 !(j.package in run["unreliable"])]
     fresh = setdiff(jobs, reused)
     isempty(reused) || @info "reusing baseline results" run_id donor_ids n=length(reused)
 
@@ -828,6 +832,7 @@ function get_run(ctx::FarmCtx, run_id::AbstractString)
     run["configs"] = JSON.parse(run["configs"])
     run["context"] = JSON.parse(run["context"])
     run["packages"] = JSON.parse(get(run, "packages", "[]"))
+    run["unreliable"] = Set{String}(JSON.parse(get(run, "unreliable", "[]")))
     return run
 end
 

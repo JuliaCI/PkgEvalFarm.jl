@@ -584,6 +584,24 @@ try
         @test used1 == ["reuse-subset"] && collect(keys(results1)) == ["Alpha"]
     end
 
+    @testset "load-only results are not reused" begin
+        # a PR run only loads unreliable packages; that can't be another run's tested baseline
+        julia = "JuliaLang/julia#" * "d"^40
+        for (pkg, status) in (("Loaded", "load"), ("Tested", "test"))
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                "run_id" => "load-donor", "job_key" => "primary#$pkg", "config" => "primary",
+                "package" => pkg, "status" => status, "duration" => 1.0)),
+                cfg.jobs_table; aws_config=aws)
+        end
+        donor_cfg = Any[Dict{String,Any}("name" => "primary", "julia" => julia, "buildflags" => Any[])]
+        run = Dict{String,Any}("run_id" => "load-taker", "reuse" => true, "configs" => Any[
+            Dict{String,Any}("name" => "primary", "julia" => "JuliaLang/julia#" * "e"^40, "buildflags" => Any[]),
+            Dict{String,Any}("name" => "against", "julia" => julia, "buildflags" => Any[])])
+        _, _, results = PEF.baseline_reuse_plan(ctx, run, ["Loaded", "Tested"],
+                                                [("2026-03-01T00:00:00Z", "load-donor", donor_cfg, 2)])
+        @test collect(keys(results)) == ["Tested"]
+    end
+
     @testset "submitter requirement parsing" begin
         # "TEAM" gates on a GITHUB_ORG team; "ORG/TEAM" carries its own org
         # (matching the broker's spec format); "" is plain org membership
@@ -696,6 +714,23 @@ try
             @test PEF.FarmBot.resolve_vs("other/repo#branch", "JuliaLang/julia") == "other/repo#branch"
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#1.9.9") == "JuliaLang/julia#$pin_sha"
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#nosuchref") == "JuliaLang/julia#nosuchref"
+
+            # PR runs carry the published unreliable-package list; without one they still run
+            TestHTTP.register!(router, "GET", "/daily/unreliable.json",
+                req -> TestHTTP.Response(200, JSON.json(Dict(
+                    "generated" => "2026-10-05T00:00:00", "unreliable" => ["Flaky", "Flakier"]))))
+            withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/daily/unreliable.json") do
+                @test PEF.FarmBot.fetch_unreliable() == ["Flaky", "Flakier"]
+            end
+            withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/no/such/list.json") do
+                @test PEF.FarmBot.fetch_unreliable() == String[]
+            end
+            @test PEF.FarmBot.create_run(lite; run_id="unreliable-run", packages=String[],
+                configs_json="[" * PEF.FarmBot.config_json("primary", "JuliaLang/julia#" * "c"^40; assertions=true) * "]",
+                context_json="{}", submitter="tester", unreliable=["Flaky"])
+            @test PEF.get_run(ctx, "unreliable-run")["unreliable"] == Set(["Flaky"])
+            @test PEF.get_run(ctx, RUN_ID)["unreliable"] == Set{String}()  # older runs carry none
+            Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => "unreliable-run")), cfg.runs_table; aws_config=aws)
 
             # 1. a mention arrives -> bot submits a run and acks
             notifications[] = JSON.json([Dict(
