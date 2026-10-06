@@ -14,7 +14,47 @@ want(name) = isempty(TEST_ONLY) || TEST_ONLY == name
 
 include("motohelpers.jl")
 
+module DailyAnalysis
+include(joinpath(@__DIR__, "..", "daily", "analyze.jl"))
+end
+
 @testset "PkgEvalFarm" begin
+
+@testset "daily analysis" begin
+    DA = DailyAnalysis
+    day(i, statuses) = DA.Daily(Date(2026, 10, 1) + Day(i), "daily-$i", "sha$i", "1.14.0-DEV",
+        Dict{String,Any}(pkg => Dict{String,Any}("status" => st, "version" => "1.0.0",
+                                                 "duration" => 1.0)
+                         for (pkg, st) in statuses))
+    normal(i) = day(i, [["P$k" => "test" for k in 1:10]; "Bad" => "fail"; "Skipped" => "skip"])
+
+    @testset "fluke days" begin
+        # a day where almost nothing passed is a fluke; ordinary days are not, even
+        # though the pass rate stays far below the 50% Nanosoldier's chart required
+        dailies = [normal.(1:8); day(9, [["P$k" => "fail" for k in 1:10]; "Bad" => "fail"]); normal(10)]
+        @test DA.fluke_days(dailies) == [falses(8); true; false]
+        low = [day(i, [["P$k" => "test" for k in 1:4]; ["F$k" => "fail" for k in 1:6]]) for i in 1:5]
+        @test !any(DA.fluke_days(low))
+        entries = DA.index_entries(dailies)
+        @test [e["outlier"] for e in entries] == [falses(8); true; false]
+        # the newest day is always drawn
+        @test !DA.index_entries(dailies[1:9])[end]["outlier"]
+
+        # a lasting drop is flagged at first, then becomes the new normal
+        drop(i) = day(i, [["P$k" => "test" for k in 1:7]; ["P$k" => "fail" for k in 8:10]])
+        flags = DA.fluke_days([normal.(1:7); drop.(8:14)])
+        @test flags[8]
+        @test !any(flags[12:14])
+    end
+
+    @testset "unreliable packages" begin
+        dailies = [normal.(1:8); day(9, [["P$k" => "fail" for k in 1:10]; "Bad" => "fail"]); normal(10)]
+        # P1..P10 failed only on the fluke day, Skipped was never evaluated
+        @test DA.unreliable_packages(dailies; today=Date(2026, 10, 11)) == ["Bad"]
+        # outside the window nothing counts
+        @test isempty(DA.unreliable_packages(dailies; today=Date(2026, 12, 1)))
+    end
+end
 
 @testset "schema" begin
     @testset "run ids" begin
