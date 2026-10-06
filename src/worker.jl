@@ -751,6 +751,14 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         gated_seal_run = ""
         if use_cache
             run = job_run(ctx, job, run_cache, run_cache_lock)
+            seal_runs = get(run, "seal_runs", nothing)
+            if seal_runs isa AbstractDict && !haskey(seal_runs, job.config)
+                # a baseline recheck adds the against seal run after the run
+                # started, so this worker's cached copy may predate it
+                run = lock(run_cache_lock) do
+                    run_cache[job.run_id] = get_run(ctx, job.run_id)
+                end
+            end
             state, gated_seal_run = seal_state(ctx, run, job)
             state == :pending &&
                 hold_and_fill!(ctx, job, gated_seal_run, cpu, run_cache, run_cache_lock)

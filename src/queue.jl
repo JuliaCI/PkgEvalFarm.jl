@@ -386,9 +386,10 @@ end
 
 "Enqueue SQS messages for jobs (also used to re-drive stalled jobs)."
 function enqueue_jobs(ctx::FarmCtx, jobs::Vector{JobRef};
-                      queue_url::AbstractString=ctx.cfg.queue_url)
+                      queue_url::AbstractString=ctx.cfg.queue_url, delay::Int=0)
     for batch in Iterators.partition(jobs, 10)
-        entries = [Dict("Id" => string(i), "MessageBody" => json_message(job))
+        entries = [Dict("Id" => string(i), "MessageBody" => json_message(job),
+                        "DelaySeconds" => delay)
                    for (i, job) in enumerate(batch)]
         aws_retry() do
             resp = SQS.send_message_batch(entries, queue_url; aws_config=ctx.aws)
@@ -807,18 +808,123 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     end
     attrs = ddb_parse(resp["Item"])
     if attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
-        Dynamodb.update_item(
-            ddb_item(Dict("run_id" => job.run_id)), ctx.cfg.runs_table,
-            Dict("ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs",
-                 "UpdateExpression" => "SET #s = :done, finished_at = :now",
-                 "ExpressionAttributeNames" => Dict("#s" => "status"),
-                 "ExpressionAttributeValues" => ddb_item(Dict(
-                     ":active" => "active", ":done" => "done", ":now" => isodate())));
-            aws_config=ctx.aws)
+        # a recheck reopens jobs, and the run finishes after them instead
+        nrecheck = try
+            recheck_reused_baselines(ctx, attrs)
+        catch err
+            @error "baseline recheck failed; reporting with the reused results" run_id=job.run_id exception=(err, catch_backtrace())
+            0
+        end
+        try
+            nrecheck == 0 && Dynamodb.update_item(
+                ddb_item(Dict("run_id" => job.run_id)), ctx.cfg.runs_table,
+                Dict("ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs",
+                     "UpdateExpression" => "SET #s = :done, finished_at = :now",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(
+                         ":active" => "active", ":done" => "done", ":now" => isodate())));
+                aws_config=ctx.aws)
+        catch err
+            # a racing worker already finished the run or reopened it for a recheck
+            is_conditional_failure(err) || rethrow()
+        end
     end
 
     SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
     return nothing
+end
+
+# Past this many, the change under test most likely broke the packages itself,
+# and re-running their baselines would cost more than it clears up.
+const MAX_BASELINE_RECHECKS = 50
+const RECHECK_DELAY = Ref(60)  # seconds; the tests set it to 0
+
+"""
+    recheck_reused_baselines(ctx, run_attrs) -> Int
+
+When a run that reused baseline results has finished, re-run the baseline of
+every package that failed on primary but passed on the reused result. The donor
+ran on an older registry, so the difference may come from a package or dependency
+release rather than from the change under test; a fresh baseline settles it.
+Returns the number of re-run jobs (0 when there is nothing to recheck).
+
+Happens at most once per run: the run item's `rechecked` field, set in the same
+transaction that reopens the jobs, guards against racing workers and against
+the re-runs triggering another round.
+"""
+function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
+    haskey(attrs, "rechecked") && return 0
+    haskey(attrs, "kind") && return 0  # seal and deriv bookkeeping runs
+    run_id = String(attrs["run_id"])
+    names = [String(c["name"]) for c in JSON.parse(attrs["configs"])]
+    (length(names) == 2 && "against" in names) || return 0
+    primary = only(filter(!=("against"), names))
+
+    jobs = run_jobs(ctx, run_id)
+    by_key = Dict(String(j["job_key"]) => j for j in jobs)
+    recheck = JobRef[]
+    for j in jobs
+        j["config"] == "against" && haskey(j, "reused_from") || continue
+        issuccess(String(get(j, "status", ""))) || continue
+        p = get(by_key, job_key(primary, String(j["package"])), nothing)
+        p === nothing && continue
+        pst = String(get(p, "status", ""))
+        pst in TERMINAL_STATUSES && !issuccess(pst) && pst != "skip" || continue
+        push!(recheck, JobRef(run_id, "against", String(j["package"])))
+    end
+    (isempty(recheck) || length(recheck) > MAX_BASELINE_RECHECKS) && return 0
+
+    # the re-runs must evaluate under the same scheme as primary did: sealed
+    # if primary was, which needs the packages added to the against seal run
+    run = get_run(ctx, run_id)
+    seal_runs = get(run, "seal_runs", nothing)
+    if seal_runs isa AbstractDict && !isempty(seal_runs)
+        mapping = setup_sealing(ctx, run, recheck)
+        (mapping === nothing || !haskey(mapping, "against")) && return 0
+        seal_runs = merge(seal_runs, mapping)
+    end
+
+    # messages first, delayed so they arrive after the reset below: if the
+    # reset loses a race or fails, they meet finished jobs and are dropped
+    enqueue_jobs(ctx, recheck; delay=RECHECK_DELAY[])
+    now = isodate()
+    items = Any[Dict("Update" => Dict(
+        "TableName" => ctx.cfg.runs_table,
+        "Key" => ddb_item(Dict("run_id" => run_id)),
+        "ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs AND " *
+                                 "attribute_not_exists(rechecked)",
+        "UpdateExpression" => "SET rechecked = :n, updated_at = :now" *
+                              (seal_runs isa AbstractDict ? ", seal_runs = :sr" : "") *
+                              " ADD completed_jobs :minus",
+        "ExpressionAttributeNames" => Dict("#s" => "status"),
+        "ExpressionAttributeValues" => ddb_item(Dict(
+            ":active" => "active", ":n" => length(recheck), ":now" => now,
+            ":minus" => -length(recheck),
+            (seal_runs isa AbstractDict ? ((":sr" => seal_runs),) : ())...))))]
+    for job in recheck
+        push!(items, Dict("Update" => Dict(
+            "TableName" => ctx.cfg.jobs_table,
+            "Key" => ddb_item(Dict("run_id" => run_id, "job_key" => job_key(job))),
+            "ConditionExpression" => "attribute_exists(reused_from)",
+            "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
+                                  "recheck_of = reused_from " *
+                                  "REMOVE reused_from, reason, reason_message, version, " *
+                                  "#d, wall, log_key, cost, peak_rss, error_line, " *
+                                  "error_lines, pass_sigs, finished_at",
+            "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
+            "ExpressionAttributeValues" => ddb_item(Dict(
+                ":pending" => "pending", ":zero" => 0)))))
+    end
+    try
+        aws_retry() do
+            Dynamodb.transact_write_items(items; aws_config=ctx.aws)
+        end
+    catch err
+        is_conditional_failure(err) && return 0  # another worker got there first
+        rethrow()
+    end
+    @info "re-running reused baselines of packages that fail on primary" run_id n=length(recheck)
+    return length(recheck)
 end
 
 

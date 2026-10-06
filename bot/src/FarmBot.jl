@@ -1694,6 +1694,10 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         println(io, "- ", count(j -> opt_str(j, "reused_from") !== nothing, jobs),
                 " baseline results reused from run ", join(map(d -> "`$d`", donors), ", "),
                 " (pass `fresh_baseline = true` to re-evaluate)")
+    nrecheck = count(j -> opt_str(j, "recheck_of") !== nothing, jobs)
+    nrecheck == 0 ||
+        println(io, "- ", nrecheck, " reused baseline", nrecheck == 1 ? "" : "s",
+                " re-run because the package failed on primary")
     total_cost = 0.0
     nmetered = 0
     for j in jobs

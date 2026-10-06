@@ -459,6 +459,67 @@ try
         @test rrows["JSON"][10] == -1  # drained via JobResult without a log
     end
 
+    @testset "reused baseline is re-run when primary fails" begin
+        PEF.RECHECK_DELAY[] = 0
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example", "JSON"], Dict{String,Any}());
+                                submitter="tester")
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example", "JSON"]) == 4
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+        @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2  # both baselines reused
+
+        # primary: Example fails where its reused baseline passed, JSON passes
+        for _ in 1:12
+            run = PEF.get_run(ctx, run_id)
+            (haskey(run, "rechecked") || run["status"] == "done") && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            PEF.record_result(ctx, c, PEF.JobResult(;
+                status=c.job.package == "Example" ? "fail" : "test", duration=1.0))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "active"   # held open for the re-run
+        @test run["rechecked"] == 1
+        @test run["completed_jobs"] == 3
+        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
+        @test jobs["against#Example"]["status"] == "pending"
+        @test haskey(jobs["against#Example"], "recheck_of")
+        @test !haskey(jobs["against#Example"], "reused_from")
+        @test !haskey(jobs["against#Example"], "log_key")
+        @test haskey(jobs["against#JSON"], "reused_from")   # JSON passed on primary
+
+        # the fresh baseline fails too, so the run finishes without another round
+        for _ in 1:12
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            @test PEF.job_key(c.job) == "against#Example"
+            PEF.record_result(ctx, c, PEF.JobResult(; status="fail", duration=1.0, log="failed"))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"
+        @test run["completed_jobs"] == 4
+        @test PEF.recheck_reused_baselines(ctx, run) == 0
+        job = only(filter(j -> j["job_key"] == "against#Example", PEF.run_jobs(ctx, run_id)))
+        @test job["status"] == "fail"
+        @test job["log_key"] == PEF.log_key(run_id, "against", "Example")
+
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        report = PEF.FarmBot.generate_report(lite, run_id)
+        @test occursin("1 reused baseline re-run because the package failed on primary",
+                       report.markdown)
+        @test occursin("no new package failures", report.summary)
+        PEF.RECHECK_DELAY[] = 60
+    end
+
     @testset "fresh baseline opts out of reuse" begin
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example"], Dict{String,Any}());
                                 submitter="tester", reuse=false)
