@@ -25,7 +25,9 @@
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
   credentials from the Cognito identity pool in IDENTITY_POOL below with
   GetId + GetCredentialsForIdentity, then Scan/GetItem — live runs carry
-  status/completed_jobs/total_jobs/updated_at and the bot's hourly `eta_at`, plus `waiting` (the Julia
+  status/completed_jobs/total_jobs/updated_at and the bot's hourly `eta_at`
+  (`reused_jobs` of the jobs are baseline results copied from earlier runs,
+  counted as completed from the start), plus `waiting` (the Julia
   builds a stalled run is blocked on CI producing, keyed by config name,
   each with sha/variant and the Buildkite url) and `seal_runs` (per
   config, the id of the shared `seal-*` run item — same table — whose
@@ -149,6 +151,13 @@
   .nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
   .liveness { font-size: 12px; color: var(--ink-3); }
   .liveness.stale { color: var(--warning); }
+  .runinfo { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .runid:empty { display: none; }
+  /* on phones the logo and nav share the first line; the run's details go below */
+  @media (max-width: 600px) {
+    .masthead { row-gap: 4px; }
+    .runinfo { order: 1; flex-basis: 100%; }
+  }
   .brand .dots { display: inline-flex; gap: 3px; }
   .brand .dots i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
   .brand .dots i:nth-child(1) { background: #cb3c33; }
@@ -162,8 +171,9 @@
   .qdepths td, .qdepths th { padding: 2px 18px 2px 0; text-align: right; }
   .qdepths td:first-child, .qdepths th:first-child { text-align: left; }
   .qnote { color: var(--ink-2); font-size: 12px; margin-top: 6px; }
-  .qviz-legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-2);
+  .qviz-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2);
                  margin: 10px 0 2px; }
+  .qviz-legend span { white-space: nowrap; }
   .qviz-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
                    margin-right: 5px; vertical-align: -1px; }
   .qrow { margin-top: 8px; }
@@ -432,8 +442,9 @@
     border-top: 1px solid var(--hairline);
   }
   .taildrawer .actions {
-    display: flex; gap: 14px; padding: 7px 14px; border-top: 1px solid var(--hairline); font-size: 12.5px;
+    display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 7px 14px; border-top: 1px solid var(--hairline); font-size: 12.5px;
   }
+  .taildrawer .actions a { white-space: nowrap; }
   @media (max-width: 800px) {
     .row, .rowx { grid-template-columns: 1fr; }
     .rowx { grid-template-columns: 22px 1fr 22px; }
@@ -468,11 +479,28 @@
   .slowtable td { padding: 6px 14px; border-bottom: 1px solid var(--hairline); }
   .slowtable tr:last-child td { border-bottom: none; }
   .slowtable tr:hover td { background: var(--surface-2); }
-  .slowtable .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  .slowtable .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); white-space: nowrap; }
   .slowtable .num .lg { font-size: 12px; margin-left: 5px; }
   .slowtable .ratio { font-weight: 700; color: var(--serious); text-align: right; font-variant-numeric: tabular-nums; }
   .slowtable .rbar { height: 5px; border-radius: 2.5px; background: var(--serious-dot); opacity: 0.85; }
   .tablewrap { overflow-x: auto; }
+  @media (max-width: 600px) {
+    /* each row becomes the package name over its durations and slowdown */
+    .slowtable thead, .slowtable td:last-child { display: none; }
+    .slowtable tr {
+      display: grid; grid-template-columns: auto auto 1fr; gap: 2px 12px;
+      padding: 7px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .slowtable tr:last-child { border-bottom: none; }
+    .slowtable tr:hover { background: var(--surface-2); }
+    .slowtable td { padding: 0; border: none; text-align: left; }
+    .slowtable td:first-child { grid-column: 1 / -1; }
+    .slowtable td.num:nth-child(2)::before { content: "baseline "; color: var(--ink-3); }
+    .slowtable td.num:nth-child(3)::before { content: "primary "; color: var(--ink-3); }
+    .slowtable td.ratio { text-align: right; }
+    /* the package name already links its primary log */
+    .slowtable .num .lg { display: none; }
+  }
 
   .lookup-input {
     width: 100%; max-width: 420px;
@@ -490,7 +518,12 @@
     display: flex; justify-content: space-between; align-items: baseline; gap: 8px 16px;
     padding: 9px 2px; border-bottom: 1px solid var(--hairline); font-size: 13.5px; flex-wrap: wrap;
   }
+  .runidx-row { position: relative; }
+  .runidx-row:hover { background: var(--surface-2); }
   .runidx-row .rid a { font-weight: 600; color: var(--ink); }
+  /* the run link covers the whole row; links and tooltips inside it stay on top */
+  .runidx-row .rid a::after { content: ""; position: absolute; inset: 0; }
+  .runidx-row .meta a, .runidx-row .flr a, .runidx-row [title] { position: relative; z-index: 1; }
   .runidx-row .meta { color: var(--ink-3); font-size: 12.5px; }
   .runidx-row .meta a { color: var(--ink-2); }
   .runidx-row .flr-line { flex-basis: 100%; text-align: right; font-size: 12.5px; }
@@ -542,9 +575,11 @@
 <div class="wrap">
   <header class="masthead">
     <a class="brand" href="./" target="_self"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span> PkgEval</a>
-    <div class="runid mono" id="runid"></div>
-    <span class="pill done" id="runstatus" hidden>done</span>
-    <span class="liveness" id="liveness" hidden></span>
+    <div class="runinfo">
+      <div class="runid mono" id="runid"></div>
+      <span class="pill done" id="runstatus" hidden>done</span>
+      <span class="liveness" id="liveness" hidden></span>
+    </div>
     <nav class="nav" aria-label="Pages">
       <a href="./" target="_self" id="nav-dash">Dashboard</a>
       <a href="?daily" target="_self" id="nav-daily">Daily</a>
@@ -780,8 +815,7 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
       $("loadstate").innerHTML = `Run ${rid} failed — ` +
         linkify(run.failure_reason || "unspecified failure") + "." + back;
     } else {
-      const prog = run.total_jobs
-        ? ` (${run.completed_jobs || 0} of ${run.total_jobs} jobs done)` : "";
+      const prog = jobsDone(run);
       $("loadstate").innerHTML = `Run ${rid} is still in progress${prog} — ` +
         "its report will appear here once it finishes." + back;
       // reload once the report (or a snapshot of it) appears, or the run fails
@@ -976,8 +1010,7 @@ async function dailyView(params) {
   })).then((rs) => {
     const r = rs.find((x) => x && x.status !== "done" && x.status !== "failed");
     return r ? ` The run <a class="mono" href="?run=${encodeURIComponent(r.run_id)}" target="_self">` +
-      `${esc(r.run_id)}</a> is in progress${r.total_jobs
-        ? ` (${r.completed_jobs || 0} of ${r.total_jobs} jobs done)` : ""}.` : "";
+      `${esc(r.run_id)}</a> is in progress${jobsDone(r)}.` : "";
   });
   let index, perf, unrel;
   try {
@@ -1292,7 +1325,9 @@ async function dashboard(params) {
       }).join(" vs ")));
     }
     if (r.submitter && r.submitter !== "?") bits.push(esc(r.submitter));
-    if (r.total_jobs) bits.push(`${r.total_jobs} jobs`);
+    const { total, reused } = jobCounts(r);
+    if (total) bits.push(`${fmtNum(total)} jobs` + (reused
+      ? ` <span title="baseline results reused from earlier runs">(+${fmtNum(reused)} reused)</span>` : ""));
     return bits;
   };
   const elapsed = (a, b) => {
@@ -1377,7 +1412,7 @@ async function dashboard(params) {
         let gauge, chip;
         if (r.status === "active" && r.total_jobs > 0) {
           chip = ["run", "running"];
-          const done = r.completed_jobs || 0, total = r.total_jobs;
+          const { done, total } = jobCounts(r);
           // …or the shared precompile (seal) phase its test jobs are gated
           // on, whose progress lives on the referenced seal-* run items
           let phase = buildWait, tick = r.updated_at;
@@ -1407,7 +1442,7 @@ async function dashboard(params) {
             const left = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
             eta = ` · about ${left} left`;
           }
-          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(fmtLocal(new Date(etaAt))) : ""}">${done} of ${total} jobs${
+          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(fmtLocal(new Date(etaAt))) : ""}">${fmtNum(done)} of ${fmtNum(total)} jobs${
               phase ? " · " + phase : ""}${esc(eta)}${esc(
               ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
             }</span><span class="bar"><i style="width:${
@@ -1463,6 +1498,18 @@ async function dashboard(params) {
   $("runindex").hidden = false;
   keepFresh(scan, 60_000);
 }
+
+// Reused baseline results are complete from the start, so progress leaves them out.
+const jobCounts = (r) => {
+  const reused = r.reused_jobs || 0;
+  return { reused, total: (r.total_jobs || 0) - reused,
+           done: Math.max(0, (r.completed_jobs || 0) - reused) };
+};
+const jobsDone = (r) => {
+  const { done, total } = jobCounts(r);
+  return total ? ` (${fmtNum(done)} of ${fmtNum(total)} jobs done)` : "";
+};
+const fmtNum = (n) => n.toLocaleString("en-US");
 
 const metaEl = (id) => document.querySelector(`.meta[data-run="${CSS.escape(id)}"]`);
 const setChip = (id, cls, text) => {

@@ -356,7 +356,8 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
             Dict("ConditionExpression" => "#s = :expanding",
                  # expansion succeeding also retires any waiting-for-build note
                  "UpdateExpression" => "SET #s = :active, total_jobs = :total, " *
-                                       "completed_jobs = :reused, updated_at = :now " *
+                                       "completed_jobs = :reused, reused_jobs = :reused, " *
+                                       "updated_at = :now " *
                                        "REMOVE #w",
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#w" => "waiting"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
@@ -893,13 +894,14 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         "Key" => ddb_item(Dict("run_id" => run_id)),
         "ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs AND " *
                                  "attribute_not_exists(rechecked)",
-        "UpdateExpression" => "SET rechecked = :n, updated_at = :now" *
+        "UpdateExpression" => "SET rechecked = :n, reused_jobs = :reused, updated_at = :now" *
                               (seal_runs isa AbstractDict ? ", seal_runs = :sr" : "") *
                               " ADD completed_jobs :minus",
         "ExpressionAttributeNames" => Dict("#s" => "status"),
         "ExpressionAttributeValues" => ddb_item(Dict(
             ":active" => "active", ":n" => length(recheck), ":now" => now,
             ":minus" => -length(recheck),
+            ":reused" => count(j -> haskey(j, "reused_from"), jobs) - length(recheck),
             (seal_runs isa AbstractDict ? ((":sr" => seal_runs),) : ())...))))]
     for job in recheck
         push!(items, Dict("Update" => Dict(
