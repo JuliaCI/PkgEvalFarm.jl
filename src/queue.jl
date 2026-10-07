@@ -187,8 +187,11 @@ existing baseline looks flaky.
 
 Returns `(config_name, donor_run_ids, Dict(package => donor job item))`, with an
 empty dict when there is nothing to reuse. Infrastructure failures ("error")
-are never reused, nor are load-only results ("load"), which can't stand in for a
-test; real results (including fail/crash/kill) are.
+are never reused, nor are the loads of a donor's unreliable packages, which
+can't stand in for a test. Any other load is a package without tests, which
+loading evaluates fully, so it is reused like real results (fail/crash/kill
+included). Skips for having no tests predate such packages being loaded, so
+they are not reused either.
 """
 function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String},
                              completed::Vector{<:Tuple}=completed_runs(ctx);
@@ -217,12 +220,15 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
     # each donor read fetches all of its jobs, so bound how far back we look
     for (_, donor_id, donor_cfg) in first(donors, max_donors)
         found = false
+        donor_unreliable = run_unreliable(ctx, donor_id)
         for job in run_jobs(ctx, donor_id)
             job["config"] == donor_cfg || continue
             pkg = String(job["package"])
             pkg in wanted && !haskey(results, pkg) || continue
             status = get(job, "status", "")
-            status in TERMINAL_STATUSES && status != "error" && status != "load" || continue
+            status in TERMINAL_STATUSES && status != "error" || continue
+            status == "load" && pkg in donor_unreliable && continue
+            status == "skip" && get(job, "reason", "") == "untestable" && continue
             results[pkg] = job
             found = true
         end
@@ -231,6 +237,16 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
     end
     isempty(results) && return none
     return ("against", used, results)
+end
+
+"The packages a run only loaded (its unreliable list); none if its item is gone."
+function run_unreliable(ctx::FarmCtx, run_id::AbstractString)
+    resp = aws_retry() do
+        Dynamodb.get_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+                          Dict("ProjectionExpression" => "unreliable"); aws_config=ctx.aws)
+    end
+    haskey(resp, "Item") || return Set{String}()
+    return Set{String}(JSON.parse(get(ddb_parse(resp["Item"]), "unreliable", "[]")))
 end
 
 "Write already-completed job items carrying donors' results (batched)."
