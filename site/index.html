@@ -1499,9 +1499,11 @@ async function dashboard(params) {
     for (const r of shown) {
       if (r.status !== "done" || r.new_fails == null) continue;
       const cost = r.cost || 0;
+      // a run of one build (a daily) has no baseline, so its failures aren't "new"
+      const kind = jparse(r.configs, []).length > 1 ? "new failure" : "failure";
       setChip(r.run_id, r.new_fails ? "bad" : "ok",
-              r.new_fails ? `${r.new_fails} new failure${r.new_fails === 1 ? "" : "s"}`
-                          : "no new failures");
+              r.new_fails ? `${r.new_fails} ${kind}${r.new_fails === 1 ? "" : "s"}`
+                          : `no ${kind}s`);
       const bits = [...runMeta(r)];
       const took = r.finished_at && elapsed(r.created_at, r.finished_at);
       if (took) bits.push(esc(took));
@@ -1630,7 +1632,7 @@ function main(D) {
   const short = (s) => (isSha(s) ? s.slice(0, 10) : s);
 
   // ---- classification ---------------------------------------------------
-  const newFails = [], nowPassing = [], stillFailing = [];
+  const newFails = [], nowPassing = [], stillFailing = [], newlySkipped = [], noBaseline = [];
   for (const r of D.pkgs) {
     const ps = r[PSTAT], as = r[ASTAT];
     if (!hasAgainst || !as) {
@@ -1641,6 +1643,8 @@ function main(D) {
     }
     if (!OK.has(ps) && ps !== "s" && OK.has(as)) newFails.push(r);
     else if (OK.has(ps) && !OK.has(as) && as !== "s") nowPassing.push(r);
+    else if (ps === "s" && as !== "s") newlySkipped.push(r);
+    else if (!OK.has(ps) && ps !== "s" && as === "s") noBaseline.push(r);
     else if (!OK.has(ps) && !OK.has(as) && ps !== "s") stillFailing.push(r);
   }
   const passed = D.pkgs.filter((r) => OK.has(r[PSTAT])).length;
@@ -1735,7 +1739,8 @@ function main(D) {
     (costStr ? `<span>estimated compute cost <b>${costStr}</b> (EC2 spot, job time only)</span>` : "");
 
   // ---- rerun command ----------------------------------------------------
-  if (nNF > 0) {
+  // without a baseline every failure counts, so the list would be the whole run
+  if (nNF > 0 && hasAgainst) {
     const names = newFails.map((r) => `"${r[0]}"`).join(", ");
     const vs = hasAgainst && isSha(D.run.against.sha) ? `, vs = "@${D.run.against.sha}"` : "";
     const cmd = `@${D.run.bot || "pkgeval"} runtests([${names}]${vs})`;
@@ -2163,10 +2168,14 @@ function main(D) {
   }
 
   // ---- other outcomes ---------------------------------------------------
-  if (hasAgainst && (nowPassing.length || stillFailing.length)) {
+  if (hasAgainst && (nowPassing.length || stillFailing.length || newlySkipped.length || noBaseline.length)) {
     $("other-block").hidden = false;
     const otherHost = $("other-groups");
     const otherSections = [
+      { id: "grp-newskip", title: "Newly skipped", n: newlySkipped.length,
+        lede: "Evaluated on the baseline but not tested on primary, grouped by why. " +
+              "A change that breaks installing a package shows up here.",
+        groups: groupBy(newlySkipped, PSTAT, PREASON) },
       { id: "grp-nowpass", title: "Now passing", n: nowPassing.length,
         lede: "Passed on primary after failing on the baseline — grouped by why they failed before. " +
               "Groups labelled “error” were baseline infrastructure problems, not real fixes.",
@@ -2174,6 +2183,10 @@ function main(D) {
       { id: "grp-stillfail", title: "Failed on both builds", n: stillFailing.length,
         lede: "Pre-existing breakage, not caused by this change — grouped by why they fail on primary.",
         groups: groupBy(stillFailing, PSTAT, PREASON) },
+      { id: "grp-nobaseline", title: "Failed, with no baseline result", n: noBaseline.length,
+        lede: "Failed on primary but skipped on the baseline, so there is nothing to compare with. " +
+              "Grouped by why they fail on primary.",
+        groups: groupBy(noBaseline, PSTAT, PREASON) },
     ];
     for (const s of otherSections) {
       if (!s.n) continue;
