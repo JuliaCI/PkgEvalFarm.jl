@@ -35,7 +35,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PkgEval report</title>
+<title>PkgEval</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='8.5' r='7' fill='%23389826'/%3E%3Ccircle cx='8' cy='23' r='7' fill='%23cb3c33'/%3E%3Ccircle cx='24' cy='23' r='7' fill='%239558b2'/%3E%3C/svg%3E">
 <!-- every link leaves the report (logs, GitHub, sibling files); keep the page open -->
 <base target="_blank">
 <style>
@@ -142,6 +143,12 @@
     padding: 28px 0 10px;
   }
   .brand { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 9px; }
+  a.brand, a.brand:hover { color: var(--ink); text-decoration: none; }
+  .nav { margin-left: auto; display: flex; gap: 16px; font-size: 13.5px; }
+  .nav a { color: var(--ink-2); }
+  .nav a[aria-current="page"] { color: var(--ink); font-weight: 600; }
+  .liveness { font-size: 12px; color: var(--ink-3); }
+  .liveness.stale { color: var(--warning); }
   .brand .dots { display: inline-flex; gap: 3px; }
   .brand .dots i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
   .brand .dots i:nth-child(1) { background: #cb3c33; }
@@ -229,6 +236,7 @@
   }
   .tile:hover { border-color: var(--hairline-2); }
   .tile[disabled] { cursor: default; }
+  .tile .v, .tile .l { display: block; }
   .tile .v { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
   .tile .l { font-size: 12.5px; color: var(--ink-2); margin-top: 1px; }
   .tile.crit .v { color: var(--critical); }
@@ -253,7 +261,7 @@
     position: relative;
   }
   .rerun-box pre {
-    margin: 0; padding: 14px 16px; overflow-x: auto; max-height: 180px;
+    margin: 0; padding: 14px 76px 14px 16px; overflow-x: auto; max-height: 180px;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
     color: var(--ink);
@@ -370,6 +378,7 @@
     display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
     margin: 0 0 12px; font-size: 13px; color: var(--ink-2);
   }
+  .triagebar .tnote { font-size: 12px; color: var(--ink-3); }
   .triagebar .bar {
     flex: 0 0 160px; height: 6px; border-radius: 3px; background: var(--muted-wash); overflow: hidden;
   }
@@ -386,7 +395,9 @@
     gap: 4px 12px; align-items: center;
     padding: 7px 16px; border-top: 1px solid var(--hairline); font-size: 13.5px;
   }
+  .rowx { cursor: pointer; }
   .rowx:hover { background: var(--surface-2); }
+  .rowx .taildrawer { cursor: auto; }
   .rowx.triaged .pkg a { color: var(--ink-3); text-decoration: line-through; }
   .rowx input[type="checkbox"] { accent-color: var(--accent); margin: 0; cursor: pointer; }
   .rowx .pkg { display: flex; align-items: baseline; gap: 7px; min-width: 0; flex-wrap: wrap; }
@@ -399,8 +410,8 @@
   .rowx .side .arr { color: var(--ink-3); font-size: 12px; }
   .rowx .side .lg { font-size: 12px; }
   .expand-btn {
-    border: none; background: none; cursor: pointer; color: var(--ink-3); padding: 2px;
-    line-height: 1; font-size: 11px;
+    border: none; background: none; cursor: pointer; color: var(--ink-3); padding: 6px;
+    margin: -4px; line-height: 1; font-size: 12px;
   }
   .expand-btn:hover { color: var(--ink); }
   .taildrawer {
@@ -426,6 +437,9 @@
   @media (max-width: 800px) {
     .row, .rowx { grid-template-columns: 1fr; }
     .rowx { grid-template-columns: 22px 1fr 22px; }
+    .rowx > .side { grid-column: 2; }
+    .rowx > .expand-btn { grid-column: 3; grid-row: 1; }
+    .row .side, .rowx .side { flex-wrap: wrap; white-space: normal; }
     .vs-card { grid-template-columns: 1fr; gap: 10px; }
     .vs-mid { flex-direction: row; }
   }
@@ -527,9 +541,14 @@
 <body>
 <div class="wrap">
   <header class="masthead">
-    <div class="brand"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span> PkgEval</div>
+    <a class="brand" href="./" target="_self"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span> PkgEval</a>
     <div class="runid mono" id="runid"></div>
     <span class="pill done" id="runstatus" hidden>done</span>
+    <span class="liveness" id="liveness" hidden></span>
+    <nav class="nav" aria-label="Pages">
+      <a href="./" target="_self" id="nav-dash">Dashboard</a>
+      <a href="?daily" target="_self" id="nav-daily">Daily</a>
+    </nav>
   </header>
   <div class="load-state" id="loadstate">Loading report data…</div>
   <div id="runindex" hidden>
@@ -542,7 +561,12 @@
       <p class="lede">Reports published by this farm, newest first. Open one, or link a report
         directly as <span class="mono" style="white-space: nowrap">?run=&lt;run id&gt;</span>.
         The <a href="?daily" target="_self">daily evaluation</a> of julia master has its own page.</p>
+      <div class="filterbar">
+        <input class="search" id="runidx-filter" type="search" placeholder="Filter by run, PR or submitter…"
+          aria-label="Filter runs">
+      </div>
       <div class="runidx-rows" id="runidx-rows"></div>
+      <button class="more-btn" id="runidx-more" type="button" hidden></button>
     </section>
     <!-- zero API calls unless a human opens it -->
     <details class="block qdebug" id="qdebug">
@@ -604,6 +628,7 @@
         <span class="bar" aria-hidden="true"><i id="triage-fill" style="width: 0%"></i></span>
         <span id="triage-count"></span>
         <button class="btn-ghost" id="copy-triage" type="button">Copy triage summary</button>
+        <span class="tnote">saved in this browser only</span>
       </div>
       <div class="filterbar">
         <input class="search" id="nf-search" type="search" placeholder="Filter packages…" aria-label="Filter new failures">
@@ -626,7 +651,7 @@
 
     <section class="block">
       <h2>Look up a package</h2>
-      <p class="lede">Every evaluated package — search to see how any of them fared.</p>
+      <p class="lede">Every evaluated package — type two or more letters to see how any of them fared.</p>
       <input class="lookup-input" id="lookup" type="search" placeholder="Package name…" aria-label="Look up a package">
       <div id="lookup-results"></div>
     </section>
@@ -647,8 +672,66 @@ async function fetchJson(url) {
 
 const escHtml = (s) => String(s).replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const linkify = (s) =>   // escape first, then turn bare URLs into links
-  escHtml(s).replace(/https?:\/\/[^\s<)]+/g, (u) => `<a href="${u}">${u}</a>`);
+// escape first, then turn bare URLs into links; `max` shortens the shown text
+const linkify = (s, max = Infinity) =>
+  escHtml(s).replace(/https?:\/\/[^\s<)]+/g, (u) => {
+    const t = u.replace(/^https?:\/\//, "");
+    return `<a href="${u}">${t.length > max ? t.slice(0, max) + "…" : u}</a>`;
+  });
+
+// Timestamps are shown in the viewer's time zone, with UTC in the tooltip.
+const pad2 = (n) => String(n).padStart(2, "0");
+const tzName = (d) => new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+  .formatToParts(d).find((x) => x.type === "timeZoneName")?.value || "";
+const fmtClock = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+const fmtLocal = (d, seconds) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${fmtClock(d)}` +
+  (seconds ? ":" + pad2(d.getSeconds()) : "") + " " + tzName(d);
+const fmtUTC = (d, seconds) =>
+  d.toISOString().slice(0, seconds ? 19 : 16).replace("T", " ") + " UTC";
+const timeHTML = (iso, seconds = false) => {
+  const d = new Date(iso || NaN);
+  if (isNaN(d)) return escHtml(iso || "?");
+  return `<time datetime="${d.toISOString()}" title="${fmtUTC(d, seconds)}">` +
+    `${escHtml(fmtLocal(d, seconds))}</time>`;
+};
+
+// clipboard writes fail outside secure contexts and when permission is denied
+const copyText = (btn, text) => {
+  const label = btn.textContent;
+  const done = (msg) => {
+    btn.textContent = msg;
+    setTimeout(() => { btn.textContent = label; }, 1600);
+  };
+  Promise.resolve().then(() => navigator.clipboard.writeText(text))
+    .then(() => done("Copied"), () => done("Copy failed"));
+};
+
+// Re-runs `refresh` every `ms` while the tab is visible. A tab that comes back
+// after missing a refresh catches up at once. The masthead shows when the data
+// was last checked, and says so when a refresh fails.
+function keepFresh(refresh, ms, verb = "updated") {
+  const live = $("liveness");
+  let last = new Date(), busy = false;
+  const show = (ok) => {
+    live.hidden = false;
+    live.classList.toggle("stale", !ok);
+    live.textContent = (ok ? verb + " " : "couldn't refresh, data from ") + fmtClock(last);
+    live.title = fmtUTC(last);
+  };
+  const tick = async () => {
+    if (busy || document.hidden) return;
+    busy = true;
+    try { await refresh(); last = new Date(); show(true); }
+    catch { show(false); }
+    busy = false;
+  };
+  show(true);
+  setInterval(tick, ms);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && Date.now() - last > ms) tick();
+  });
+}
 
 // declared above boot(), which uses them synchronously on load
 const AWS_REGION = "us-east-2";
@@ -675,23 +758,39 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   const runId = params.get("run");
   const bucket = (params.get("bucket") || "https://pkgeval.s3.us-east-2.amazonaws.com")
     .replace(/\/+$/, "");
-  if (params.has("daily")) return dailyView();
+  if (params.has("daily")) return dailyView(params);
   if (!runId) return dashboard(params);
+  $("runid").textContent = runId;
+  document.title = "PkgEval — " + runId;
   const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
+  const reportUrl = `${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`;
   try {
-    D = await fetchJson(`${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`);
+    D = await fetchJson(reportUrl);
   } catch (err) {
     // no report — the runs table still explains an unfinished or failed run
-    let run = null;
-    try { run = await ddbClient(params).getRun(runId); } catch { /* stay bare */ }
-    $("loadstate").innerHTML = run === null
-      ? `Could not load the report for run <span class="mono">${escHtml(runId)}</span> ` +
-        `(${escHtml(err.message)}).` + back
-      : run.status === "failed"
-      ? `Run <span class="mono">${escHtml(runId)}</span> failed — ` +
-        linkify(run.failure_reason || "unspecified failure") + "." + back
-      : `Run <span class="mono">${escHtml(runId)}</span> is still in progress — ` +
+    let run = null, known = false;
+    try { run = await ddbClient(params).getRun(runId); known = true; } catch { /* stay bare */ }
+    const rid = `<span class="mono">${escHtml(runId)}</span>`;
+    if (run === null) {
+      // S3 answers 403 for a missing key, so the runs table decides
+      $("loadstate").innerHTML = known
+        ? `There is no run named ${rid}.` + back
+        : `Could not load the report for run ${rid} (${escHtml(err.message)}).` + back;
+    } else if (run.status === "failed") {
+      $("loadstate").innerHTML = `Run ${rid} failed — ` +
+        linkify(run.failure_reason || "unspecified failure") + "." + back;
+    } else {
+      const prog = run.total_jobs
+        ? ` (${run.completed_jobs || 0} of ${run.total_jobs} jobs done)` : "";
+      $("loadstate").innerHTML = `Run ${rid} is still in progress${prog} — ` +
         "its report will appear here once it finishes." + back;
+      // reload once the report (or a snapshot of it) appears, or the run fails
+      keepFresh(async () => {
+        const live = await ddbClient(params).getRun(runId);
+        const head = await fetch(reportUrl, { method: "HEAD", cache: "no-store" });
+        if (head.ok || (live && live.status === "failed")) location.reload();
+      }, 60_000, "checked");
+    }
     return;
   }
   if (D.run.in_progress) {
@@ -716,6 +815,16 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   $("loadstate").hidden = true;
   $("app").hidden = false;
   main(D);
+  if (D.run.in_progress) {
+    // snapshots are republished about hourly: reload for a newer one, the
+    // final report, or the run's failure
+    keepFresh(async () => {
+      const fresh = await (await fetch(reportUrl, { cache: "no-store" })).json();
+      const live = await ddbClient(params).getRun(runId).catch(() => null);
+      if (!fresh.run.in_progress || fresh.run.as_of !== D.run.as_of ||
+          (live && live.status === "failed")) location.reload();
+    }, 5 * 60_000, "checked");
+  }
 })();
 
 // ---- anonymous runs-table reads -------------------------------------------
@@ -852,10 +961,24 @@ function ddbClient(params) {
 // The data is daily/*.json next to this page, which the Pages build derives from
 // the daily runs (daily/analyze.jl). These are the charts Nanosoldier published for
 // its dailies, without the second y-axis: the success rate has its own chart.
-async function dailyView() {
+async function dailyView(params) {
   const esc = escHtml;
   const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
   $("runid").textContent = "daily";
+  document.title = "PkgEval daily";
+  $("nav-daily").setAttribute("aria-current", "page");
+  // a daily still running is only in the runs table; it is named after its
+  // UTC start date, and can run past midnight
+  const ddb = ddbClient(params);
+  const running = Promise.all([0, 1].map((back) => {
+    const id = "daily-" + new Date(Date.now() - back * 86400_000).toISOString().slice(0, 10);
+    return ddb.getRun(id).catch(() => null);
+  })).then((rs) => {
+    const r = rs.find((x) => x && x.status !== "done" && x.status !== "failed");
+    return r ? ` The run <a class="mono" href="?run=${encodeURIComponent(r.run_id)}" target="_self">` +
+      `${esc(r.run_id)}</a> is in progress${r.total_jobs
+        ? ` (${r.completed_jobs || 0} of ${r.total_jobs} jobs done)` : ""}.` : "";
+  });
   let index, perf, unrel;
   try {
     [index, perf, unrel] = await Promise.all(
@@ -865,7 +988,7 @@ async function dailyView() {
     return;
   }
   if (!index.length) {
-    $("loadstate").innerHTML = "No daily run has finished yet." + back;
+    $("loadstate").innerHTML = "No daily run has finished yet." + await running + back;
     return;
   }
   $("loadstate").hidden = true;
@@ -880,29 +1003,42 @@ async function dailyView() {
     `<a class="mono" href="https://github.com/JuliaLang/julia/commit/${esc(latest.sha)}">` +
     `${esc(latest.sha.slice(0, 10))}</a>: ${fmtN(latest.total)} packages, ${pct(rate(latest))} passed ` +
     `(<a href="?run=${encodeURIComponent(latest.run)}" target="_self">report</a>).`;
+  running.then((html) => $("daily-lede").insertAdjacentHTML("beforeend", html));
 
   // like Nanosoldier's chart, leave out days that look like infrastructure trouble
   const kept = index.filter((e) => !e.outlier);
   const outcomes = [
     ["test", "success"], ["skip", "skip"], ["fail", "failure"], ["kill", "kill"], ["crash", "crash"],
   ];
-  timeChart($("daily-outcomes"), {
-    dates: kept.map((e) => e.date), stacked: true, yFormat: fmtN,
-    series: outcomes.map(([k, label]) => ({
-      label, color: `var(--dv-${k})`, values: kept.map((e) => e.counts[k]) })),
-  });
-  timeChart($("daily-rate"), {
-    dates: kept.map((e) => e.date), yMin: 0, yMax: 1, yFormat: (y) => Math.round(100 * y) + "%",
-    valueFormat: pct,
-    series: [{ label: "success rate", color: "var(--accent)", values: kept.map(rate) }],
-  });
-  const timed = perf.filter((p) => p.simple !== null || p.full !== null);
-  timeChart($("daily-time"), {
-    dates: timed.map((p) => p.date), baseline: 1, yFormat: (y) => y.toFixed(2),
-    series: [
-      { label: "same versions", color: "var(--qviz-1)", values: timed.map((p) => p.simple) },
-      { label: "all versions", color: "var(--qviz-2)", values: timed.map((p) => p.full) },
-    ],
+  // charts are drawn at the container's width, so redraw when that changes
+  let drawnAt = 0, resizeTimer = null;
+  const drawCharts = () => {
+    drawnAt = $("daily-outcomes").clientWidth;
+    timeChart($("daily-outcomes"), {
+      dates: kept.map((e) => e.date), stacked: true, yFormat: fmtN,
+      series: outcomes.map(([k, label]) => ({
+        label, color: `var(--dv-${k})`, values: kept.map((e) => e.counts[k]) })),
+    });
+    timeChart($("daily-rate"), {
+      dates: kept.map((e) => e.date), yMin: 0, yMax: 1, yFormat: (y) => Math.round(100 * y) + "%",
+      valueFormat: pct,
+      series: [{ label: "success rate", color: "var(--accent)", values: kept.map(rate) }],
+    });
+    const timed = perf.filter((p) => p.simple !== null || p.full !== null);
+    timeChart($("daily-time"), {
+      dates: timed.map((p) => p.date), baseline: 1, yFormat: (y) => y.toFixed(2),
+      series: [
+        { label: "same versions", color: "var(--qviz-1)", values: timed.map((p) => p.simple) },
+        { label: "all versions", color: "var(--qviz-2)", values: timed.map((p) => p.full) },
+      ],
+    });
+  };
+  drawCharts();
+  addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if ($("daily-outcomes").clientWidth !== drawnAt) drawCharts();
+    }, 150);
   });
 
   $("daily-unrel-n").textContent = unrel.unreliable.length;
@@ -1055,7 +1191,7 @@ async function dashboard(params) {
     const qseries = new Map();   // name -> [{t, vis, inf}], capped
     const QCAP = 240;
     let qtip = null;
-    const fmtT = (t) => new Date(t).toISOString().slice(11, 19) + " UTC";
+    const fmtT = (t) => new Date(t).toLocaleTimeString();
     const spark = (name) => {
       const pts = qseries.get(name) || [];
       const w = 600, h = 44, pad = 2;
@@ -1138,8 +1274,6 @@ async function dashboard(params) {
     });
   }
 
-  const when = (iso) => iso
-    ? iso.replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC") : "";
   const href = (id) => "?run=" + encodeURIComponent(id) +
     (params.get("bucket") ? "&bucket=" + encodeURIComponent(params.get("bucket")) : "");
   const jparse = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
@@ -1174,7 +1308,15 @@ async function dashboard(params) {
       <span class="meta" data-run="${esc(r.run_id)}">${meta}</span>${extra || ""}
     </div>`;
 
-  const render = async () => {
+  // the newest PAGE runs matching the filter are shown; "show more" adds a page
+  const PAGE = 30;
+  let all = [], limit = PAGE, query = "";
+  const haystack = (r) => {
+    const ctx = jparse(r.context, {});
+    return [r.run_id, r.submitter, r.status,
+            ctx.repo && ctx.issue ? `${ctx.repo}#${ctx.issue}` : ""].join(" ").toLowerCase();
+  };
+  const render = () => {
     // some runs-table items are internal machinery, not runs anyone
     // submitted, and are hidden: seal-* (the shared precompile phase's
     // bookkeeping — though active runs reference them, to show sealing
@@ -1182,33 +1324,36 @@ async function dashboard(params) {
     // at test time; new wants re-open them forever, so they'd render as
     // perpetually running), and _-prefixed sentinels (e.g. the
     // _fleet-generation record cloud-init claims)
-    const all = await ddb.scanRuns();
     const sealById = new Map(all.filter((r) => r.run_id.startsWith("seal-"))
       .map((r) => [r.run_id, r]));
     const runs = all.filter((r) => !r.run_id.startsWith("seal-") &&
       !r.run_id.startsWith("deriv-") && !r.run_id.startsWith("_"));
     runs.sort((a, b) => (b.created_at || "").localeCompare(a.created_at || "") ||
                         (a.run_id < b.run_id ? 1 : -1));
-    const shown = runs.slice(0, 30);
-    $("runidx-n").textContent = `(${shown.length} of ${runs.length})`;
+    const matching = query ? runs.filter((r) => haystack(r).includes(query)) : runs;
+    const shown = matching.slice(0, limit);
+    $("runidx-n").textContent = `(${shown.length} of ${matching.length})`;
+    const more = $("runidx-more");
+    more.hidden = shown.length >= matching.length;
+    more.textContent = `Show ${Math.min(PAGE, matching.length - shown.length)} more`;
     const finished = [], active = [];
     for (const r of shown) {
       const bits = [...runMeta(r)];
       if (r.status === "done") {
         const took = r.finished_at && elapsed(r.created_at, r.finished_at);
         if (took) bits.push(esc(took));
-        bits.push(esc(when(r.created_at)));
+        bits.push(timeHTML(r.created_at));
         // verdict chip and cost arrive with the report probe below
         finished.push(row(r, null, bits.join(" · ")));
       } else if (r.status === "failed") {
-        bits.push(esc(when(r.created_at)));
+        bits.push(timeHTML(r.created_at));
         // the (often long) reason gets its own line so the meta column — and
         // its trigger links — stays aligned with every other row
         finished.push(row(r, ["bad", "failed"], bits.join(" · "),
           `<div class="flr-line"><span class="flr">${
-            linkify(r.failure_reason || "unspecified failure")}</span></div>`));
+            linkify(r.failure_reason || "unspecified failure", 40)}</span></div>`));
       } else {   // expanding | active: the in-progress section
-        bits.push(esc(when(r.created_at)));
+        bits.push(timeHTML(r.created_at));
         // say what a run without visible progress is actually doing, so it
         // doesn't read as hung: waiting on CI Julia builds (the workers stamp
         // `waiting` per config — both sides of a comparison can need one —
@@ -1262,7 +1407,7 @@ async function dashboard(params) {
             const left = mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
             eta = ` · about ${left} left`;
           }
-          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(r.eta_at) : ""}">${done} of ${total} jobs${
+          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(fmtLocal(new Date(etaAt))) : ""}">${done} of ${total} jobs${
               phase ? " · " + phase : ""}${esc(eta)}${esc(
               ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
             }</span><span class="bar"><i style="width:${
@@ -1276,7 +1421,8 @@ async function dashboard(params) {
           bits.join(" · ") + ` · <span class="runidx-prog">${gauge}</span>`));
       }
     }
-    $("runidx-rows").innerHTML = finished.join("");
+    $("runidx-rows").innerHTML = finished.join("") ||
+      `<div class="empty-note">${query ? "No run matches." : "No runs yet."}</div>`;
     $("runidx-active-rows").innerHTML = active.join("");
     $("runidx-active").hidden = !active.length;
     // verdict chips: the bot annotates each finished run with new_fails/cost
@@ -1293,21 +1439,29 @@ async function dashboard(params) {
       const took = r.finished_at && elapsed(r.created_at, r.finished_at);
       if (took) bits.push(esc(took));
       if (cost > 0) bits.push(`$${cost.toFixed(2)}`);
-      bits.push(esc(when(r.created_at)));
+      bits.push(timeHTML(r.created_at));
       metaEl(r.run_id).innerHTML = bits.join(" · ");
     }
   };
 
+  const scan = async () => { all = await ddb.scanRuns(); render(); };
   try {
-    await render();
+    await scan();
   } catch (err) {
     $("loadstate").textContent = `Could not load runs (${err.message}). ` +
       "Open a report directly with ?run=<run id>.";
     return;
   }
+  $("nav-dash").setAttribute("aria-current", "page");
+  $("runidx-filter").addEventListener("input", (e) => {
+    query = e.target.value.trim().toLowerCase();
+    limit = PAGE;
+    render();
+  });
+  $("runidx-more").addEventListener("click", () => { limit += PAGE; render(); });
   $("loadstate").hidden = true;
   $("runindex").hidden = false;
-  setInterval(() => render().catch(() => {}), 60_000);
+  keepFresh(scan, 60_000);
 }
 
 const metaEl = (id) => document.querySelector(`.meta[data-run="${CSS.escape(id)}"]`);
@@ -1393,14 +1547,15 @@ function main(D) {
   // ---- header -----------------------------------------------------------
   document.title = "PkgEval — " + D.run.id;
   $("runid").textContent = D.run.id;
-  const stamp = (iso) => esc((iso || "?").replace("T", " ").replace("Z", " UTC"));
+  const stamp = (iso) => timeHTML(iso, true);
   if (D.run.in_progress) {   // a mid-run snapshot, republished about hourly
     $("runstatus").className = "pill wip";
     $("runstatus").textContent = "in progress";
   }
   $("runstatus").hidden = false;
   const wallMs = Date.parse(D.run.finished || "") - Date.parse(D.run.created || "");
-  const wall = isNaN(wallMs) ? "" : `${Math.floor(wallMs / 3600000)}h ${Math.round((wallMs % 3600000) / 60000)}m`;
+  const wallH = Math.floor(wallMs / 3600000), wallM = Math.round((wallMs % 3600000) / 60000);
+  const wall = isNaN(wallMs) ? "" : (wallH ? `${wallH}h ${wallM}m` : `${wallM}m`);
   $("metaline").innerHTML =
     `<span>submitted by <strong>${esc(D.run.submitter || "?")}</strong></span>` +
     (D.run.trigger_url ? `<span>triggered from <a href="${esc(D.run.trigger_url)}">${esc(D.run.trigger_label)}</a></span>` : "") +
@@ -1458,7 +1613,7 @@ function main(D) {
     { v: fmtInt(skipped), l: "skipped", cls: "", target: null },
   ];
   $("tiles").innerHTML = tiles.map((t) =>
-    `<button class="tile ${t.cls}" ${t.target ? `data-target="${t.target}"` : "disabled"}>
+    `<button class="tile ${t.cls}" ${t.target && t.v !== "0" ? `data-target="${t.target}"` : "disabled"}>
        <span class="v">${t.v}</span><span class="l">${t.l}</span></button>`).join("");
   $("tiles").addEventListener("click", (e) => {
     const b = e.target.closest("[data-target]");
@@ -1479,12 +1634,7 @@ function main(D) {
     const vs = hasAgainst && isSha(D.run.against.sha) ? `, vs = "@${D.run.against.sha}"` : "";
     const cmd = `@${D.run.bot || "pkgeval"} runtests([${names}]${vs})`;
     $("rerun-cmd").textContent = cmd;
-    $("copy-rerun").addEventListener("click", () => {
-      navigator.clipboard.writeText(cmd).then(() => {
-        $("copy-rerun").textContent = "Copied";
-        setTimeout(() => { $("copy-rerun").textContent = "Copy"; }, 1600);
-      });
-    });
+    $("copy-rerun").addEventListener("click", () => copyText($("copy-rerun"), cmd));
   } else {
     $("rerun-block").hidden = true;
   }
@@ -1653,8 +1803,25 @@ function main(D) {
        <span class="dot ${ST[s].cls}" style="background: currentColor;"></span>${ST[s].label}
        (${newFails.filter((r) => r[PSTAT] === s).length})</button>`).join(" ");
 
-  let nfQuery = "", nfStatus = null, hideTriaged = false;
+  // the filters are kept in the URL, so a filtered view can be shared
+  const urlState = new URLSearchParams(location.search);
+  let nfQuery = urlState.get("filter") || "", hideTriaged = false;
+  let nfStatus = present.includes(urlState.get("status")) ? urlState.get("status") : null;
+  const sigParam = urlState.get("sig");
+  if (sigParam !== null && $("sigpanel").querySelector(`[data-sig="${CSS.escape(sigParam)}"]`))
+    nfSig = parseInt(sigParam, 10);
+  $("nf-search").value = nfQuery;
+  for (const el of $("nf-chips").children) el.setAttribute("aria-pressed", String(el.dataset.st === nfStatus));
+  for (const el of $("sigpanel").querySelectorAll(".sigrow"))
+    el.setAttribute("aria-pressed", String(parseInt(el.dataset.sig, 10) === nfSig));
+  const syncURL = () => {
+    const u = new URL(location.href);
+    for (const [k, v] of [["filter", nfQuery], ["status", nfStatus], ["sig", nfSig]])
+      if (v === null || v === "") u.searchParams.delete(k); else u.searchParams.set(k, v);
+    history.replaceState(null, "", u);
+  };
   const nfRender = () => {
+    syncURL();
     const q = nfQuery.toLowerCase();
     const host = $("nf-groups");
     host.innerHTML = "";
@@ -1733,7 +1900,7 @@ function main(D) {
     const stLabel = (ST[r[PSTAT]] || { label: r[PSTAT] }).label;
     const title = `[PkgEval] ${name}${r[1] ? " v" + r[1] : ""}: ${stLabel} on ${short(p.sha || p.julia || "primary")}`;
     const body = [
-      `PkgEval run [${D.run.id}](${D.run.bucket}/runs/${D.run.id}/report/report.html): ` +
+      `PkgEval run [${D.run.id}](${new URL("?run=" + encodeURIComponent(D.run.id), location.href)}): ` +
         `**${name}** ${r[1] ? "v" + r[1] + " " : ""}${stLabel}s on primary` +
         (hasAgainst ? ` but passed on the baseline.` : `.`),
       ``, ...(plog(r) ? [`- [primary log](${plog(r)})`] : []),
@@ -1746,7 +1913,10 @@ function main(D) {
     return `https://github.com/${repo}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
   };
   $("nf-groups").addEventListener("click", async (e) => {
-    const btn = e.target.closest(".expand-btn");
+    // a click anywhere on a row toggles it, except on its controls or while selecting text
+    const btn = e.target.closest(".expand-btn") ||
+      (!e.target.closest("a, input, label, button, .taildrawer") && !getSelection().toString()
+        ? e.target.closest(".rowx")?.querySelector(".expand-btn") : null);
     if (!btn) return;
     const row = btn.closest(".rowx");
     const open = btn.getAttribute("aria-expanded") === "true";
@@ -1805,10 +1975,7 @@ function main(D) {
       }
       lines.push("");
     }
-    navigator.clipboard.writeText(lines.join("\n")).then(() => {
-      $("copy-triage").textContent = "Copied";
-      setTimeout(() => { $("copy-triage").textContent = "Copy triage summary"; }, 1600);
-    });
+    copyText($("copy-triage"), lines.join("\n"));
   });
 
   // ---- histogram of baseline durations for time-limit kills -------------
@@ -1922,17 +2089,23 @@ function main(D) {
       const q = e.target.value.trim().toLowerCase();
       const host = $("lookup-results");
       if (q.length < 2) { host.innerHTML = ""; return; }
-      const hits = D.pkgs.filter((r) => r[0].toLowerCase().includes(q)).slice(0, 200);
+      const rank = (r) => { const n = r[0].toLowerCase(); return n === q ? 0 : n.startsWith(q) ? 1 : 2; };
+      const all = D.pkgs.filter((r) => r[0].toLowerCase().includes(q))
+        .sort((a, b) => rank(a) - rank(b) || a[0].localeCompare(b[0]));
+      const hits = all.slice(0, 200);
       if (!hits.length) { host.innerHTML = `<div class="group"><div class="empty-note">No package matches “${esc(q)}”.</div></div>`; return; }
-      host.innerHTML = `<div class="group"><div class="rows">${hits.map(rowHTML).join("")}</div></div>`;
+      host.innerHTML = `<div class="group"><div class="rows">${hits.map(rowHTML).join("")}</div>` +
+        (all.length > hits.length ? `<div class="empty-note">Showing the first ${hits.length} of ` +
+          `${fmtInt(all.length)} matches. Type more to narrow the search.</div>` : "") + `</div>`;
     }, 120);
   });
 
   // ---- footer -----------------------------------------------------------
+  const reportDir = `${D.run.bucket}/runs/${encodeURIComponent(D.run.id)}/report`;
   $("foot").innerHTML =
     `<span>run <span class="mono">${esc(D.run.id)}</span></span>` +
-    `<a href="report.md">report.md</a>` +
-    `<a href="db.json">db.json</a>` +
+    `<a href="${reportDir}/report.md">report.md</a>` +
+    `<a href="${reportDir}/db.json">db.json</a>` +
     `<span>PkgEvalFarm — evaluates the Julia General registry against a Julia build</span>`;
 }
 </script>
