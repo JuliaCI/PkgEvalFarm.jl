@@ -157,6 +157,7 @@
   @media (max-width: 600px) {
     .masthead { row-gap: 4px; }
     .runinfo { order: 1; flex-basis: 100%; }
+    .nav { gap: 12px; }
   }
   .brand .dots { display: inline-flex; gap: 3px; }
   .brand .dots i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
@@ -583,6 +584,7 @@
     <nav class="nav" aria-label="Pages">
       <a href="./" target="_self" id="nav-dash">Dashboard</a>
       <a href="?daily" target="_self" id="nav-daily">Daily</a>
+      <a href="https://github.com/JuliaCI/PkgEvalFarm.jl">GitHub</a>
     </nav>
   </header>
   <div class="load-state" id="loadstate">Loading report data…</div>
@@ -2159,7 +2161,7 @@ function main(D) {
     `<span>run <span class="mono">${esc(D.run.id)}</span></span>` +
     `<a href="${reportDir}/report.md">report.md</a>` +
     `<a href="${reportDir}/db.json">db.json</a>` +
-    `<span>PkgEvalFarm — evaluates the Julia General registry against a Julia build</span>`;
+    `<span><a href="https://github.com/JuliaCI/PkgEvalFarm.jl">PkgEvalFarm</a> — evaluates the Julia General registry against a Julia build</span>`;
 }
 </script>
 </body>
