@@ -1556,8 +1556,8 @@ function main(D) {
   const ST = {
     t: { label: "pass",  icon: "✓", cls: "st-t", help: "The package's tests passed." },
     l: { label: "load",  icon: "~", cls: "st-l",
-         help: "Installed and loaded, but not tested. Packages whose tests fail often on their own " +
-               "are only loaded in PR runs, since their failures say little about the change." },
+         help: "Precompiled and loaded, but not tested. This happens when the package has no tests, " +
+               "and in PR runs for packages whose tests often fail on their own." },
     f: { label: "fail",  icon: "✕", cls: "st-f",
          help: "The tests failed or errored, or the package failed to precompile or load." },
     c: { label: "crash", icon: "❗", cls: "st-c",
@@ -1579,7 +1579,7 @@ function main(D) {
     build_failed: ["A build step failed",
       "A deps/build.jl script failed, usually for missing outside software or a failed download."],
     uninstallable: ["Could not be installed", "Installing the package failed; the log says why."],
-    untestable: ["No tests", "The package has no test/runtests.jl, so there is nothing to run."],
+    untestable: ["No tests", "The package has no test/runtests.jl. Only in older runs: these packages are now loaded instead."],
     unsupported: ["Doesn't support this Julia", "No registered version of the package allows this Julia version."],
     blacklisted: ["On PkgEval's skip list",
       "Listed in PkgEval's Packages.toml: deprecated, needs proprietary software or services, or misbehaves."],
