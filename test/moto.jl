@@ -1167,6 +1167,9 @@ try
         body = FB.status_comment_body("run-1", "", "active", 5, 200, now, nothing)
         @test occursin("5/200 jobs completed.", body)
         @test !occursin("Estimated", body)
+        # reused baselines are left out of the progress
+        body = FB.status_comment_body("run-1", "", "active", 105, 200, now, nothing; reused=100)
+        @test occursin("5/100 jobs completed (plus 100 baseline results reused from earlier runs).", body)
 
         @test FB.configs_summary("[{\"name\":\"primary\",\"julia\":\"x#1\"},{\"name\":\"against\",\"julia\":\"#1.12\"}]") ==
               "primary: `x#1`, against: `#1.12`"
