@@ -245,8 +245,12 @@
     padding: 12px 14px 10px; box-shadow: var(--shadow);
     text-align: left; cursor: pointer; transition: border-color 0.12s;
   }
-  .tile:hover { border-color: var(--hairline-2); }
-  .tile[disabled] { cursor: default; }
+  /* tiles with a breakdown further down are raised and say so; plain counts sit flat */
+  .tile:not([disabled]):hover { border-color: var(--accent); }
+  .tile[disabled] { cursor: default; background: transparent; box-shadow: none; }
+  .tile:not([disabled]) { display: grid; grid-template-columns: 1fr auto; column-gap: 8px; align-items: baseline; }
+  .tile .l { grid-column: 1 / -1; }
+  .tile .go { grid-row: 1; grid-column: 2; font-size: 12px; font-weight: 600; color: var(--accent-ink); white-space: nowrap; }
   .tile .v, .tile .l { display: block; }
   .tile .v { font-size: 24px; font-weight: 700; letter-spacing: -0.01em; }
   .tile .l { font-size: 12.5px; color: var(--ink-2); margin-top: 1px; }
@@ -1705,15 +1709,18 @@ function main(D) {
     { v: fmtInt(nowPassing.length), l: "now passing", cls: "good", target: "grp-nowpass" },
     { v: fmtInt(stillFailing.length), l: "failed on both", cls: "", target: "grp-stillfail" },
     { v: fmtInt(passed), l: "passed on primary", cls: "", target: null },
-    { v: fmtInt(skipped), l: "skipped (not tested)", cls: "", target: "skip-block" },
+    { v: fmtInt(skipped), l: "skipped", cls: "", target: "skip-block" },
   ] : [
     { v: fmtInt(nNF), l: "failures", cls: "crit", target: "nf-groups" },
     { v: fmtInt(passed), l: "passed", cls: "good", target: null },
-    { v: fmtInt(skipped), l: "skipped (not tested)", cls: "", target: "skip-block" },
+    { v: fmtInt(skipped), l: "skipped", cls: "", target: "skip-block" },
   ];
   $("tiles").innerHTML = tiles.map((t) =>
-    `<button class="tile ${t.cls}" ${t.target && t.v !== "0" ? `data-target="${t.target}"` : "disabled"}>
-       <span class="v">${t.v}</span><span class="l">${t.l}</span></button>`).join("");
+    t.target && t.v !== "0"
+      ? `<button class="tile ${t.cls}" data-target="${t.target}">
+           <span class="v">${t.v}</span><span class="l">${t.l}</span><span class="go">breakdown ↓</span></button>`
+      : `<button class="tile ${t.cls}" disabled>
+           <span class="v">${t.v}</span><span class="l">${t.l}</span></button>`).join("");
   $("tiles").addEventListener("click", (e) => {
     const b = e.target.closest("[data-target]");
     if (!b) return;
