@@ -407,6 +407,7 @@ try
         # primary side was enqueued
         reused = filter(j -> get(j, "reused_from", nothing) !== nothing, jobs)
         @test length(reused) == 3
+        @test run["reused_jobs"] == 3
         @test all(j -> j["config"] == "against", reused)
         @test all(j -> j["reused_from"] == RUN_ID, reused)
         # the donor's error_line rides along for its crashed job, and stays
@@ -472,6 +473,7 @@ try
         @test PEF.expand_run(ctx, run_id, ["Example", "JSON"]) == 4
         SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
         @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2  # both baselines reused
+        @test PEF.get_run(ctx, run_id)["reused_jobs"] == 2
 
         # primary: Example fails where its reused baseline passed, JSON passes
         for _ in 1:12
@@ -486,6 +488,7 @@ try
         @test run["status"] == "active"   # held open for the re-run
         @test run["rechecked"] == 1
         @test run["completed_jobs"] == 3
+        @test run["reused_jobs"] == 1
         jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
         @test jobs["against#Example"]["status"] == "pending"
         @test haskey(jobs["against#Example"], "recheck_of")
@@ -1164,6 +1167,9 @@ try
         body = FB.status_comment_body("run-1", "", "active", 5, 200, now, nothing)
         @test occursin("5/200 jobs completed.", body)
         @test !occursin("Estimated", body)
+        # reused baselines are left out of the progress
+        body = FB.status_comment_body("run-1", "", "active", 105, 200, now, nothing; reused=100)
+        @test occursin("5/100 jobs completed (plus 100 baseline results reused from earlier runs).", body)
 
         @test FB.configs_summary("[{\"name\":\"primary\",\"julia\":\"x#1\"},{\"name\":\"against\",\"julia\":\"#1.12\"}]") ==
               "primary: `x#1`, against: `#1.12`"

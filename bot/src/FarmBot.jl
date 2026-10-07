@@ -1336,7 +1336,7 @@ message should ping the requester.
 """
 function status_comment_body(run_id::String, config_desc::String, status::String,
                              completed::Int, total::Int, asof::DateTime,
-                             eta::Union{Nothing,DateTime})
+                             eta::Union{Nothing,DateTime}; reused::Int=0)
     desc = isempty(config_desc) ? "" : " ($config_desc)"
     stampfmt = dateformat"yyyy-mm-dd HH:MM \U\T\C"
     line = if status == "expanding"
@@ -1345,7 +1345,10 @@ function status_comment_body(run_id::String, config_desc::String, status::String
         eta_note = eta === nothing ? "" :
             " Estimated completion: $(Dates.format(something(eta), stampfmt)) " *
             "(~$(remaining_str(asof, something(eta))) left)."
-        "$completed/$total jobs completed.$eta_note"
+        # reused baseline results count as completed from the start, so they are
+        # left out of the progress and mentioned on their own
+        reused_note = reused > 0 ? " (plus $reused baseline results reused from earlier runs)" : ""
+        "$(max(0, completed - reused))/$(total - reused) jobs completed$reused_note.$eta_note"
     else
         "starting up."
     end
@@ -1417,7 +1420,8 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
     context = parse_json(str(run, "context", "{}"), RunContext)
     if comment_id > 0 && context.repo !== nothing && context.issue !== nothing
         body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
-                                   status, completed, total, now, eta)
+                                   status, completed, total, now, eta;
+                                   reused=int(run, "reused_jobs", 0))
         update_comment(gh, something(context.repo), comment_id, body)
         @info "updated status comment" run_id status completed total
     end
