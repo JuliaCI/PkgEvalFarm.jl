@@ -779,14 +779,15 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         end
         r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
                                  use_cache, sealed_kwargs...)
+        logtext = r.log === missing ? nothing : String(r.log)
         JobResult(; status=String(r.status),
-                  reason=r.reason === missing ? nothing : String(r.reason),
+                  reason=refine_skip_reason(r.reason === missing ? nothing : String(r.reason), logtext),
                   version=r.version === missing ? nothing : string(r.version),
                   duration=Float64(r.duration), wall=time() - eval_started,
                   slots=cpus === nothing ? 1 : length(something(cpus)),
                   # haskey: tolerate a PkgEval pinned before peak_rss existed
                   peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
-                  log=r.log === missing ? nothing : String(r.log))
+                  log=logtext)
     catch err
         if err isa PkgEval.MissingStagedBuild
             # not a job failure: the Julia under test needs building. Ask CI
