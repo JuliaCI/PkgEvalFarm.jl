@@ -144,6 +144,19 @@ end
         @test isempty(PEF.pass_sig_hashes("all good\n"))
     end
 
+    @testset "uninstallable skips are refined by cause" begin
+        rsr = PEF.refine_skip_reason
+        @test rsr("uninstallable", "ERROR: LoadError: Unsatisfiable requirements detected for package A [123]:") ==
+              "unresolvable"
+        @test rsr("uninstallable", "ERROR: LoadError: Error building `Xpress`: \n") == "build_failed"
+        @test rsr("uninstallable", "something else") == "uninstallable"
+        @test rsr("uninstallable", nothing) == "uninstallable"
+        @test rsr("test_failures", "Unsatisfiable requirements detected") == "test_failures"
+        @test rsr(nothing, nothing) === nothing
+        @test PEF.reason_message("unresolvable") == "package dependencies could not be resolved"
+        @test PEF.reason_message("build_failed") == "a package build step failed"
+    end
+
     @testset "sig_hash" begin
         # FNV-1a 64: known vectors, since worker and bot must agree across
         # Julia versions (which Base.hash does not guarantee)

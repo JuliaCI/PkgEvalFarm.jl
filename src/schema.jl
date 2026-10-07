@@ -243,7 +243,25 @@ issuccess(status::AbstractString) = status in ("test", "load")
 reason_message(reason::Nothing) = ""
 reason_message(reason::AbstractString) =
     reason == "worker_exception" ? "the worker failed to evaluate the package" :
+    reason == "unresolvable" ? "package dependencies could not be resolved" :
+    reason == "build_failed" ? "a package build step failed" :
     PkgEval.reason_message(Symbol(reason))
+
+"""
+    refine_skip_reason(reason, log) -> reason
+
+PkgEval files every failed install under `uninstallable`. Split out the two
+common causes, so the report can say why a package wasn't tested: no set of
+dependency versions works on this Julia (`unresolvable`), or a `deps/build.jl`
+step failed, usually for missing outside software or a failed download
+(`build_failed`). Every other reason passes through unchanged.
+"""
+function refine_skip_reason(reason::Union{String,Nothing}, log::Union{String,Nothing})
+    (reason == "uninstallable" && log !== nothing) || return reason
+    occursin("Unsatisfiable requirements detected", log) && return "unresolvable"
+    occursin("Error building `", log) && return "build_failed"
+    return reason
+end
 
 # error_line heuristics, mirroring the log-tail highlighting in site/index.html
 # (analyzeTail): crash-class markers trump the first ERROR: line, which in turn

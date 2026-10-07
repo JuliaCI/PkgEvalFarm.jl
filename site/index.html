@@ -360,6 +360,15 @@
     display: flex; align-items: baseline; gap: 10px;
   }
   .subhead .n { color: var(--ink-3); font-weight: 600; font-size: 13px; }
+  .group > summary .gwhy { display: block; font-weight: 400; font-size: 12.5px; color: var(--ink-3); }
+  .legend { margin-top: 14px; font-size: 13px; color: var(--ink-2); }
+  .legend summary { cursor: pointer; }
+  .legend dl {
+    display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: baseline;
+    margin: 10px 0 0; max-width: 78ch;
+  }
+  .legend dd { margin: 0; }
+  .legend dd ul { margin: 4px 0 0; padding-left: 18px; }
   #other-groups .lede { margin: 0 0 10px; color: var(--ink-2); font-size: 13px; max-width: 72ch; }
 
   .sigpanel {
@@ -646,6 +655,10 @@
     <div class="verdict" id="verdict"></div>
     <div class="tiles" id="tiles"></div>
     <div class="runfacts" id="runfacts"></div>
+    <details class="legend">
+      <summary>What the outcomes mean</summary>
+      <dl id="legend"></dl>
+    </details>
 
     <section class="block" id="rerun-block">
       <h2>Rerun the new failures</h2>
@@ -684,6 +697,13 @@
       <h2>Other outcomes</h2>
       <p class="lede">Changes in the other direction, and failures shared with the baseline.</p>
       <div id="other-groups"></div>
+    </section>
+
+    <section class="block" id="skip-block" hidden>
+      <h2>Not tested <span class="n" id="skip-n"></span></h2>
+      <p class="lede">Packages skipped on the primary build, grouped by why. They count as neither
+        passes nor failures.</p>
+      <div id="skip-groups"></div>
     </section>
 
     <section class="block">
@@ -1530,13 +1550,35 @@ const setChip = (id, cls, text) => {
 function main(D) {
   // ---- vocabulary -------------------------------------------------------
   const ST = {
-    t: { label: "pass",  icon: "✓", cls: "st-t" },
-    l: { label: "load",  icon: "~", cls: "st-l" },
-    f: { label: "fail",  icon: "✕", cls: "st-f" },
-    c: { label: "crash", icon: "❗", cls: "st-c" },
-    k: { label: "kill",  icon: "⏱", cls: "st-k" },
-    s: { label: "skip",  icon: "–", cls: "st-s" },
-    e: { label: "error", icon: "⚠", cls: "st-e" },
+    t: { label: "pass",  icon: "✓", cls: "st-t", help: "The package's tests passed." },
+    l: { label: "load",  icon: "~", cls: "st-l",
+         help: "Installed and loaded, but not tested. Packages whose tests fail often on their own " +
+               "are only loaded in PR runs, since their failures say little about the change." },
+    f: { label: "fail",  icon: "✕", cls: "st-f",
+         help: "The tests failed or errored, or the package failed to precompile or load." },
+    c: { label: "crash", icon: "❗", cls: "st-c",
+         help: "Julia itself crashed: a segfault, abort, GC corruption, or an internal or LLVM error. " +
+               "The likeliest sign of a Julia bug." },
+    k: { label: "kill",  icon: "⏱", cls: "st-k",
+         help: "PkgEval stopped the tests: they ran past the time limit, printed nothing for too long, " +
+               "wrote too much log, or used too much memory." },
+    s: { label: "skip",  icon: "–", cls: "st-s",
+         help: "Not tested at all, so neither a pass nor a failure. The reason says why." },
+    e: { label: "error", icon: "⚠", cls: "st-e",
+         help: "The farm failed to evaluate the package (a worker or Julia build problem). " +
+               "It says nothing about the package." },
+  };
+  // the reasons a package is skipped, as [title, explanation]
+  const SKIP_WHY = {
+    unresolvable: ["Dependencies can't be resolved",
+      "No set of dependency versions works on this Julia, usually because a dependency's compat bounds exclude it."],
+    build_failed: ["A build step failed",
+      "A deps/build.jl script failed, usually for missing outside software or a failed download."],
+    uninstallable: ["Could not be installed", "Installing the package failed; the log says why."],
+    untestable: ["No tests", "The package has no test/runtests.jl, so there is nothing to run."],
+    unsupported: ["Doesn't support this Julia", "No registered version of the package allows this Julia version."],
+    blacklisted: ["On PkgEval's skip list",
+      "Listed in PkgEval's Packages.toml: deprecated, needs proprietary software or services, or misbehaves."],
   };
   const OK = new Set(["t", "l"]);
   // pkgs row layout: [name, version, ps, pr, pdur, as, ar, adur, aver-if-different, plogdir, alogdir]
@@ -1549,9 +1591,11 @@ function main(D) {
     "inference_overflow", "syntax", "uncompilable", "precompile", "method_overwriting",
     "test_failures", "test_errors", "binary_dependency", "missing_dependency", "missing_package",
     "network", "unknown", "inactivity", "time_limit", "log_limit", "resource_limit",
-    "untestable", "uninstallable", "unsupported", "blacklisted", "worker_exception"];
+    "untestable", "unresolvable", "build_failed", "uninstallable", "unsupported", "blacklisted",
+    "worker_exception"];
   const reasonCode = (ri) => (ri >= 0 && D.reasons[ri] ? D.reasons[ri][0] : "");
-  const reasonMsg = (ri) => (ri >= 0 && D.reasons[ri] ? D.reasons[ri][1] : "no reason recorded");
+  const reasonMsg = (ri) => SKIP_WHY[reasonCode(ri)]?.[0] ||
+    (ri >= 0 && D.reasons[ri] ? D.reasons[ri][1] : "no reason recorded");
   const reasonSev = (ri) => {
     const i = SEV_ORDER.indexOf(reasonCode(ri));
     return ri < 0 ? 999 : (i < 0 ? 998 : i);
@@ -1661,11 +1705,11 @@ function main(D) {
     { v: fmtInt(nowPassing.length), l: "now passing", cls: "good", target: "grp-nowpass" },
     { v: fmtInt(stillFailing.length), l: "failed on both", cls: "", target: "grp-stillfail" },
     { v: fmtInt(passed), l: "passed on primary", cls: "", target: null },
-    { v: fmtInt(skipped), l: "skipped", cls: "", target: null },
+    { v: fmtInt(skipped), l: "skipped (not tested)", cls: "", target: "skip-block" },
   ] : [
     { v: fmtInt(nNF), l: "failures", cls: "crit", target: "nf-groups" },
     { v: fmtInt(passed), l: "passed", cls: "good", target: null },
-    { v: fmtInt(skipped), l: "skipped", cls: "", target: null },
+    { v: fmtInt(skipped), l: "skipped (not tested)", cls: "", target: "skip-block" },
   ];
   $("tiles").innerHTML = tiles.map((t) =>
     `<button class="tile ${t.cls}" ${t.target && t.v !== "0" ? `data-target="${t.target}"` : "disabled"}>
@@ -1701,7 +1745,8 @@ function main(D) {
   // ---- rows + groups ----------------------------------------------------
   const badge = (st, ri, withReason) => {
     const s = ST[st] || { label: st, icon: "?", cls: "st-s" };
-    return `<span class="sbadge ${s.cls}" title="${esc(withReason && ri >= 0 ? reasonMsg(ri) : s.label)}">
+    const why = withReason && ri >= 0 ? ` Reason: ${reasonMsg(ri)}.` : "";
+    return `<span class="sbadge ${s.cls}" title="${esc(`${s.label}: ${s.help || ""}${why}`)}">
       <span class="ic">${s.icon}</span>${s.label}</span>`;
   };
   const rowHTML = (r) => {
@@ -1787,7 +1832,8 @@ function main(D) {
   const groupHTML = (g, open) => {
     const title = g.ri >= 0 ? reasonMsg(g.ri) : (OK.has(g.st) ? "passed" : "no reason recorded");
     return `<details class="group" ${open ? "open" : ""}>
-      <summary>${badge(g.st, -1, false)} ${esc(title[0].toUpperCase() + title.slice(1))}
+      <summary>${badge(g.st, -1, false)} <span>${esc(title[0].toUpperCase() + title.slice(1))}${
+          SKIP_WHY[reasonCode(g.ri)] ? `<span class="gwhy">${esc(SKIP_WHY[reasonCode(g.ri)][1])}</span>` : ""}</span>
         <span class="n">${fmtInt(g.rows.length)}</span></summary>
       <div class="rows" data-pending="1"></div>
     </details>`;
@@ -1854,7 +1900,7 @@ function main(D) {
   const present = [...new Set(newFails.map((r) => r[PSTAT]))];
   const chipOrder = ["c", "f", "k", "e"];
   $("nf-chips").innerHTML = chipOrder.filter((s) => present.includes(s)).map((s) =>
-    `<button class="chip" type="button" aria-pressed="false" data-st="${s}">
+    `<button class="chip" type="button" aria-pressed="false" data-st="${s}" title="${esc(ST[s].help)}">
        <span class="dot ${ST[s].cls}" style="background: currentColor;"></span>${ST[s].label}
        (${newFails.filter((r) => r[PSTAT] === s).length})</button>`).join(" ");
 
@@ -2133,6 +2179,24 @@ function main(D) {
         host.insertAdjacentHTML("beforeend", groupHTML(g, false));
         wireGroup(host.lastElementChild, g, "");
       }
+    }
+  }
+
+  // ---- what the outcomes mean --------------------------------------------
+  $("legend").innerHTML = Object.entries(ST).map(([st, s]) =>
+    `<dt>${badge(st, -1, false)}</dt><dd>${esc(s.help)}${st !== "s" ? "" : "<ul>" +
+      Object.values(SKIP_WHY).map(([t, why]) => `<li><b>${esc(t)}</b>: ${esc(why)}</li>`).join("") +
+      "</ul>"}</dd>`).join("");
+
+  // ---- not tested -------------------------------------------------------
+  const skippedRows = D.pkgs.filter((r) => r[PSTAT] === "s");
+  if (skippedRows.length) {
+    $("skip-block").hidden = false;
+    $("skip-n").textContent = fmtInt(skippedRows.length) + " packages";
+    const host = $("skip-groups");
+    for (const g of groupBy(skippedRows, PSTAT, PREASON).sort((a, b) => b.rows.length - a.rows.length)) {
+      host.insertAdjacentHTML("beforeend", groupHTML(g, false));
+      wireGroup(host.lastElementChild, g, "");
     }
   }
 
