@@ -144,6 +144,16 @@ end
         @test isempty(PEF.pass_sig_hashes("all good\n"))
     end
 
+    @testset "baseline re-runs over the cap" begin
+        ref(p) = PEF.JobRef("r", "against", p)
+        cands = [[("kill", ref("K$i")) for i in 1:60]; [("fail", ref("F")), ("crash", ref("C"))]]
+        recheck, skipped = PEF.pick_rechecks(cands)
+        @test length(recheck) == PEF.MAX_BASELINE_RECHECKS
+        @test skipped == length(cands) - PEF.MAX_BASELINE_RECHECKS
+        @test [j.package for j in recheck[1:2]] == ["C", "F"]   # kills go last
+        @test PEF.pick_rechecks([("kill", ref("A"))]) == ([ref("A")], 0)
+    end
+
     @testset "uninstallable skips are refined by cause" begin
         rsr = PEF.refine_skip_reason
         @test rsr("uninstallable", "ERROR: LoadError: Unsatisfiable requirements detected for package A [123]:") ==

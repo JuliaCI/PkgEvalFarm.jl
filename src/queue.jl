@@ -145,7 +145,10 @@ function duration_estimates(ctx::FarmCtx, packages::Vector{String},
             pkg in wanted || continue
             get(job, "status", "") in TERMINAL_STATUSES || continue
             get(job, "status", "") == "error" && continue
+            # PkgEval records no duration for a killed or skipped job: without the
+            # wall-time fallback those got the default estimate, the full time limit
             duration = Float64(get(job, "duration", 0.0))
+            duration > 0 || (duration = Float64(get(job, "wall", 0.0)))
             duration > 0 || continue
             est[pkg] = max(get(est, pkg, 0.0), duration)
         end
@@ -266,6 +269,7 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString,
                 "reason_message" => get(donor, "reason_message", nothing),
                 "version" => get(donor, "version", nothing),
                 "duration" => get(donor, "duration", 0.0),
+                "wall" => get(donor, "wall", nothing),
                 # the donor's log verbatim: log_key is stored per job precisely
                 # so a result can point outside its own run's prefix
                 "log_key" => get(donor, "log_key", nothing),
@@ -851,10 +855,26 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     return nothing
 end
 
-# Past this many, the change under test most likely broke the packages itself,
-# and re-running their baselines would cost more than it clears up.
+# Past this many, the change under test most likely broke many packages itself,
+# and re-running all their baselines would cost more than it clears up, so only
+# this many are re-run.
 const MAX_BASELINE_RECHECKS = 50
 const RECHECK_DELAY = Ref(60)  # seconds; the tests set it to 0
+
+"""
+    pick_rechecks(candidates) -> (recheck, skipped)
+
+The reused baselines to re-run, at most `MAX_BASELINE_RECHECKS`, from
+`(primary status, baseline job)` pairs, and how many were left out. Over the
+cap, the failures a newer registry most plausibly explains go first: a kill on
+primary is mostly a busy fleet, which a fresh baseline does not settle.
+"""
+function pick_rechecks(candidates::Vector{Tuple{String,JobRef}})
+    rank = Dict("crash" => 0, "fail" => 1, "kill" => 2)
+    sorted = sort(candidates; by=c -> (get(rank, c[1], 3), c[2].package))
+    recheck = [c[2] for c in first(sorted, MAX_BASELINE_RECHECKS)]
+    return recheck, length(candidates) - length(recheck)
+end
 
 """
     recheck_reused_baselines(ctx, run_attrs) -> Int
@@ -879,7 +899,7 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
 
     jobs = run_jobs(ctx, run_id)
     by_key = Dict(String(j["job_key"]) => j for j in jobs)
-    recheck = JobRef[]
+    candidates = Tuple{String,JobRef}[]  # (primary status, baseline to re-run)
     for j in jobs
         j["config"] == "against" && haskey(j, "reused_from") || continue
         issuccess(String(get(j, "status", ""))) || continue
@@ -887,9 +907,10 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         p === nothing && continue
         pst = String(get(p, "status", ""))
         pst in TERMINAL_STATUSES && !issuccess(pst) && pst != "skip" || continue
-        push!(recheck, JobRef(run_id, "against", String(j["package"])))
+        push!(candidates, (pst, JobRef(run_id, "against", String(j["package"]))))
     end
-    (isempty(recheck) || length(recheck) > MAX_BASELINE_RECHECKS) && return 0
+    isempty(candidates) && return 0
+    recheck, skipped = pick_rechecks(candidates)
 
     # the re-runs must evaluate under the same scheme as primary did: sealed
     # if primary was, which needs the packages added to the against seal run
@@ -910,12 +931,13 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         "Key" => ddb_item(Dict("run_id" => run_id)),
         "ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs AND " *
                                  "attribute_not_exists(rechecked)",
-        "UpdateExpression" => "SET rechecked = :n, reused_jobs = :reused, updated_at = :now" *
+        "UpdateExpression" => "SET rechecked = :n, rechecks_skipped = :skipped, " *
+                              "reused_jobs = :reused, updated_at = :now" *
                               (seal_runs isa AbstractDict ? ", seal_runs = :sr" : "") *
                               " ADD completed_jobs :minus",
         "ExpressionAttributeNames" => Dict("#s" => "status"),
         "ExpressionAttributeValues" => ddb_item(Dict(
-            ":active" => "active", ":n" => length(recheck), ":now" => now,
+            ":active" => "active", ":n" => length(recheck), ":skipped" => skipped, ":now" => now,
             ":minus" => -length(recheck),
             ":reused" => count(j -> haskey(j, "reused_from"), jobs) - length(recheck),
             (seal_runs isa AbstractDict ? ((":sr" => seal_runs),) : ())...))))]
@@ -941,7 +963,7 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         is_conditional_failure(err) && return 0  # another worker got there first
         rethrow()
     end
-    @info "re-running reused baselines of packages that fail on primary" run_id n=length(recheck)
+    @info "re-running reused baselines of packages that fail on primary" run_id n=length(recheck) skipped
     return length(recheck)
 end
 

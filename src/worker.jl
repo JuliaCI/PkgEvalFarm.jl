@@ -780,6 +780,15 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
                                  use_cache, sealed_kwargs...)
         logtext = r.log === missing ? nothing : String(r.log)
+        # the container failed to start because the kernel's per-user keyring quota
+        # ran out, and PkgEval files that as an uninstallable skip; it says nothing
+        # about the package, so retry it. Only this known failure: a Julia that does
+        # not boot must stay a skip, which the report flags as an infrastructure problem
+        if r.status === :skip && r.reason === :uninstallable &&
+           !occursin("Package evaluation to ", something(logtext, "")) &&
+           occursin(r"create keyring .*: Disk quota exceeded", something(logtext, ""))
+            error("the sandbox did not start: " * first(something(logtext, ""), 500))
+        end
         JobResult(; status=String(r.status),
                   reason=refine_skip_reason(r.reason === missing ? nothing : String(r.reason), logtext),
                   version=r.version === missing ? nothing : string(r.version),

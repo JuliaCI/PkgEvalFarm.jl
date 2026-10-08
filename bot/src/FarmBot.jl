@@ -1286,12 +1286,16 @@ estimates were recorded — fall back to the mean actual duration of finished
 jobs, or drop the ETA entirely when nothing has finished to average.
 Returns `(work_done, remaining)`, with `remaining = -1.0` meaning unknown.
 """
+# PkgEval records no duration for a killed or skipped job, so fall back to the
+# job's wall time
+job_seconds(j::Item) = (d = flt(j, "duration", 0.0)) > 0 ? d : flt(j, "wall", 0.0)
+
 function run_work(jobs::Vector{Item})
     work_done = 0.0
     ndone = 0
     for j in jobs
         if str(j, "status", "") in TERMINAL_STATUSES
-            work_done += flt(j, "duration", 0.0)
+            work_done += job_seconds(j)
             ndone += 1
         end
     end
@@ -1504,7 +1508,7 @@ status_emoji(status::String) = issuccess(status) ? "✅" :
                                status == "skip"  ? "⏭" : "❓"
 
 """
-All job items of a run. `slim=true` fetches only status/duration/est — the
+All job items of a run. `slim=true` fetches only status/duration/wall/est — the
 fields the hourly status tick needs — cutting the response (and the parse
 allocations, which have crashed the trimmed runtime on 24k-job runs) roughly
 fivefold. Report generation wants the full items.
@@ -1513,8 +1517,8 @@ function run_jobs(ctx::LiteCtx, run_id::String; slim::Bool=false)
     jobs = Item[]
     start_key = ""
     projection = slim ?
-        ",\"ProjectionExpression\":\"#s, #d, est\"," *
-        "\"ExpressionAttributeNames\":{\"#s\":\"status\",\"#d\":\"duration\"}" : ""
+        ",\"ProjectionExpression\":\"#s, #d, #w, est\"," *
+        "\"ExpressionAttributeNames\":{\"#s\":\"status\",\"#d\":\"duration\",\"#w\":\"wall\"}" : ""
     while true
         payload = "{\"TableName\":$(JSON.json(ctx.jobs_table))," *
                   "\"KeyConditionExpression\":\"run_id = :run_id\"," *
@@ -1706,6 +1710,10 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     nrecheck == 0 ||
         println(io, "- ", nrecheck, " reused baseline", nrecheck == 1 ? "" : "s",
                 " re-run because the package failed on primary")
+    nskipped = int(run, "rechecks_skipped", 0)
+    nskipped == 0 ||
+        println(io, "- ", nskipped, " more reused baseline", nskipped == 1 ? " was" : "s were",
+                " not re-run (over the limit of re-runs per run); their new failures may come from registry changes")
     total_cost = 0.0
     nmetered = 0
     for j in jobs
@@ -1746,17 +1754,27 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         new_failures = String[]
         now_passing = String[]
         still_failing = String[]
+        newly_skipped = String[]
+        no_baseline = String[]
         for pkg in sort!(collect(keys(by_pkg)))
             group = by_pkg[pkg]
             (haskey(group, config_names[1]) && haskey(group, config_names[2])) || continue
             p, a = group[config_names[1]], group[config_names[2]]
             pst, ast = str(p, "status"), str(a, "status")
             (pst in TERMINAL_STATUSES && ast in TERMINAL_STATUSES) || continue
+            # the registry can move between the two sides' jobs, so say when the
+            # baseline tested a different version
+            av = opt_str(a, "version")
+            vs = av === nothing || av == opt_str(p, "version") ? "" : " v$(something(av))"
             if !issuccess(pst) && issuccess(ast) && pst != "skip"
                 push!(new_failures, "- " * describe_job(ctx, p) *
-                      " (vs. $(status_emoji(ast)))")
+                      " (vs. $(status_emoji(ast))$vs)")
             elseif issuccess(pst) && !issuccess(ast) && ast != "skip"
                 push!(now_passing, "- " * describe_job(ctx, p))
+            elseif pst == "skip" && ast != "skip"
+                push!(newly_skipped, "- " * describe_job(ctx, p) * " (vs. $(status_emoji(ast))$vs)")
+            elseif !issuccess(pst) && pst != "skip" && ast == "skip"
+                push!(no_baseline, "- " * describe_job(ctx, p))
             elseif !issuccess(pst) && !issuccess(ast) && pst != "skip"
                 push!(still_failing, "- " * describe_job(ctx, p))
             end
@@ -1768,7 +1786,8 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         nprimary = count(j -> str(j, "config") == config_names[1], jobs)
         nprimary_skip = count(j -> str(j, "config") == config_names[1] &&
                                    str(j, "status") == "skip", jobs)
-        summary = if nprimary > 0 && 2 * nprimary_skip >= nprimary
+        infra_failure = nprimary > 0 && 2 * nprimary_skip >= nprimary
+        summary = if infra_failure
             "⚠️ $nprimary_skip of $nprimary primary evaluations were skipped — " *
             "likely an infrastructure failure; results are not meaningful"
         elseif isempty(new_failures)
@@ -1776,11 +1795,17 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         else
             "possible new issues: $(length(new_failures)) package$(length(new_failures) == 1 ? "" : "s") ❌"
         end
+        # a package that was evaluated on the baseline but skipped on primary (it
+        # no longer installs, say) is not a failure, but it is worth a look
+        (infra_failure || isempty(newly_skipped)) ||
+            (summary *= "; $(length(newly_skipped)) newly skipped")
         println(io, "**", summary, "**\n")
         for (title, entries, open) in (
                 ("❌ Packages that failed on primary but not on against", new_failures, true),
+                ("⏭️ Packages skipped on primary but evaluated on against", newly_skipped, !infra_failure),
                 ("✅ Packages that now pass", now_passing, false),
-                ("💔 Packages that failed on both", still_failing, false))
+                ("💔 Packages that failed on both", still_failing, false),
+                ("❔ Packages that failed on primary and were skipped on against", no_baseline, false))
             isempty(entries) && continue
             println(io, "<details", open ? " open" : "", "><summary>$title ($(length(entries)))</summary>\n")
             for e in entries
@@ -1936,9 +1961,10 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         print(io, ",\"in_progress\":true,\"done_jobs\":", string(ndone),
               ",\"as_of\":", JSON.json(isodate()))
     end
+    # only the jobs this run evaluated: reused baselines ran in their donor run
     cpu_seconds = 0.0
     for j in jobs
-        cpu_seconds += flt(j, "duration", 0.0)
+        opt_str(j, "reused_from") === nothing && (cpu_seconds += job_seconds(j))
     end
     print(io, ",\"cpu_hours\":", string(round(cpu_seconds / 3600; digits=1)))
     print(io, ",\"cost\":", string(round(total_cost; digits=2)),
