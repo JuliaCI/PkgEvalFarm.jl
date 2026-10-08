@@ -1,6 +1,7 @@
 # Results bucket. Workers upload logs and artifacts under runs/<run_id>/...;
-# reports are published under runs/<run_id>/report/. When public_reports is
-# enabled, reports and logs are world-readable via a bucket policy.
+# reports are published under runs/<run_id>/report/, and the bot's fleet load
+# history under fleet/. When public_reports is enabled, reports, logs and the
+# load history are world-readable via a bucket policy.
 
 resource "aws_s3_bucket" "results" {
   bucket = var.bucket_name
@@ -30,6 +31,7 @@ locals {
         Resource = [
           "${aws_s3_bucket.results.arn}/runs/*/report/*",
           "${aws_s3_bucket.results.arn}/runs/*/logs/*",
+          "${aws_s3_bucket.results.arn}/fleet/*",
         ]
       }
     ] : [],

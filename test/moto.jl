@@ -1584,6 +1584,51 @@ try
         @test protected(last(ids))                  # ...but 3 jobs still running
     end
 
+    @testset "fleet load samples" begin
+        # reuses the ASG the fleet drain test created
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, slow_queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        FB = PEF.FarmBot
+        # two workers report the slots their jobs hold; a third went quiet
+        use = PEF.SlotUse()
+        use.test[] = 30; use.seal[] = 4; use.deriv[] = 2
+        PEF.report_slot_use(ctx, "i-busy", use)
+        use.test[] = 0; use.seal[] = 8; use.deriv[] = 0; use.expand[] = 1
+        PEF.report_slot_use(ctx, "i-sealing", use)
+        Dynamodb.put_item(PEF.ddb_item(Dict("run_id" => PEF.SLOT_USE_RUN, "job_key" => "i-gone",
+                                            "reported_at" => "2020-01-01T00:00:00Z", "test" => 64)),
+                          cfg.jobs_table; aws_config=aws)
+        @test FB.slot_use(lite, Dates.now(UTC)) == [30, 12, 2, 1, 2]
+
+        t0 = Dates.now(UTC)
+        withenv("PKGEVAL_ASG_NAME" => "pkgeval-test-asg") do
+            @test FB.sample_load(lite; now=t0)
+            h1 = FB.FarmLite.parse_json(something(FB.FarmLite.s3_get(lite, FB.LOAD_KEY)),
+                                        FB.LoadHistory)
+            slots = only(h1.rows)[findfirst(==("test_slots"), h1.fields):end][1:5]
+            @test slots == [30, 12, 2, 1, 2]
+            # a second invocation within the same step adds nothing
+            @test !FB.sample_load(lite; now=t0 + Second(30))
+            @test FB.sample_load(lite; now=t0 + Minute(5))
+            # samples older than two weeks are dropped
+            @test FB.sample_load(lite; now=t0 + Day(15))
+        end
+        h = FB.FarmLite.parse_json(something(FB.FarmLite.s3_get(lite, FB.LOAD_KEY)), FB.LoadHistory)
+        @test FB.FarmLite.s3_get(lite, "fleet/missing.json") === nothing
+        @test h.fields[1:11] == ["t", "capacity", "desired", "max", "instances", "cpu", "test_slots",
+                                 "seal_slots", "deriv_slots", "expand_slots", "reporting"]
+        @test "tests_queued" in h.fields && "slow_held" in h.fields
+        @test length(h.rows) == 1
+        row = only(h.rows)
+        @test row[1] == round(Int, Dates.datetime2unix(t0 + Day(15)))
+        @test row[4] == 4                          # max size
+        @test row[5] == row[2]                     # unweighted: one unit per instance
+        @test row[6] == -1                         # no CPU datapoints in moto
+        @test row[11] == 0                         # the reports are stale by then
+    end
+
     @testset "DLQ consumer closes out dead jobs and runs" begin
         # a run with two jobs; one completes normally, one dies to the DLQ
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Alive", "Dead"], Dict{String,Any}());

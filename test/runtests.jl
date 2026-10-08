@@ -255,6 +255,43 @@ end
     @test dl["logdirs"][row[11] + 1] == "runs/RID/logs/against"
 end
 
+@testset "fleet load history" begin
+    FB = PEF.FarmBot
+    # an excerpt of a real DescribeAutoScalingGroups response: the launch
+    # template overrides carry weights too, and must not count as instances
+    xml = """
+    <DescribeAutoScalingGroupsResponse><DescribeAutoScalingGroupsResult><AutoScalingGroups><member>
+      <MixedInstancesPolicy><LaunchTemplate><Overrides>
+        <member><InstanceType>m5.8xlarge</InstanceType><WeightedCapacity>32</WeightedCapacity></member>
+        <member><InstanceType>m5.12xlarge</InstanceType><WeightedCapacity>48</WeightedCapacity></member>
+      </Overrides></LaunchTemplate></MixedInstancesPolicy>
+      <MinSize>0</MinSize><MaxSize>384</MaxSize><DesiredCapacity>112</DesiredCapacity>
+      <Instances>
+        <member><InstanceId>i-1</InstanceId><LifecycleState>InService</LifecycleState><WeightedCapacity>32</WeightedCapacity></member>
+        <member><InstanceId>i-2</InstanceId><LifecycleState>InService</LifecycleState><WeightedCapacity>48</WeightedCapacity></member>
+        <member><InstanceId>i-3</InstanceId><LifecycleState>Pending</LifecycleState><WeightedCapacity>32</WeightedCapacity></member>
+      </Instances>
+    </member></AutoScalingGroups></DescribeAutoScalingGroupsResult></DescribeAutoScalingGroupsResponse>"""
+    fleet = FB.parse_fleet_size(xml)
+    @test (fleet.capacity, fleet.desired, fleet.max, fleet.instances) == (80, 112, 384, 2)
+    empty = FB.parse_fleet_size("<MaxSize>384</MaxSize><DesiredCapacity>0</DesiredCapacity><Instances/>")
+    @test (empty.capacity, empty.instances) == (0, 0)
+
+    stats = """<GetMetricStatisticsResult><Datapoints>
+      <member><Timestamp>2026-10-08T18:05:00Z</Timestamp><Average>96.4</Average><Unit>Percent</Unit></member>
+      <member><Timestamp>2026-10-08T18:10:00Z</Timestamp><Average>91.6</Average><Unit>Percent</Unit></member>
+      <member><Timestamp>2026-10-08T18:00:00Z</Timestamp><Average>12.0</Average><Unit>Percent</Unit></member>
+    </Datapoints><Label>CPUUtilization</Label></GetMetricStatisticsResult>"""
+    @test FB.parse_latest_average(stats) == 92
+    @test FB.parse_latest_average("<Datapoints/>") == -1
+
+    h = FB.LoadHistory(["t", "capacity", "cpu"], [[100, 32, 50], [400, 64, 75]])
+    back = FB.FarmLite.parse_json(FB.load_json(h), FB.LoadHistory)
+    @test back.fields == h.fields && back.rows == h.rows
+    # a column added later reads as missing in older rows; a dropped one goes
+    @test FB.reindex_rows(h, ["t", "cpu", "seal_queued"]) == [[100, 50, -1], [400, 75, -1]]
+end
+
 @testset "bot command parsing" begin
     parse_command = PEF.FarmBot.parse_command
     @test parse_command("hello world") === nothing

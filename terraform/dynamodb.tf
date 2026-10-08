@@ -31,4 +31,11 @@ resource "aws_dynamodb_table" "jobs" {
     name = "job_key"
     type = "S"
   }
+
+  # only the workers' slot-use records (run_id "_fleet") carry it: they
+  # expire an hour after their instance stops reporting
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
 }
