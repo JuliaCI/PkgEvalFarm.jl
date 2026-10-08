@@ -424,9 +424,11 @@ function add_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages::Vect
 end
 
 "Enqueue seal jobs on the seal queue."
-enqueue_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages) =
+function enqueue_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages)
+    forget_wanted_seal_runs!()
     enqueue_jobs(ctx, [JobRef(seal_run_id, SEAL_CONFIG_NAME, pkg) for pkg in packages];
                  queue_url=ctx.cfg.seal_queue_url)
+end
 
 """
 Decrement each dependent's readiness counter after a seal job reached a
@@ -686,32 +688,34 @@ end
 # whose seal run no in-flight run uses is dropped and left pending. The next run
 # that needs the package queues it again (add_seal_jobs re-queues ready jobs),
 # and a gated test's reconciliation re-sends any ready job it still waits on.
-const SEAL_WANTED_CACHE = Dict{String,Tuple{Bool,Float64}}()
+const SEAL_WANTED = Ref((Set{String}(), 0.0))   # (seal run ids, valid until)
 const SEAL_WANTED_LOCK = ReentrantLock()
 
 function seal_run_wanted(ctx::FarmCtx, id::AbstractString)
     now = time()
-    hit = lock(() -> get(SEAL_WANTED_CACHE, id, nothing), SEAL_WANTED_LOCK)
-    hit !== nothing && now < hit[2] && return hit[1]
-    wanted = try
-        any_run_uses_seal_run(ctx, id)
-    catch err
-        @warn "could not check whether a seal run is still needed; keeping its job" id err
-        true
+    wanted, until = lock(() -> SEAL_WANTED[], SEAL_WANTED_LOCK)
+    if now >= until
+        wanted = try
+            wanted_seal_runs(ctx)
+        catch err
+            @warn "could not check which seal runs are still needed; keeping the job" id err
+            return true
+        end
+        lock(() -> (SEAL_WANTED[] = (wanted, now + 30)), SEAL_WANTED_LOCK)
     end
-    # runs end rarely, so a yes can be kept a while; a no must notice a new run soon
-    lock(SEAL_WANTED_LOCK) do
-        SEAL_WANTED_CACHE[id] = (wanted, now + (wanted ? 300 : 30))
-    end
-    return wanted
+    return id in wanted
 end
 
+"Drop the cached answer, so a seal run this worker just queued jobs for counts at once."
+forget_wanted_seal_runs!() = lock(() -> (SEAL_WANTED[] = (Set{String}(), 0.0)), SEAL_WANTED_LOCK)
+
 """
-Whether a user run still in flight uses the seal run `id`: an active run that maps a
-config to it, or an expanding run (whose mapping isn't written yet) with a
-config that fingerprints to it.
+The seal runs that user runs still in flight use: those an active run maps a
+config to, and those an expanding run's configs fingerprint to (its mapping is
+written only after its seal jobs are queued). One scan covers every seal run.
 """
-function any_run_uses_seal_run(ctx::FarmCtx, id::AbstractString)
+function wanted_seal_runs(ctx::FarmCtx)
+    wanted = Set{String}()
     start_key = nothing
     while true
         params = Dict{String,Any}(
@@ -727,14 +731,15 @@ function any_run_uses_seal_run(ctx::FarmCtx, id::AbstractString)
         end
         for item in ddb_parse.(resp["Items"])
             seal_runs = get(item, "seal_runs", nothing)
-            seal_runs isa AbstractDict && id in values(seal_runs) && return true
+            seal_runs isa AbstractDict && union!(wanted, String.(values(seal_runs)))
             if get(item, "status", "") == "expanding" && haskey(item, "configs")
-                any(c -> seal_run_id(seal_fingerprint(c)) == id,
-                    JSON.parse(item["configs"])) && return true
+                for c in JSON.parse(item["configs"])
+                    push!(wanted, seal_run_id(seal_fingerprint(c)))
+                end
             end
         end
         start_key = get(resp, "LastEvaluatedKey", nothing)
-        start_key === nothing && return false
+        start_key === nothing && return wanted
     end
 end
 
