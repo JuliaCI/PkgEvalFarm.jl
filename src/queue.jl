@@ -477,16 +477,29 @@ end
 
 function claim_from_queues(ctx::FarmCtx, queues)
     message, from_queue = nothing, ""
+    drops = 0
     for (queue, w) in queues
-        resp = SQS.receive_message(queue,
-            Dict("WaitTimeSeconds" => w, "MaxNumberOfMessages" => 1,
-                 "VisibilityTimeout" => VISIBILITY_TIMEOUT,
-                 "AttributeNames" => ["ApproximateReceiveCount"]);
-            aws_config=ctx.aws)
-        messages = get(resp, "Messages", nothing)
-        (messages === nothing || isempty(messages)) && continue
-        message, from_queue = only(messages), queue
-        break
+        while true
+            resp = SQS.receive_message(queue,
+                Dict("WaitTimeSeconds" => w, "MaxNumberOfMessages" => 1,
+                     "VisibilityTimeout" => VISIBILITY_TIMEOUT,
+                     "AttributeNames" => ["ApproximateReceiveCount"]);
+                aws_config=ctx.aws)
+            messages = get(resp, "Messages", nothing)
+            (messages === nothing || isempty(messages)) && break
+            m = only(messages)
+            if unneeded_seal_message(ctx, m)
+                # no run waits on this seal job any more; it stays pending for a
+                # later one. Keep polling, so a backlog of these doesn't hide the
+                # work behind it
+                SQS.delete_message(queue, m["ReceiptHandle"]; aws_config=ctx.aws)
+                (drops += 1) < 50 && continue
+                return nothing
+            end
+            message, from_queue = m, queue
+            break
+        end
+        message === nothing || break
     end
     message === nothing && return nothing
     receipt = message["ReceiptHandle"]
@@ -530,6 +543,13 @@ function claim_from_queues(ctx::FarmCtx, queues)
         rethrow()
     end
     return ClaimedJob(job, receipt, receive_count, from_queue)
+end
+
+function unneeded_seal_message(ctx::FarmCtx, message)
+    body = JSON.parse(message["Body"])
+    get(body, "expand", false) == true && return false
+    job = JobRef(body)
+    return is_seal_job(job) && !seal_run_wanted(ctx, job.run_id)
 end
 
 function job_is_running(ctx::FarmCtx, job::JobRef)

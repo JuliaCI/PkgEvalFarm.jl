@@ -424,9 +424,11 @@ function add_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages::Vect
 end
 
 "Enqueue seal jobs on the seal queue."
-enqueue_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages) =
+function enqueue_seal_jobs(ctx::FarmCtx, seal_run_id::AbstractString, packages)
+    forget_wanted_seal_runs!()
     enqueue_jobs(ctx, [JobRef(seal_run_id, SEAL_CONFIG_NAME, pkg) for pkg in packages];
                  queue_url=ctx.cfg.seal_queue_url)
+end
 
 """
 Decrement each dependent's readiness counter after a seal job reached a
@@ -675,6 +677,70 @@ function maybe_reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString; eve
         @warn "seal reconciliation failed" seal_run_id err
     end
     return nothing
+end
+
+
+## seal runs nobody needs any more
+
+# Seal runs are shared and outlive the runs that queued their jobs: dependency
+# cycles keep some jobs pending, and the rest keep running after the last test
+# that wanted them finished, taking slots from live work. So a claimed seal job
+# whose seal run no in-flight run uses is dropped and left pending. The next run
+# that needs the package queues it again (add_seal_jobs re-queues ready jobs),
+# and a gated test's reconciliation re-sends any ready job it still waits on.
+const SEAL_WANTED = Ref((Set{String}(), 0.0))   # (seal run ids, valid until)
+const SEAL_WANTED_LOCK = ReentrantLock()
+
+function seal_run_wanted(ctx::FarmCtx, id::AbstractString)
+    now = time()
+    wanted, until = lock(() -> SEAL_WANTED[], SEAL_WANTED_LOCK)
+    if now >= until
+        wanted = try
+            wanted_seal_runs(ctx)
+        catch err
+            @warn "could not check which seal runs are still needed; keeping the job" id err
+            return true
+        end
+        lock(() -> (SEAL_WANTED[] = (wanted, now + 30)), SEAL_WANTED_LOCK)
+    end
+    return id in wanted
+end
+
+"Drop the cached answer, so a seal run this worker just queued jobs for counts at once."
+forget_wanted_seal_runs!() = lock(() -> (SEAL_WANTED[] = (Set{String}(), 0.0)), SEAL_WANTED_LOCK)
+
+"""
+The seal runs that user runs still in flight use: those an active run maps a
+config to, and those an expanding run's configs fingerprint to (its mapping is
+written only after its seal jobs are queued). One scan covers every seal run.
+"""
+function wanted_seal_runs(ctx::FarmCtx)
+    wanted = Set{String}()
+    start_key = nothing
+    while true
+        params = Dict{String,Any}(
+            # seal and derivation runs carry `kind`; user runs don't
+            "FilterExpression" => "#s IN (:expanding, :active) AND attribute_not_exists(kind)",
+            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeValues" => ddb_item(Dict(
+                ":expanding" => "expanding", ":active" => "active")),
+            "ProjectionExpression" => "run_id, #s, seal_runs, configs")
+        start_key === nothing || (params["ExclusiveStartKey"] = start_key)
+        resp = aws_retry() do
+            Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
+        end
+        for item in ddb_parse.(resp["Items"])
+            seal_runs = get(item, "seal_runs", nothing)
+            seal_runs isa AbstractDict && union!(wanted, String.(values(seal_runs)))
+            if get(item, "status", "") == "expanding" && haskey(item, "configs")
+                for c in JSON.parse(item["configs"])
+                    push!(wanted, seal_run_id(seal_fingerprint(c)))
+                end
+            end
+        end
+        start_key = get(resp, "LastEvaluatedKey", nothing)
+        start_key === nothing && return wanted
+    end
 end
 
 
