@@ -18,10 +18,14 @@ command -v iptables >/dev/null || { apt-get update -q; apt-get install -qy iptab
 iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner root -j REJECT
 
 # rootless containers (crun) + rr need these; Ubuntu 24.04 restricts
-# unprivileged user namespaces via AppArmor by default
+# unprivileged user namespaces via AppArmor by default. crun also creates a
+# keyring per container, and the default per-user quota (200 keys) ran out on
+# a busy worker, so every sandbox there failed to start
 cat >/etc/sysctl.d/99-pkgeval.conf <<SYSCTL
 kernel.apparmor_restrict_unprivileged_userns = 0
 kernel.perf_event_paranoid = 1
+kernel.keys.maxkeys = 20000
+kernel.keys.maxbytes = 4000000
 SYSCTL
 sysctl --system
 

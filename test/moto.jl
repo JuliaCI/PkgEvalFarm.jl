@@ -615,6 +615,16 @@ try
         @test est["Alpha"] == 100.0    # max over donors, not first-donor-wins
         # and completed_runs supplies the total_jobs the preference keys on
         @test any(d -> d[4] >= 6, PEF.completed_runs(ctx))
+        # a killed or skipped job records no duration; its wall time stands in
+        for (pkg, status, wall) in (("Delta", "kill", 2700.0), ("Epsilon", "skip", 30.0))
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                "run_id" => "wall-donor", "job_key" => "primary#$pkg", "config" => "primary",
+                "package" => pkg, "status" => status, "duration" => 0.0, "wall" => wall)),
+                cfg.jobs_table; aws_config=aws)
+        end
+        est = PEF.duration_estimates(ctx, ["Delta", "Epsilon"],
+                                     [("2026-01-05T00:00:00Z", "wall-donor", Any[], 2)])
+        @test est == Dict("Delta" => 2700.0, "Epsilon" => 30.0)
     end
 
     @testset "baseline reuse merges donors" begin
@@ -1146,15 +1156,18 @@ try
 
         # run_work: actual durations for the finished, estimates for the rest,
         # mean-of-finished fallback for jobs without a stored estimate
-        mk(st; dur=nothing, est=nothing) = PEF.FarmLite.Item(
+        mk(st; dur=nothing, est=nothing, wall=nothing) = PEF.FarmLite.Item(
             "status" => PEF.FarmLite.attr(st),
             (dur === nothing ? () : ("duration" => PEF.FarmLite.attr(dur),))...,
+            (wall === nothing ? () : ("wall" => PEF.FarmLite.attr(wall),))...,
             (est === nothing ? () : ("est" => PEF.FarmLite.attr(est),))...)
         jobs = [mk("test"; dur=100.0, est=50.0), mk("fail"; dur=300.0),
                 mk("pending"; est=500.0), mk("running")]
         @test FB.run_work(jobs) == (400.0, 700.0)   # 500 est + 200 fallback
         @test FB.run_work([mk("pending"; est=500.0), mk("pending")]) == (0.0, -1.0)
         @test FB.run_work([mk("test"; dur=60.0), mk("pending"; est=30.0)]) == (60.0, 30.0)
+        # a kill records no duration; its wall time counts as the work done
+        @test FB.run_work([mk("kill"; dur=0.0, wall=2700.0), mk("pending"; est=30.0)]) == (2700.0, 30.0)
 
         body = FB.status_comment_body("run-1", "primary: `a`, against: `b`",
                                       "active", 80, 200, now, eta)
