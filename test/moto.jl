@@ -1935,6 +1935,32 @@ try
                 end
             end
 
+            # a seal run that no in-flight run uses drops its claimed jobs and
+            # leaves them pending; one that an active run maps to is still wanted
+            @test PEF.any_run_uses_seal_run(sctx, sr)
+            @test !PEF.any_run_uses_seal_run(sctx, cyc_run)
+            Dynamodb.put_item(PEF.ddb_item(Dict(
+                    "run_id" => cyc_run, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, "Orphan"),
+                    "config" => PEF.SEAL_CONFIG_NAME, "package" => "Orphan", "kind" => "seal",
+                    "status" => "pending", "attempts" => 0, "deps" => String[],
+                    "dependents" => String[], "remaining" => 0)), "pkgeval-jobs"; aws_config=aws)
+            PEF.enqueue_seal_jobs(sctx, cyc_run, ["Orphan"])
+            @test PEF.claim_seal_job(sctx) === nothing
+            @test PEF.get_seal_item(sctx, PEF.JobRef(cyc_run, PEF.SEAL_CONFIG_NAME, "Orphan"))["status"] ==
+                  "pending"
+            # an expanding run hasn't written its seal mapping yet, so its configs'
+            # fingerprints count
+            let cfg = Dict{String,Any}("name" => "primary", "julia" => "fake-julia-expanding")
+                exp_seal = PEF.seal_run_id(PEF.seal_fingerprint(cfg))
+                @test !PEF.any_run_uses_seal_run(sctx, exp_seal)
+                Dynamodb.put_item(PEF.ddb_item(Dict(
+                        "run_id" => "expanding-run", "status" => "expanding",
+                        "configs" => JSON.json([cfg]))), "pkgeval-runs"; aws_config=aws)
+                @test PEF.any_run_uses_seal_run(sctx, exp_seal)
+                Dynamodb.delete_item(PEF.ddb_item(Dict("run_id" => "expanding-run")),
+                                     "pkgeval-runs"; aws_config=aws)
+            end
+
             # learned edges round-trip
             PEF.record_learned_edges(sctx, "JSON", ["Crayons", "TestExtras"])
             @test PEF.learned_edges(sctx)["JSON"] == ["Crayons", "TestExtras"]

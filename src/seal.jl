@@ -678,6 +678,67 @@ function maybe_reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString; eve
 end
 
 
+## seal runs nobody needs any more
+
+# Seal runs are shared and outlive the runs that queued their jobs: dependency
+# cycles keep some jobs pending, and the rest keep running after the last test
+# that wanted them finished, taking slots from live work. So a claimed seal job
+# whose seal run no in-flight run uses is dropped and left pending. The next run
+# that needs the package queues it again (add_seal_jobs re-queues ready jobs),
+# and a gated test's reconciliation re-sends any ready job it still waits on.
+const SEAL_WANTED_CACHE = Dict{String,Tuple{Bool,Float64}}()
+const SEAL_WANTED_LOCK = ReentrantLock()
+
+function seal_run_wanted(ctx::FarmCtx, id::AbstractString)
+    now = time()
+    hit = lock(() -> get(SEAL_WANTED_CACHE, id, nothing), SEAL_WANTED_LOCK)
+    hit !== nothing && now < hit[2] && return hit[1]
+    wanted = try
+        any_run_uses_seal_run(ctx, id)
+    catch err
+        @warn "could not check whether a seal run is still needed; keeping its job" id err
+        true
+    end
+    # runs end rarely, so a yes can be kept a while; a no must notice a new run soon
+    lock(SEAL_WANTED_LOCK) do
+        SEAL_WANTED_CACHE[id] = (wanted, now + (wanted ? 300 : 30))
+    end
+    return wanted
+end
+
+"""
+Whether a user run still in flight uses the seal run `id`: an active run that maps a
+config to it, or an expanding run (whose mapping isn't written yet) with a
+config that fingerprints to it.
+"""
+function any_run_uses_seal_run(ctx::FarmCtx, id::AbstractString)
+    start_key = nothing
+    while true
+        params = Dict{String,Any}(
+            # seal and derivation runs carry `kind`; user runs don't
+            "FilterExpression" => "#s IN (:expanding, :active) AND attribute_not_exists(kind)",
+            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeValues" => ddb_item(Dict(
+                ":expanding" => "expanding", ":active" => "active")),
+            "ProjectionExpression" => "run_id, #s, seal_runs, configs")
+        start_key === nothing || (params["ExclusiveStartKey"] = start_key)
+        resp = aws_retry() do
+            Dynamodb.scan(ctx.cfg.runs_table, params; aws_config=ctx.aws)
+        end
+        for item in ddb_parse.(resp["Items"])
+            seal_runs = get(item, "seal_runs", nothing)
+            seal_runs isa AbstractDict && id in values(seal_runs) && return true
+            if get(item, "status", "") == "expanding" && haskey(item, "configs")
+                any(c -> seal_run_id(seal_fingerprint(c)) == id,
+                    JSON.parse(item["configs"])) && return true
+            end
+        end
+        start_key = get(resp, "LastEvaluatedKey", nothing)
+        start_key === nothing && return false
+    end
+end
+
+
 ## the test-job gate
 
 """

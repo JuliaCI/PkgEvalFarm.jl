@@ -495,6 +495,12 @@ function claim_from_queues(ctx::FarmCtx, queues)
         return ClaimedExpand(body["run_id"], receipt, from_queue)
     job = JobRef(body)
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
+    if job.config == SEAL_CONFIG_NAME && !seal_run_wanted(ctx, job.run_id)
+        # no run waits on this seal job any more; it stays pending for a later one
+        SQS.delete_message(from_queue, receipt; aws_config=ctx.aws)
+        @debug "dropped a seal job no run needs" job.run_id job.package
+        return nothing
+    end
 
     # flip pending -> running. A job already `running` is re-claimable only
     # when its worker looks dead (heartbeat_at stale beyond three beats, or

@@ -96,6 +96,14 @@ across user runs with the same seal id: a recurring baseline config gets
 cross-run cache reuse for free, and later runs only add jobs for packages not
 yet covered (create-only item writes keep the totals honest).
 
+Because they are shared, seal runs outlive the user runs that queued their
+jobs. A worker that claims a seal job checks that some user run still in
+flight uses its seal run (an active run's `seal_runs` map, or an expanding
+run's config fingerprints); if none does, it drops the message and leaves the
+job pending instead of taking a slot from live work. The next run that needs
+the package re-queues it, and reconciliation re-sends any ready job a gated
+test still waits on.
+
 Test-job dependency discovery that the static graph missed (runtime `Pkg.add`,
 platform-conditional deps) is handled by the want/derivation machinery below;
 seal-job discovery is handled by construction (the seal job resolves the real
