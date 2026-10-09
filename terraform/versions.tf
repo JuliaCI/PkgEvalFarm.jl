@@ -1,5 +1,15 @@
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.10"
+
+  # Shared state, so anyone with admin access to the account can apply. The
+  # bucket is versioned and also holds the Pkg servers' state.
+  backend "s3" {
+    bucket       = "julialang-terraform"
+    key          = "pkgeval-farm.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 
   required_providers {
     aws = {

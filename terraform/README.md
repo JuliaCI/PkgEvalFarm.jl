@@ -210,6 +210,10 @@ itself would still be a welcome belt-and-braces improvement.
 
    (`tofu validate` works without the zips, but `plan`/`apply` require them.)
 
+   State lives in `s3://julialang-terraform/pkgeval-farm.tfstate` (see
+   versions.tf), so `tofu init` needs AWS credentials for the account. A
+   deployment elsewhere changes the backend block first.
+
 2. Deploy:
 
    ```sh
