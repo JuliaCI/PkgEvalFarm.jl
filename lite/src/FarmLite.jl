@@ -186,8 +186,20 @@ function sqs_send_message(ctx::LiteCtx, body::String;
     return nothing
 end
 
-"Signed S3 PUT (path-style against emulators, virtual-hosted otherwise)."
-function s3_put(ctx::LiteCtx, key::String, body::String; content_type::String="text/plain; charset=utf-8")
+"Signed POST of an AWS Query operation (Auto Scaling), returning the XML response."
+function aws_query(ctx::LiteCtx, service::String, form::String)
+    url = service_url(ctx, service)
+    headers = sigv4_headers(; method="POST", host=host_of(url), path="/", body=form,
+                            region=ctx.region, service, creds=ctx.creds)
+    # Query services may answer in JSON when asked to; callers parse XML
+    filter!(h -> first(h) != "Accept", headers)
+    resp = http_request("POST", url; headers, body=form)
+    resp.status == 200 || error("$service query failed (HTTP $(resp.status)): $(resp.body)")
+    return resp.body
+end
+
+"Host, URL and signing path of an S3 object (path-style against emulators, virtual-hosted otherwise)."
+function s3_location(ctx::LiteCtx, key::String)
     if ctx.endpoint === nothing
         host = "$(ctx.bucket).s3.$(ctx.region).amazonaws.com"
         url = "https://$host/$key"
@@ -197,7 +209,24 @@ function s3_put(ctx::LiteCtx, key::String, body::String; content_type::String="t
         url = String(rstrip(ctx.endpoint, '/')) * "/$(ctx.bucket)/$key"
         path = "/$(ctx.bucket)/$key"
     end
-    path = join(map(urlencode, split(path, '/')), '/')
+    return host, url, join(map(urlencode, split(path, '/')), '/')
+end
+
+"Signed S3 GET; `nothing` when the object does not exist."
+function s3_get(ctx::LiteCtx, key::String)
+    host, url, path = s3_location(ctx, key)
+    headers = sigv4_headers(; method="GET", host, path, body="",
+                            region=ctx.region, service="s3", creds=ctx.creds,
+                            extra_headers=["x-amz-content-sha256" => hexdigest("")])
+    resp = http_request("GET", url; headers)
+    resp.status == 404 && return nothing
+    resp.status == 200 || error("S3 GET $key failed (HTTP $(resp.status)): $(resp.body)")
+    return resp.body
+end
+
+"Signed S3 PUT."
+function s3_put(ctx::LiteCtx, key::String, body::String; content_type::String="text/plain; charset=utf-8")
+    host, url, path = s3_location(ctx, key)
     headers = sigv4_headers(; method="PUT", host, path, body,
                             region=ctx.region, service="s3", creds=ctx.creds,
                             content_type,

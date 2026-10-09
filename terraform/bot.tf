@@ -156,6 +156,10 @@ resource "aws_lambda_function" "bot" {
       PKGEVAL_RUNS_TABLE     = aws_dynamodb_table.runs.name
       PKGEVAL_JOBS_TABLE     = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET         = aws_s3_bucket.results.bucket
+      # sampled for the dashboard's fleet load chart
+      PKGEVAL_SEAL_QUEUE_URL  = aws_sqs_queue.jobs_seal.url
+      PKGEVAL_DERIV_QUEUE_URL = aws_sqs_queue.jobs_deriv.url
+      PKGEVAL_ASG_NAME        = local.ec2_workers == 1 ? aws_autoscaling_group.ec2_worker[0].name : ""
       # lets the DLQ consumer recognize (and recycle) messages that are only
       # waiting on a pending CI build; empty when build requests are disabled
       PKGEVAL_BUILDS_TABLE = local.build_request_enabled == 1 ? aws_dynamodb_table.builds[0].name : ""
@@ -292,4 +296,61 @@ resource "aws_lambda_permission" "bot_schedule" {
   function_name = aws_lambda_function.bot[0].function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.bot_schedule[0].arn
+}
+
+# --- Trigger 4: fleet load samples for the dashboard ---------------------------
+# Every few minutes the bot records fleet capacity, CPU use and queue depths into
+# fleet/load.json, which the dashboard charts.
+
+resource "aws_iam_role_policy" "bot_fleet_load" {
+  count = local.bot_enabled
+  name  = "sample-fleet-load"
+  role  = aws_iam_role.bot[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # neither action supports resource-level permissions
+        Effect   = "Allow"
+        Action   = ["autoscaling:DescribeAutoScalingGroups", "cloudwatch:GetMetricStatistics"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = "sqs:GetQueueAttributes"
+        Resource = [
+          aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+          aws_sqs_queue.jobs_seal.arn, aws_sqs_queue.jobs_deriv.arn,
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.results.arn}/fleet/*"
+      },
+    ]
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "bot_load_sample" {
+  count               = local.bot_enabled
+  name                = "${var.name_prefix}-bot-load-sample"
+  schedule_expression = "rate(5 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "bot_load_sample" {
+  count = local.bot_enabled
+  rule  = aws_cloudwatch_event_rule.bot_load_sample[0].name
+  arn   = aws_lambda_function.bot[0].arn
+  input = jsonencode({ sample = true })
+}
+
+resource "aws_lambda_permission" "bot_load_sample" {
+  count         = local.bot_enabled
+  statement_id  = "AllowEventBridgeLoadSample"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.bot[0].function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.bot_load_sample[0].arn
 }

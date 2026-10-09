@@ -115,6 +115,11 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     foreach(c -> put!(spill_cpus, c % max(ninstances, 1)), 0:nspill-1)
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
     fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
+    use = SlotUse()                       # vCPUs held, by kind of job
+    fleet === nothing || errormonitor(@async while !draining[] && isopen(work)
+        report_slot_use(ctx, fleet.instance_id, use)
+        sleep(60)
+    end)
 
     # Fast-release on shutdown: systemd's ExecStop (and the spot-notice timer)
     # touch PKGEVAL_DRAIN_FILE; the watcher below then releases every claimed
@@ -147,6 +152,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     slots = map(1:(ninstances + nspill)) do i
         errormonitor(@async begin
             for (claimed, cpus, spill) in work
+                held = slot_counter(use, claimed)
+                Threads.atomic_add!(held, length(cpus))
                 try
                     if claimed isa ClaimedExpand
                         process_expand(ctx, claimed)
@@ -155,6 +162,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                                     cpus)
                     end
                 finally
+                    Threads.atomic_sub!(held, length(cpus))
                     lock(claims_lock) do
                         delete!(active_claims, claimed.receipt_handle)
                     end
@@ -492,6 +500,50 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
         @warn "failed to update scale-in protection" err
     end
     return fleet.draining
+end
+
+"The vCPUs a worker's running jobs hold, by kind of job."
+struct SlotUse
+    test::Threads.Atomic{Int}
+    seal::Threads.Atomic{Int}
+    deriv::Threads.Atomic{Int}
+    expand::Threads.Atomic{Int}
+end
+SlotUse() = SlotUse(Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+                    Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
+
+function slot_counter(use::SlotUse, claimed)
+    claimed isa ClaimedExpand && return use.expand
+    is_seal_job(claimed.job) && return use.seal
+    is_derivation_job(claimed.job) && return use.deriv
+    return use.test
+end
+
+# jobs-table partition holding one slot-use record per EC2 instance
+const SLOT_USE_RUN = "_fleet"
+
+"""
+Record the vCPUs this instance's jobs hold, by kind, for the dashboard's load
+chart. The bot adds up the recent records every few minutes; a record expires
+an hour after its instance stops reporting. Best effort.
+"""
+function report_slot_use(ctx::FarmCtx, instance_id::String, use::SlotUse)
+    try
+        Dynamodb.update_item(ddb_item(Dict("run_id" => SLOT_USE_RUN, "job_key" => instance_id)),
+            ctx.cfg.jobs_table,
+            Dict("UpdateExpression" => "SET #at = :now, #exp = :exp, #t = :t, #s = :s, #d = :d, #e = :e",
+                 "ExpressionAttributeNames" => Dict("#at" => "reported_at", "#exp" => "expires_at",
+                                                    "#t" => "test", "#s" => "seal",
+                                                    "#d" => "deriv", "#e" => "expand"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":now" => isodate(), ":exp" => round(Int, time()) + 3600,
+                     ":t" => use.test[], ":s" => use.seal[], ":d" => use.deriv[],
+                     ":e" => use.expand[])));
+            aws_config=ctx.aws)
+    catch err
+        @warn "slot use report failed" err
+    end
+    return nothing
 end
 
 """

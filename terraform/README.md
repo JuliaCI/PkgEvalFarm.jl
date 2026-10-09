@@ -27,8 +27,9 @@ temporary AWS credentials to authorized GitHub users.
   webhooks (when `github_webhook_secret` is set; register the
   `bot_webhook_url` output on the target repo/org — requires admin there), the
   runs table's DynamoDB stream (filtered to `status = "done"`) for report
-  posting, and an EventBridge schedule (`bot_schedule`, default hourly) as a
-  notifications-polling fallback.
+  posting, an EventBridge schedule (`bot_schedule`, default hourly) as a
+  notifications-polling fallback, and a 5-minute schedule that records fleet
+  capacity, CPU use and queue depths in `fleet/load.json` for the dashboard.
 
 ## Enrollment and authorization
 

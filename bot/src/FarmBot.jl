@@ -2178,6 +2178,250 @@ end
 ## entry points
 
 "One poll iteration: the daily run, then new commands, finished runs and progress edits."
+## fleet load history, charted on the dashboard
+#
+# A rolling sample of fleet capacity, CPU use, slot use and queue depths,
+# written every few minutes by its own schedule. The site reads it from the
+# public fleet/ prefix, so it needs no AWS access of its own.
+
+const LOAD_KEY = "fleet/load.json"
+const LOAD_STEP = 300            # seconds between samples, as scheduled
+const LOAD_KEEP = 14 * 24 * 3600 # seconds of history kept
+
+struct FleetSize
+    capacity::Int   # weighted capacity (vCPUs) of the in-service instances
+    desired::Int
+    max::Int
+    instances::Int
+end
+
+xml_int(m::Union{Nothing,RegexMatch}) =
+    m === nothing ? 0 : something(tryparse(Int, something(m.captures[1])), 0)
+
+"Read a DescribeAutoScalingGroups response for one group."
+function parse_fleet_size(xml::AbstractString)
+    capacity = 0
+    instances = 0
+    open_tag = findfirst("<Instances>", xml)
+    close_tag = findfirst("</Instances>", xml)
+    if open_tag !== nothing && close_tag !== nothing
+        # the launch template overrides carry weights too; only count instances'
+        block = SubString(xml, last(open_tag) + 1, first(close_tag) - 1)
+        for m in eachmatch(r"<member>(.*?)</member>"s, block)
+            inst = something(m.captures[1])
+            occursin("<LifecycleState>InService</LifecycleState>", inst) || continue
+            weight = xml_int(match(r"<WeightedCapacity>(\d+)</WeightedCapacity>", inst))
+            capacity += weight > 0 ? weight : 1
+            instances += 1
+        end
+    end
+    return FleetSize(capacity,
+                     xml_int(match(r"<DesiredCapacity>(\d+)</DesiredCapacity>", xml)),
+                     xml_int(match(r"<MaxSize>(\d+)</MaxSize>", xml)), instances)
+end
+
+function fleet_size(ctx::LiteCtx, asg::String)
+    isempty(asg) && return FleetSize(0, 0, 0, 0)
+    form = "Action=DescribeAutoScalingGroups&Version=2011-01-01" *
+           "&AutoScalingGroupNames.member.1=" * urlencode(asg)
+    return parse_fleet_size(FarmLite.aws_query(ctx, "autoscaling", form))
+end
+
+"The newest datapoint's average in a GetMetricStatistics response, rounded; -1 if none."
+function parse_latest_average(xml::AbstractString)
+    newest = ""
+    value = -1
+    for m in eachmatch(r"<member>(.*?)</member>"s, xml)
+        point = something(m.captures[1])
+        ts = match(r"<Timestamp>([^<]+)</Timestamp>", point)
+        avg = match(r"<Average>([^<]+)</Average>", point)
+        (ts === nothing || avg === nothing) && continue
+        stamp = String(something(ts.captures[1]))
+        x = tryparse(Float64, something(avg.captures[1]))
+        (x === nothing || stamp <= newest) && continue
+        newest = stamp
+        value = round(Int, something(x))
+    end
+    return value
+end
+
+"""
+Average CPU use of the group's instances in percent, or -1 when CloudWatch has no
+recent datapoint. Queue depths can't stand in for this: jobs that wait on their
+precompile step are handed back with a delay and count as in flight meanwhile.
+"""
+function fleet_cpu(ctx::LiteCtx, asg::String, now::DateTime)
+    isempty(asg) && return -1
+    form = "Action=GetMetricStatistics&Version=2010-08-01&Namespace=AWS%2FEC2" *
+           "&MetricName=CPUUtilization&Dimensions.member.1.Name=AutoScalingGroupName" *
+           "&Dimensions.member.1.Value=" * urlencode(asg) *
+           "&StartTime=" * urlencode(isodate(now - Minute(20))) *
+           "&EndTime=" * urlencode(isodate(now)) * "&Period=300&Statistics.member.1=Average"
+    return parse_latest_average(FarmLite.aws_query(ctx, "monitoring", form))
+end
+
+"""
+Job slots in use by kind of job, summed over the workers that reported in the
+last few minutes, and how many did. Each EC2 worker writes its own record under
+the jobs table's `_fleet` partition every minute.
+"""
+function slot_use(ctx::LiteCtx, now::DateTime)
+    fresh = isodate(now - Minute(3))
+    use = zeros(Int, 5)   # test, seal, deriv, expand, reporting instances
+    for rec in run_jobs(ctx, "_fleet")
+        str(rec, "reported_at", "") >= fresh || continue
+        use[1] += int(rec, "test", 0)
+        use[2] += int(rec, "seal", 0)
+        use[3] += int(rec, "deriv", 0)
+        use[4] += int(rec, "expand", 0)
+        use[5] += 1
+    end
+    return use
+end
+
+struct QueueDepth
+    queued::Int
+    held::Int       # received by workers: running, or handed back to wait a while
+end
+
+function json_make(::Type{QueueDepth}, x::LazyVal)
+    queued = Ref(0)
+    held = Ref(0)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        k == "Attributes" || return nothing
+        return JSON.applyobject(v) do ak, av
+            astr, apos = json_string(av)
+            n = something(tryparse(Int, astr), 0)
+            if ak == "ApproximateNumberOfMessages"
+                queued[] = n
+            elseif ak == "ApproximateNumberOfMessagesNotVisible"
+                held[] = n
+            end
+            return apos
+        end
+    end
+    return QueueDepth(queued[], held[]), pos::Int
+end
+
+function queue_depth(ctx::LiteCtx, url::String)
+    payload = "{\"QueueUrl\":" * JSON.json(url) * ",\"AttributeNames\":" *
+              "[\"ApproximateNumberOfMessages\",\"ApproximateNumberOfMessagesNotVisible\"]}"
+    return parse_json(FarmLite.aws_json(ctx, "sqs", "AmazonSQS.GetQueueAttributes", payload),
+                      QueueDepth)
+end
+
+"The queues sampled, as (name, URL) pairs."
+function load_queues(ctx::LiteCtx)
+    queues = Tuple{String,String}[("tests", ctx.queue_url)]
+    isempty(ctx.slow_queue_url) || push!(queues, ("slow", ctx.slow_queue_url))
+    for (name, var) in (("seal", "PKGEVAL_SEAL_QUEUE_URL"), ("deriv", "PKGEVAL_DERIV_QUEUE_URL"))
+        url = get(ENV, var, "")::String
+        isempty(url) || push!(queues, (name, url))
+    end
+    return queues
+end
+
+"Column names, and rows of integers whose first column is the unix time."
+struct LoadHistory
+    fields::Vector{String}
+    rows::Vector{Vector{Int}}
+end
+
+function json_make(::Type{LoadHistory}, x::LazyVal)
+    lfields = String[]
+    lrows = Vector{Int}[]
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "fields"
+            fvals, fpos = json_string_vector(v)
+            append!(lfields, fvals)
+            return fpos
+        elseif k == "rows"
+            jsontype(v) == JSON.JSONTypes.ARRAY || json_expected("array of rows")
+            return JSON.applyarray(v) do i, rowv
+                jsontype(rowv) == JSON.JSONTypes.ARRAY || json_expected("row")
+                row = Int[]
+                rpos = JSON.applyarray(rowv) do j, cell
+                    cval, cpos = json_int(cell)
+                    push!(row, cval)
+                    return cpos
+                end
+                push!(lrows, row)
+                return rpos
+            end
+        end
+        return nothing
+    end
+    return LoadHistory(lfields, lrows), pos::Int
+end
+
+function load_json(h::LoadHistory)
+    io = IOBuffer()
+    print(io, "{\"step\":", LOAD_STEP, ",\"fields\":[")
+    for (i, f) in enumerate(h.fields)
+        i > 1 && print(io, ',')
+        print(io, '"', f, '"')
+    end
+    print(io, "],\"rows\":[")
+    for (i, row) in enumerate(h.rows)
+        i > 1 && print(io, ",\n")
+        print(io, '[')
+        join(io, row, ',')
+        print(io, ']')
+    end
+    print(io, "]}")
+    return String(take!(io))
+end
+
+"Keep old rows when the sampled columns change; a column new to them reads -1 (missing)."
+function reindex_rows(h::LoadHistory, fields::Vector{String})
+    h.fields == fields && return h.rows
+    cols = Int[something(findfirst(==(f), h.fields), 0) for f in fields]
+    return Vector{Int}[Int[0 < c <= length(row) ? row[c] : -1 for c in cols] for row in h.rows]
+end
+
+"""
+    sample_load(ctx; now) -> Bool
+
+Append one sample of fleet capacity, CPU use, job slots in use by kind and
+queue depths to the load history, and drop samples older than two weeks. Returns whether a sample was written.
+"""
+function sample_load(ctx::LiteCtx; now::DateTime=Dates.now(UTC))
+    t = round(Int, Dates.datetime2unix(now))
+    asg = get(ENV, "PKGEVAL_ASG_NAME", "")::String
+    fleet = fleet_size(ctx, asg)
+    fields = ["t", "capacity", "desired", "max", "instances", "cpu"]
+    row = Int[t, fleet.capacity, fleet.desired, fleet.max, fleet.instances,
+              fleet_cpu(ctx, asg, now)]
+    append!(fields, ["test_slots", "seal_slots", "deriv_slots", "expand_slots", "reporting"])
+    append!(row, slot_use(ctx, now))
+    for (name, url) in load_queues(ctx)
+        depth = queue_depth(ctx, url)
+        push!(fields, name * "_queued", name * "_held")
+        push!(row, depth.queued, depth.held)
+    end
+
+    rows = Vector{Int}[]
+    old = FarmLite.s3_get(ctx, LOAD_KEY)
+    if old !== nothing
+        try
+            rows = reindex_rows(parse_json(something(old), LoadHistory), fields)
+        catch err
+            # a damaged file would otherwise block every later sample
+            lmsg = (FarmLite.@trim_errmsg err)::String
+            println(Core.stderr, "discarding unreadable load history: " * lmsg)
+        end
+    end
+    filter!(r -> !isempty(r) && t - LOAD_KEEP <= r[1], rows)
+    # a retried or overlapping invocation must not add a second sample
+    !isempty(rows) && t - rows[end][1] < LOAD_STEP ÷ 2 && return false
+    push!(rows, row)
+    s3_put(ctx, LOAD_KEY, load_json(LoadHistory(fields, rows));
+           content_type="application/json")
+    return true
+end
+
 function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
     # first, so that a failure in the steps below can't hold up the daily run;
     # anything that fails here is retried by the next poll
@@ -2258,6 +2502,7 @@ struct TopEvent
     is_base64::Bool
     canary::Union{Nothing,String}       # direct invoke: forensic parse of this run
     daily::Bool                         # the daily EventBridge rule: submit the daily run
+    sample::Bool                        # the load-sampling rule: record fleet load
 end
 
 function json_make(::Type{GhRepoFull}, x::LazyVal)
@@ -2303,6 +2548,7 @@ function json_make(::Type{TopEvent}, x::LazyVal)
     is_base64 = Ref(false)
     canary = Ref{Union{Nothing,String}}(nothing)
     daily = Ref(false)
+    sample = Ref(false)
     pos = JSON.applyobject(x) do k, v
         isnullval(v) && return nothing
         # NB: locals in the nested closures carry unique names — reusing an outer
@@ -2359,11 +2605,13 @@ function json_make(::Type{TopEvent}, x::LazyVal)
             b, p = json_bool(v); is_base64[] = b; return p
         elseif k == "daily"
             db, dp = json_bool(v); daily[] = db; return dp
+        elseif k == "sample"
+            sb, sp = json_bool(v); sample[] = sb; return sp
         end
         return nothing
     end
     return TopEvent(new_images, dead_bodies, method[], signature[], ghevent[], body[], is_base64[], canary[],
-                    daily[]),
+                    daily[], sample[]),
            pos::Int
 end
 
@@ -2416,6 +2664,10 @@ function handle_event(event_body::String, ctx::LiteCtx=ctx_from_env(),
         jobs = run_jobs(ctx, something(event.canary))
         @info "forensic canary parse survived" n=length(jobs)
         return "{\"ok\":true,\"jobs\":" * string(length(jobs)) * "}"
+    end
+    if event.sample
+        sampled = sample_load(ctx)
+        return "{\"ok\":true,\"sampled\":" * string(sampled) * "}"
     end
     if event.daily
         created = submit_daily(ctx, gh)
