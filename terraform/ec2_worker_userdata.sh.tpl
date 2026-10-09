@@ -29,6 +29,15 @@ kernel.keys.maxbytes = 4000000
 SYSCTL
 sysctl --system
 
+# Unattended upgrades run daily and needrestart then restarts services that use
+# an upgraded library. Restarting the worker drains it, and its exit deletes
+# files that running sandboxes still use, so those jobs fail mid-run.
+mkdir -p /etc/needrestart/conf.d
+cat >/etc/needrestart/conf.d/pkgeval.conf <<'NEEDRESTART'
+$nrconf{override_rc}{qr(^pkgeval-)} = 0;
+$nrconf{override_rc}{qr(^user@)} = 0;
+NEEDRESTART
+
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -qy git curl unzip
 

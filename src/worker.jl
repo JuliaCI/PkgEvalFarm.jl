@@ -43,6 +43,11 @@ function stop_orphan_sandboxes!()
     end
 end
 
+# Set once this process starts to exit. By then its claims are handed back, and
+# the exit-time tempdir cleanup deletes files that running sandboxes still use,
+# so a job that finishes afterwards must not record its result.
+const SHUTTING_DOWN = Threads.Atomic{Bool}(false)
+
 # Tempdirs of a worker incarnation that died uncleanly (spot reclaim, OOM,
 # SIGKILL) are never removed: Base's exit-time cleanup didn't run, and the
 # restarted worker mints fresh cache dirs while the orphans — whole sandbox
@@ -86,6 +91,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # build surfaces as MissingStagedBuild and is requested from CI instead
     PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
+    # registered after Base's tempdir cleanup, so it runs before it
+    atexit(() -> SHUTTING_DOWN[] = true)
     if claim_host!()
         stop_orphan_sandboxes!()
         sweep_stale_tempdirs!()
@@ -179,6 +186,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
             end
             @info "drain requested; releasing claimed jobs and exiting"
             draining[] = true
+            SHUTTING_DOWN[] = true
             lock(claims_lock) do
                 for claimed in values(active_claims)
                     try
@@ -935,6 +943,10 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         stop_heartbeat()
     end
 
+    if SHUTTING_DOWN[]
+        @info "shutting down; leaving the job to be redelivered" job.package result.status
+        return
+    end
     try
         record_result(ctx, claimed, result)
         @info "finished" job.package result.status result.reason
