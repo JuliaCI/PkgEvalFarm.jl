@@ -1253,8 +1253,10 @@ end
 
 ## in-flight runs -> hourly status edits of the submission comment
 
+const MAX_ETA_SECONDS = 7 * 86400
+
 """
-    eta_from_work(prev_at, prev_work, work_done, remaining, now)
+    eta_from_work(prev_at, prev_work, work_done, remaining, now; started_at="", own_done=work_done)
 
 Delta-based ETA in *work-seconds*, not job counts: `work_done` is the summed
 actual duration of finished jobs, `remaining` the summed duration estimates of
@@ -1265,9 +1267,16 @@ window exactly as they subtract it from `remaining`. Returns `nothing` when
 there is no baseline tick yet or no forward progress — better no ETA than a
 bogus one. Self-correcting: each tick re-derives the rate from the latest
 window, so fleet scale-ups and spot losses fold in within an hour.
+
+A window in which little finished (long jobs still running, or other runs
+holding the fleet) understates the rate, so the rate never drops below half
+the run's average since `started_at`. That average uses `own_done`, the work
+this run did itself: reused baseline results arrive finished and would
+inflate it. An ETA more than a week away is dropped as well.
 """
 function eta_from_work(prev_at::String, prev_work::Float64,
-                       work_done::Float64, remaining::Float64, now::DateTime)
+                       work_done::Float64, remaining::Float64, now::DateTime;
+                       started_at::String="", own_done::Float64=work_done)
     prev_work < 0 && return nothing
     remaining > 0 || return nothing
     work_done > prev_work || return nothing
@@ -1276,7 +1285,14 @@ function eta_from_work(prev_at::String, prev_work::Float64,
     elapsed_s = Dates.value(now - something(prev)) / 1000
     elapsed_s > 0 || return nothing
     rate = (work_done - prev_work) / elapsed_s
-    return now + Dates.Second(round(Int, remaining / rate))
+    start = parse_isodate(started_at)
+    if start !== nothing
+        run_s = Dates.value(now - something(start)) / 1000
+        run_s > 0 && (rate = max(rate, own_done / run_s / 2))
+    end
+    secs = remaining / rate
+    secs > MAX_ETA_SECONDS && return nothing
+    return now + Dates.Second(round(Int, secs))
 end
 
 """
@@ -1289,6 +1305,16 @@ Returns `(work_done, remaining)`, with `remaining = -1.0` meaning unknown.
 # PkgEval records no duration for a killed or skipped job, so fall back to the
 # job's wall time
 job_seconds(j::Item) = (d = flt(j, "duration", 0.0)) > 0 ? d : flt(j, "wall", 0.0)
+
+"Work done by a run's own finished jobs, leaving out reused baseline results."
+function own_work_done(jobs::Vector{Item})
+    done = 0.0
+    for j in jobs
+        opt_str(j, "reused_from") === nothing || continue
+        str(j, "status", "") in TERMINAL_STATUSES && (done += job_seconds(j))
+    end
+    return done
+end
 
 function run_work(jobs::Vector{Item})
     work_done = 0.0
@@ -1404,11 +1430,14 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
     # report site can show it too
     eta = nothing
     if status == "active" && isempty(str(run, "kind", ""))
-        work_done, remaining = run_work(run_jobs(ctx, run_id; slim=true))
+        jobs = run_jobs(ctx, run_id; slim=true)
+        work_done, remaining = run_work(jobs)
         if remaining >= 0
             eta = eta_from_work(str(run, "status_commented_at", ""),
                                 flt(run, "status_work_done", -1.0),
-                                work_done, remaining, now)
+                                work_done, remaining, now;
+                                started_at=str(run, "created_at", ""),
+                                own_done=own_work_done(jobs))
         end
         # whole seconds: string(::Float64) can go scientific, which DynamoDB's
         # number grammar does not accept
@@ -1508,7 +1537,8 @@ status_emoji(status::String) = issuccess(status) ? "✅" :
                                status == "skip"  ? "⏭" : "❓"
 
 """
-All job items of a run. `slim=true` fetches only status/duration/wall/est — the
+All job items of a run. `slim=true` fetches only status/duration/wall/est and
+`reused_from` — the
 fields the hourly status tick needs — cutting the response (and the parse
 allocations, which have crashed the trimmed runtime on 24k-job runs) roughly
 fivefold. Report generation wants the full items.
@@ -1517,7 +1547,7 @@ function run_jobs(ctx::LiteCtx, run_id::String; slim::Bool=false)
     jobs = Item[]
     start_key = ""
     projection = slim ?
-        ",\"ProjectionExpression\":\"#s, #d, #w, est\"," *
+        ",\"ProjectionExpression\":\"#s, #d, #w, est, reused_from\"," *
         "\"ExpressionAttributeNames\":{\"#s\":\"status\",\"#d\":\"duration\",\"#w\":\"wall\"}" : ""
     while true
         payload = "{\"TableName\":$(JSON.json(ctx.jobs_table))," *

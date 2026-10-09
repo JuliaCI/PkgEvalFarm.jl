@@ -458,6 +458,12 @@ try
         rrows = Dict(r[1] => r for r in rj["pkgs"])
         @test rj["logdirs"][rrows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
         @test rrows["JSON"][10] == -1  # drained via JobResult without a log
+
+        # the hourly ETA's slim fetch must carry reused_from, or the run's own
+        # work would include the donor's
+        slim = PEF.FarmBot.run_jobs(lite, run_id; slim=true)
+        @test count(j -> PEF.FarmBot.opt_str(j, "reused_from") !== nothing, slim) == 3
+        @test PEF.FarmBot.own_work_done(slim) == 3.0
     end
 
     @testset "reused baseline is re-run when primary fails" begin
@@ -1153,6 +1159,18 @@ try
         # estimated remaining -> two hours out
         eta = FB.eta_from_work("2026-07-28T11:00:00Z", 0.0, 3600.0, 7200.0, now)
         @test eta == DateTime(2026, 7, 28, 14, 0, 0)
+        # only 100 work-seconds finished in the last hour of a run that has averaged
+        # 0.1 per second over 10 hours: the rate falls back to half that average
+        @test FB.eta_from_work("2026-07-28T11:00:00Z", 3500.0, 3600.0, 7200.0, now;
+                               started_at="2026-07-28T02:00:00Z") == DateTime(2026, 7, 30, 4, 0, 0)
+        # reused baseline results arrive finished: only the run's own 3600 work-seconds
+        # count toward the average, whose half still sets the ETA (with the reused
+        # 100000 counted, it would be hours early)
+        @test FB.eta_from_work("2026-07-28T11:00:00Z", 103500.0, 103600.0, 7200.0, now;
+                               started_at="2026-07-28T02:00:00Z", own_done=3600.0) ==
+              DateTime(2026, 7, 30, 4, 0, 0)
+        # an ETA more than a week out is dropped
+        @test FB.eta_from_work("2026-07-28T11:00:00Z", 0.0, 3600.0, 1e9, now) === nothing
 
         # run_work: actual durations for the finished, estimates for the rest,
         # mean-of-finished fallback for jobs without a stored estimate
@@ -1168,6 +1186,9 @@ try
         @test FB.run_work([mk("test"; dur=60.0), mk("pending"; est=30.0)]) == (60.0, 30.0)
         # a kill records no duration; its wall time counts as the work done
         @test FB.run_work([mk("kill"; dur=0.0, wall=2700.0), mk("pending"; est=30.0)]) == (2700.0, 30.0)
+        reused = mk("test"; dur=500.0)
+        reused["reused_from"] = PEF.FarmLite.attr("run-0")
+        @test FB.own_work_done([reused, mk("test"; dur=60.0), mk("pending"; est=30.0)]) == 60.0
 
         body = FB.status_comment_body("run-1", "primary: `a`, against: `b`",
                                       "active", 80, 200, now, eta)
