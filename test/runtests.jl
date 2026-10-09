@@ -167,6 +167,24 @@ end
         @test PEF.reason_message("build_failed") == "a package build step failed"
     end
 
+    @testset "sandbox loss is recognised in job logs" begin
+        # lines from daily-2026-10-08, where shared sandbox files vanished mid-run
+        for line in ("IOError: mkdir(\"/home\"; mode=0o777): no such file or directory (ENOENT)",
+                     "IOError: mkdir(\"/home\"; mode=0o777): read-only file system (EROFS)",
+                     "ERROR: SystemError: opening file \"/proc/self/stat\": No such file or directory",
+                     "ERROR: SystemError: opening file \"/PkgEval.jl/scripts/precompile.jl\": No such file or directory",
+                     "ERROR: LoadError: IOError: readdir(\"/opt/julia/share/julia/stdlib/v1.14\"): no such file or directory (ENOENT)",
+                     "ERROR: LoadError: could not load library \"/opt/julia/bin/../lib/julia/libopenlibm.so.4\"",
+                     "ERROR: LoadError: ArgumentError: \"/tmp\" is not a directory")
+            @test PEF.sandbox_loss("Precompiling packages...\n" * line * "\nStacktrace:") !== nothing
+        end
+        @test PEF.sandbox_loss("ERROR: SystemError: opening file \"/home/pkgeval/data.csv\": No such file or directory") === nothing
+        @test PEF.sandbox_loss("IOError: mkdir(\"/home/pkgeval/out\"; mode=0o777): no such file or directory (ENOENT)") === nothing
+        @test PEF.sandbox_loss("ERROR: could not load library \"/opt/julia/bin/../lib/julia/libLLVM-17jl.so\"") === nothing
+        @test PEF.sandbox_loss("IOError: readdir(\"/opt/julia/share/julia/test/data\"): no such file or directory (ENOENT)") === nothing
+        @test PEF.sandbox_loss("") === nothing
+    end
+
     @testset "sig_hash" begin
         # FNV-1a 64: known vectors, since worker and bot must agree across
         # Julia versions (which Base.hash does not guarantee)

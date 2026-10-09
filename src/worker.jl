@@ -885,6 +885,13 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
            occursin(r"create keyring .*: Disk quota exceeded", something(logtext, ""))
             error("the sandbox did not start: " * first(something(logtext, ""), 500))
         end
+        # likewise when files every sandbox on this host shares disappeared mid-job;
+        # the last attempt records what PkgEval saw, so the report keeps the log
+        if r.status !== :test && r.status !== :load && claimed.attempts < 3
+            lost = sandbox_loss(something(logtext, ""))
+            lost === nothing ||
+                error("the sandbox lost its files: " * lost * "\n" * last(something(logtext, ""), 1000))
+        end
         JobResult(; status=String(r.status),
                   reason=refine_skip_reason(r.reason === missing ? nothing : String(r.reason), logtext),
                   version=r.version === missing ? nothing : string(r.version),
