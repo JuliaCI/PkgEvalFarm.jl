@@ -345,6 +345,33 @@ try
         @test job["attempts"] == 3
     end
 
+    @testset "no result recorded while shutting down" begin
+        # a drain hands claims back before exit, and exit-time cleanup deletes
+        # files running sandboxes use: results finishing after that are bogus
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Drained"], Dict{String,Any}());
+                                submitter="tester")
+        expand_claim = PEF.claim_job(ctx; wait=1)
+        PEF.expand_run(ctx, run_id, ["Drained"])
+        SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
+        for _ in 1:2
+            PEF.release_job(ctx, PEF.claim_job(ctx; wait=1); delay=0)
+        end
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed.attempts == 3
+        # a run without the job's config fails evaluation at once, which the
+        # last attempt would record as an error
+        run_cache = Dict{String,Dict{String,Any}}(run_id => Dict{String,Any}("configs" => []))
+        PEF.SHUTTING_DOWN[] = true
+        try
+            PEF.process_job(ctx, claimed, 0, run_cache, ReentrantLock())
+        finally
+            PEF.SHUTTING_DOWN[] = false
+        end
+        @test only(PEF.run_jobs(ctx, run_id))["status"] == "running"
+        PEF.process_job(ctx, claimed, 0, run_cache, ReentrantLock())
+        @test only(PEF.run_jobs(ctx, run_id))["status"] == "error"
+    end
+
     @testset "retry after a dead attempt records its own log" begin
         # a worker dying between its log upload and its result write leaves the
         # canonical log key taken by a log that may contradict the retry's
