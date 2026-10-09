@@ -263,6 +263,27 @@ function refine_skip_reason(reason::Union{String,Nothing}, log::Union{String,Not
     return reason
 end
 
+# Errors that only happen when the files every sandbox on a host shares (the
+# rootfs, the Julia install, PkgEval's scripts) disappear while a job runs
+const SANDBOX_LOSS = (r"mkdir\(\"/home\"; mode=0o777\): (no such file|read-only)",
+                      r"opening file \"/proc/self/stat\": No such file",
+                      r"opening file \"/dev/null\": No such file",
+                      r"opening file \"/PkgEval\.jl/[^\"]*\": No such file",
+                      r"readdir\(\"/opt/julia/share/julia/stdlib[^\"]*\"\): no such file",
+                      # only libraries every install ships: a package can ask for one
+                      # a newer Julia dropped (a versioned libLLVM, say) and fail for real
+                      r"could not load library \"/opt/julia/[^\"]*/(libjulia|libjulia-internal|libopenlibm|libopenblas64_|sys)\.",
+                      r"\"/tmp\" is not a directory")
+
+"An error in `log` showing the sandbox lost its shared files, or `nothing`."
+function sandbox_loss(log::AbstractString)
+    for pat in SANDBOX_LOSS
+        m = match(pat, log)
+        m === nothing || return String(m.match)
+    end
+    return nothing
+end
+
 # error_line heuristics, mirroring the log-tail highlighting in site/index.html
 # (analyzeTail): crash-class markers trump the first ERROR: line, which in turn
 # trumps a plain test failure location

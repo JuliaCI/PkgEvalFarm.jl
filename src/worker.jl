@@ -5,11 +5,50 @@
 # visibility timeout and is picked up elsewhere (with the package cache disabled on
 # retries, in case the job's cache use was what killed the worker).
 
+# One worker process per host owns the sandboxes and tempdirs there. A second
+# one (a manual run over ssh, say) must not stop or delete them, so the startup
+# cleanup below only runs while holding this lock, kept for the process lifetime.
+const HOST_LOCK = Ref{Union{Nothing,IOStream}}(nothing)
+
+function claim_host!()
+    # the unit's RuntimeDirectory=, also found by a worker started by hand there
+    dir = get(ENV, "RUNTIME_DIRECTORY", isdir("/run/pkgeval") ? "/run/pkgeval" : "")
+    isempty(dir) && return true   # not a farm host: nothing else to protect
+    io = try
+        open(joinpath(dir, "worker.lock"), "w")
+    catch
+        return false   # not this host's worker user: leave the cleanup to it
+    end
+    LOCK_EX, LOCK_NB = 2, 4
+    if ccall(:flock, Cint, (Cint, Cint), fd(io), LOCK_EX | LOCK_NB) != 0
+        close(io)
+        return false
+    end
+    HOST_LOCK[] = io
+    return true
+end
+
+# Sandboxes run in a slice of the worker user's systemd manager, not in the worker
+# service, so they outlive a worker that restarts. Their jobs are redelivered
+# elsewhere, and the sweep below would delete their rootfs, Julia and caches out
+# from under them, so stop them first.
+function stop_orphan_sandboxes!()
+    slice = get(ENV, "PKGEVAL_SANDBOX_SLICE", "")
+    isempty(slice) && return
+    try
+        # bounded: a wedged user bus must not stall startup
+        run(`timeout 120 systemctl --user stop $slice`)
+    catch err
+        @warn "could not stop leftover sandboxes" slice err
+    end
+end
+
 # Tempdirs of a worker incarnation that died uncleanly (spot reclaim, OOM,
 # SIGKILL) are never removed: Base's exit-time cleanup didn't run, and the
 # restarted worker mints fresh cache dirs while the orphans — whole sandbox
-# homes and compilecaches — keep their disk space. Nothing else evaluates on
-# this machine at startup, so every pkgeval tempdir present now is stale.
+# homes and compilecaches — keep their disk space. Once leftover sandboxes are
+# stopped, nothing else evaluates on this machine at startup, so every pkgeval
+# tempdir present now is stale.
 function sweep_stale_tempdirs!()
     for entry in readdir(tempdir(); join=true)
         startswith(basename(entry), "pkgeval_") || continue
@@ -47,7 +86,12 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # build surfaces as MissingStagedBuild and is requested from CI instead
     PkgEval.source_build_fallback[] = false
     @info "worker started" user ninstances host=gethostname()
-    sweep_stale_tempdirs!()
+    if claim_host!()
+        stop_orphan_sandboxes!()
+        sweep_stale_tempdirs!()
+    else
+        @warn "another worker owns this host; leaving its sandboxes and tempdirs alone"
+    end
     init_slot_rate!(ctx, ninstances)
     if sealing_enabled(ctx.cfg) && pkgeval_supports_seal()
         sweep_seal_cache!()
@@ -840,6 +884,13 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
            !occursin("Package evaluation to ", something(logtext, "")) &&
            occursin(r"create keyring .*: Disk quota exceeded", something(logtext, ""))
             error("the sandbox did not start: " * first(something(logtext, ""), 500))
+        end
+        # likewise when files every sandbox on this host shares disappeared mid-job;
+        # the last attempt records what PkgEval saw, so the report keeps the log
+        if r.status !== :test && r.status !== :load && claimed.attempts < 3
+            lost = sandbox_loss(something(logtext, ""))
+            lost === nothing ||
+                error("the sandbox lost its files: " * lost * "\n" * last(something(logtext, ""), 1000))
         end
         JobResult(; status=String(r.status),
                   reason=refine_skip_reason(r.reason === missing ? nothing : String(r.reason), logtext),
