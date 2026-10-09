@@ -329,6 +329,14 @@ resource "aws_iam_role_policy" "bot_fleet_load" {
         Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.results.arn}/fleet/*"
       },
+      {
+        # without it S3 answers a read of the not yet written history with 403,
+        # not 404, so the first sample can never be taken. A prefix condition
+        # would not help: a read carries no prefix for S3 to match.
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.results.arn
+      },
     ]
   })
 }
