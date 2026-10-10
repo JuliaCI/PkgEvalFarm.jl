@@ -109,24 +109,34 @@ platform-conditional deps) is handled by the want/derivation machinery below;
 seal-job discovery is handled by construction (the seal job resolves the real
 test env and reports its manifest, which is where learned edges come from).
 
-## Worker slot policy: prefer sealing, hold-and-fill
+## Worker slot policy: prefer sealing, start tests once sealed
 
 Sealing gets its own SQS queue: priority between queues is the only ordering
 SQS honors. A slot's claim order is seal → slow → fast. When a claimed *test*
-job's seal(X) is still pending, the slot **holds the claim** (heartbeats
-continue; nothing is re-enqueued, so no receive-count or attempt accounting is
-disturbed) and fills the wait with seal jobs: poll the seal queue, run what it
-gets, recheck seal(X) between jobs. Deadline or seal(X) terminal → run the
-test. "Cold" is soft: the proxy still serves whatever was sealed by then, so
-an aggressive deadline is safe.
+job's seal(X) is still pending, the worker **defers** it: the job goes back on
+its queue as a new message delayed by `PKGEVAL_SEAL_DEFER` (default 5 min), and
+its claim is undone (status back to `pending`, the attempt it used given back),
+so neither the receive count nor the job's attempts grow. The slot is then free
+for seal work or a test that can run. A test started while its seal is pending
+spends its time limit waiting on held fetches instead: on daily-2026-10-09, 31%
+of those were killed, against 1% of tests started after their seal finished.
 
-Waiting slots polling the seal queue is what makes this deadlock-free: every
-pending seal is either in flight on some slot or gated on deps whose jobs are
-queued where a waiting slot's poll can reach them. The residual liveness holes
-(a seal message dying to the DLQ without its dependents being decremented, a
-worker crashing mid-decrement) are healed by `reconcile_seal_run`, run — 
-throttled — by exactly the party that cares: a slot whose fill-poll came up
-empty while its test job is still gated.
+A deferred test runs anyway, consuming whatever was sealed by then ("cold" is
+soft), once it has waited `PKGEVAL_SEAL_WAIT` in total (default 6 h, counted
+from its first deferral in `seal_wait_since`) or its seal job has stalled:
+running on a worker whose heartbeat lapsed, or pending while the seal run has
+finished no job for `PKGEVAL_SEAL_STALL` (default 20 min) since the test was
+first deferred, e.g. when the remaining jobs are stuck in dependency cycles.
+Deferred tests sit in their queue as delayed messages, so the fleet's drain
+decision counts delayed test messages (and the seal queues) as backlog.
+
+Every free slot polls the seal queue before any test queue, which is what makes
+this deadlock-free: every pending seal is either in flight on some slot or gated
+on deps whose jobs are queued where a free slot's poll reaches them. The
+residual liveness holes (a seal message dying to the DLQ without its dependents
+being decremented, a worker crashing mid-decrement) are healed by
+`reconcile_seal_run`, run (throttled) by exactly the party that cares: each
+deferral of a test job that is still gated.
 
 ## Consumption: the worker's loopback proxy
 

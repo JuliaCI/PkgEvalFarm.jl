@@ -407,6 +407,68 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
           }
         }
       }
+      # tests deferred until their package is sealed wait as delayed messages,
+      # and sealing is work too: without them a fleet that is sealing looks idle
+      metrics {
+        id          = "deferred"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesDelayed"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs.name
+            }
+          }
+        }
+      }
+      metrics {
+        id          = "deferred_slow"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesDelayed"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs_slow.name
+            }
+          }
+        }
+      }
+      metrics {
+        id          = "backlog_seal"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesVisible"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs_seal.name
+            }
+          }
+        }
+      }
+      metrics {
+        id          = "backlog_deriv"
+        return_data = false
+        metric_stat {
+          stat = "Average"
+          metric {
+            namespace   = "AWS/SQS"
+            metric_name = "ApproximateNumberOfMessagesVisible"
+            dimensions {
+              name  = "QueueName"
+              value = aws_sqs_queue.jobs_deriv.name
+            }
+          }
+        }
+      }
       metrics {
         id          = "capacity"
         return_data = false
@@ -429,7 +491,7 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
         # CloudWatch metric math has no element-wise MAX against a constant, and
         # dividing by zero capacity yields no data — guard with IF.
         # (Scaling up from zero is the kickstart policy's job, below.)
-        expression  = "IF(capacity > 0, (backlog + backlog_slow) / capacity, backlog + backlog_slow)"
+        expression  = "IF(capacity > 0, (backlog + backlog_slow + deferred + deferred_slow + backlog_seal + backlog_deriv) / capacity, backlog + backlog_slow + deferred + deferred_slow + backlog_seal + backlog_deriv)"
         label       = "queue backlog per in-service job slot"
         return_data = true
       }

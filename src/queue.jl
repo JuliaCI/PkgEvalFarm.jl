@@ -428,6 +428,9 @@ struct ClaimedJob
     receipt_handle::String
     attempts::Int
     queue_url::String   # receipt handles are queue-specific
+    # the claim's stamp on the job item: every slot on a host shares the
+    # worker identity, so this is what tells this claim from a later one
+    started_at::String
 end
 
 "A received *expand* message: the worker should compute and fan out the run's jobs."
@@ -465,8 +468,8 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
     return claim_from_queues(ctx, queues)
 end
 
-"Claim seal-pipeline work only (derivations first) — the hold-and-fill path
-of a gated test job, the donor slots, and the spill receiver."
+"Claim seal-pipeline work only (derivations first): the donor slots and the
+spill receiver."
 function claim_seal_job(ctx::FarmCtx; wait::Int=1)
     sealing_enabled(ctx.cfg) || return nothing
     dq = deriv_queue(ctx.cfg)
@@ -508,6 +511,7 @@ function claim_from_queues(ctx::FarmCtx, queues)
         return ClaimedExpand(body["run_id"], receipt, from_queue)
     job = JobRef(body)
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
+    claimed_at = isodate()
 
     # flip pending -> running. A job already `running` is re-claimable only
     # when its worker looks dead (heartbeat_at stale beyond three beats, or
@@ -528,7 +532,7 @@ function claim_from_queues(ctx::FarmCtx, queues)
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":pending" => "pending", ":running" => "running",
-                     ":worker" => worker_identity(), ":now" => isodate(),
+                     ":worker" => worker_identity(), ":now" => claimed_at,
                      ":stale" => isodate(Dates.now(Dates.UTC) - Dates.Second(3 * HEARTBEAT_INTERVAL)),
                      ":one" => 1)));
             aws_config=ctx.aws)
@@ -542,7 +546,7 @@ function claim_from_queues(ctx::FarmCtx, queues)
         end
         rethrow()
     end
-    return ClaimedJob(job, receipt, receive_count, from_queue)
+    return ClaimedJob(job, receipt, receive_count, from_queue, claimed_at)
 end
 
 function unneeded_seal_message(ctx::FarmCtx, message)

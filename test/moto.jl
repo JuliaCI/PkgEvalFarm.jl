@@ -1898,6 +1898,49 @@ try
                                                     PEF.JobRef(run_id, "primary", "JSON"))
             @test gated_state == :pending && gated_run == sr
 
+            # that test job is deferred while its seal job is pending: back on
+            # its queue unclaimed, with no attempt used
+            function claim_test(pkg)
+                # keep the others claimed until it turns up, or the queue keeps
+                # handing back the one just released
+                others = PEF.ClaimedJob[]
+                found = nothing
+                for _ in 1:12
+                    c = PEF.claim_from_queues(sctx, [(scfg.queue_url, 1),
+                                                     (PEF.slow_queue(scfg), 1)])
+                    c isa PEF.ClaimedJob || continue
+                    if c.job.config == "primary" && c.job.package == pkg
+                        found = c
+                        break
+                    end
+                    push!(others, c)
+                end
+                foreach(c -> PEF.release_job(sctx, c; delay=0), others)
+                return found
+            end
+            test_item() = PEF.ddb_parse(Dynamodb.get_item(
+                PEF.ddb_item(Dict("run_id" => run_id, "job_key" => "primary#JSON")),
+                scfg.jobs_table; aws_config=aws)["Item"])
+            tc = claim_test("JSON")
+            @test tc isa PEF.ClaimedJob && tc.attempts == 1
+            withenv("PKGEVAL_SEAL_DEFER" => "0") do
+                @test PEF.defer_until_sealed!(sctx, tc, sr)
+            end
+            item = test_item()
+            @test item["status"] == "pending" && item["attempts"] == 0
+            @test haskey(item, "seal_wait_since") && !haskey(item, "heartbeat_at")
+            tc = claim_test("JSON")
+            @test tc isa PEF.ClaimedJob && tc.attempts == 1   # a fresh message
+            # a stalled seal run, or a wait past the limit, runs the test anyway
+            withenv("PKGEVAL_SEAL_STALL" => "-1") do
+                @test !PEF.defer_until_sealed!(sctx, tc, sr)
+            end
+            withenv("PKGEVAL_SEAL_WAIT" => "-1") do
+                @test !PEF.defer_until_sealed!(sctx, tc, sr)
+            end
+            @test test_item()["status"] == "running"
+            PEF.release_job(sctx, tc; delay=0)
+
             claimed_seals = 0
             for _ in 1:12
                 c = PEF.claim_job(sctx; wait=1)
