@@ -1,5 +1,6 @@
 # Worker-side sealing (docs/sealing.md): executing seal jobs, gating test jobs
-# on them (hold-and-fill), and executing derivations.
+# on them (deferring a test until its package is sealed), and executing
+# derivations.
 #
 # There is deliberately no on-demand (filesystem-level) artifact layer: a
 # cache-dir miss carries no resolution context — no version, dep build_ids or
@@ -14,10 +15,10 @@ is_seal_job(job::JobRef) = startswith(job.run_id, "seal-")
 is_derivation_job(job::JobRef) = startswith(job.run_id, "deriv-")
 seal_id_of(run_id::AbstractString) = String(chopprefix(run_id, "seal-"))
 
-"How long a gated test job waits (filling the time with seal work) before
-running cold. Cold is soft — whatever sealed by then is still consumed — so
-this trades duplicate compilation against latency, nothing more."
-seal_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_WAIT", "")), 20.0 * 60)
+"How long in total a test job is deferred for its pending seal job before running
+cold. Cold is soft — whatever sealed by then is still consumed — so this trades
+duplicate compilation against latency, nothing more."
+seal_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_WAIT", "")), 6.0 * 3600)
 
 "How long a test job's in-sandbox fetch may wait on a held `/ensure` before
 degrading to a local compile. For a test job a hold is an accelerator that
@@ -487,42 +488,113 @@ function parse_seal_export(export_dir::AbstractString)
 end
 
 
-## the test-job gate: hold the claim, fill the wait with seal work
+## the test-job gate: start a test only once its own package is sealed
+
+"How long a test job goes back on the queue for each time its seal job is still pending
+(SQS allows 0 to 15 minutes)."
+seal_defer_delay() =
+    clamp(something(tryparse(Int, get(ENV, "PKGEVAL_SEAL_DEFER", "")), 300), 0, 900)
+
+"""A pending seal job whose seal run has finished no job for this long, counted from
+no earlier than the test's first deferral, has stalled (e.g. on dependency cycles),
+so the test it gates starts anyway."""
+seal_stall_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_SEAL_STALL", "")), 20.0 * 60)
 
 """
-    hold_and_fill!(ctx, job, seal_run_id, cpu, run_cache, run_cache_lock) -> :terminal | :pending
-
-The claimed test job stays held (its heartbeat keeps running); this slot pulls
-seal jobs while `seal(X)` is pending. Every iteration also offers a (throttled)
-reconcile — the waiting party heals the pipeline it waits on. The offer must
-not be gated on finding the queue empty: a wedged seal run generates a flood
-of consumer-miss derivations that keeps this very queue busy, and that flood
-would then starve the only mechanism able to unwedge it (seen live: run
-gh-5241627143, zero reconciles in 8h under constant derivation traffic).
-`:pending` on return means the deadline passed — run cold.
+Whether `package`'s seal job has stalled: running on a worker that stopped
+heartbeating, or pending while neither its seal run has completed a job nor one
+of its dependencies' seal jobs is running live, for the stall limit since
+`since` or the run's last completion, whichever is later. A shared seal run can
+sit idle for days before a new run adds jobs, so progress before `since` is not
+counted against it.
 """
-function hold_and_fill!(ctx::FarmCtx, job::JobRef, seal_run_id::AbstractString, cpu::Int,
-                        run_cache, run_cache_lock)
-    deadline = time() + seal_wait_limit()
-    @info "test job gated on sealing; filling the wait" job.package seal_run_id
-    while time() < deadline
-        maybe_reconcile_seal_run(ctx, seal_run_id)
-        filled = try
-            claim_seal_job(ctx)
-        catch err
-            @warn "seal queue poll failed" err
-            nothing
-        end
-        if filled isa ClaimedJob
-            # the seal queue carries seal AND derivation messages: dispatch
-            # like the main claim path does, or a filled derivation crashes in
-            # seal processing (seen live: 66 error'd derivations, trial run 1)
-            process_job(ctx, filled, cpu, run_cache, run_cache_lock)
-        else
-            sleep(15)
-        end
-        seal_status(ctx, seal_run_id, job.package) == :pending || return :terminal
+function seal_stalled(ctx::FarmCtx, seal_run_id::AbstractString, package::AbstractString,
+                      since::DateTime, now::DateTime)
+    item = get_seal_item(ctx, JobRef(seal_run_id, SEAL_CONFIG_NAME, package))
+    item === nothing && return false
+    get(item, "status", "") == "running" && return !seal_job_live(item, now)
+    seal_run = get_run(ctx, seal_run_id)
+    progress = get(seal_run, "updated_at", nothing)
+    last = progress === nothing ? since : max(since, parse_expiration(progress))
+    now - last > Dates.Second(round(Int, seal_stall_limit())) || return false
+    # a long precompile of a dependency is progress the run cannot show yet
+    for dep in unique(String.(get(item, "deps", String[])))
+        dep_item = get_seal_item(ctx, JobRef(seal_run_id, SEAL_CONFIG_NAME, dep))
+        dep_item !== nothing && get(dep_item, "status", "") == "running" &&
+            seal_job_live(dep_item, now) && return false
     end
-    @info "seal wait deadline reached; evaluating with whatever sealed" job.package
-    return :pending
+    return true
+end
+
+# A released job is `running` without a heartbeat until it is claimed again, so
+# fall back to when it was claimed.
+function seal_job_live(item, now::DateTime)
+    stamp = get(item, "heartbeat_at", get(item, "started_at", nothing))
+    stamp === nothing && return true
+    return now - parse_expiration(stamp) <= Dates.Second(3 * HEARTBEAT_INTERVAL)
+end
+
+"""
+    defer_until_sealed!(ctx, claimed, seal_run_id) -> Bool
+
+Put a claimed test job whose own seal job is still pending back on the queue, so
+it starts once the package is sealed instead of holding a slot meanwhile or
+running while its cache fetches are held (on daily-2026-10-09, 31% of tests
+started with their seal job pending were killed, against 1% of the rest).
+
+The job goes back as a new, delayed message and its claim is undone, so neither
+the queue's receive count nor the job's attempts grow. Returns `false`, and the
+test runs with whatever has been sealed, once it has waited the seal wait limit
+in total or its seal job has stalled (see `seal_stalled`). Each deferral offers
+a (throttled) reconcile of the seal run: the waiting party heals the pipeline it
+waits on.
+"""
+function defer_until_sealed!(ctx::FarmCtx, claimed::ClaimedJob, seal_run_id::AbstractString)
+    job = claimed.job
+    maybe_reconcile_seal_run(ctx, seal_run_id)
+    now = Dates.now(UTC)
+    resp = aws_retry() do
+        Dynamodb.get_item(ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+                          ctx.cfg.jobs_table, Dict("ConsistentRead" => true); aws_config=ctx.aws)
+    end
+    item = haskey(resp, "Item") ? ddb_parse(resp["Item"]) : Dict{String,Any}()
+    since = get(item, "seal_wait_since", nothing)
+    if since !== nothing &&
+       now - parse_expiration(since) > Dates.Second(round(Int, seal_wait_limit()))
+        @info "seal wait limit reached; evaluating with whatever sealed" job.package
+        return false
+    end
+    if since !== nothing && seal_stalled(ctx, seal_run_id, job.package,
+                                         parse_expiration(since), now)
+        @info "seal job has stalled; evaluating with whatever sealed" job.package seal_run_id
+        return false
+    end
+    enqueue_jobs(ctx, [job]; queue_url=claimed.queue_url, delay=seal_defer_delay())
+    try
+        aws_retry() do
+            Dynamodb.update_item(
+                ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+                ctx.cfg.jobs_table,
+                Dict("ConditionExpression" => "#s = :running AND worker = :worker AND " *
+                                              "started_at = :started",
+                     "UpdateExpression" => "SET #s = :pending, " *
+                                           "seal_wait_since = if_not_exists(seal_wait_since, :now) " *
+                                           "REMOVE heartbeat_at ADD attempts :minus",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(
+                         ":running" => "running", ":pending" => "pending",
+                         ":worker" => worker_identity(), ":now" => isodate(now),
+                         ":minus" => -1, ":started" => claimed.started_at)));
+                aws_config=ctx.aws)
+        end
+    catch err
+        # no longer ours (e.g. claimed again from a duplicate message): the new
+        # message will bounce off it like any duplicate
+        is_conditional_failure(err) || rethrow()
+    end
+    aws_retry() do
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+    end
+    @info "seal job pending; test deferred" job.package seal_run_id delay=seal_defer_delay()
+    return true
 end

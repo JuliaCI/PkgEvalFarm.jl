@@ -466,9 +466,9 @@ end
 """
 Heal a seal run's readiness bookkeeping: any pending job whose deps are all
 terminal but whose counter is stuck (worker died mid-decrement, message died
-to the DLQ) is zeroed and enqueued. Called — throttled — by workers whose
-fill-poll found the seal queue empty while a test job is still gated, i.e. by
-exactly the party that cares.
+to the DLQ) is zeroed and enqueued. Called — throttled — by workers each time
+they defer a test job that is still gated, i.e. by exactly the party that
+cares.
 """
 function reconcile_seal_run(ctx::FarmCtx, seal_run_id::AbstractString)
     jobs = run_jobs(ctx, seal_run_id)

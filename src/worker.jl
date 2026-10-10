@@ -245,7 +245,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                 if claimed === nothing
                     put!(free_cpus, only(cpus))
                     idle_polls += 1
-                    once && idle_polls >= 3 && break
+                    # deferred tests are delayed, not gone
+                    once && idle_polls >= 3 && remaining_backlog(ctx) == 0 && break
                     continue
                 end
                 idle_polls = 0
@@ -411,14 +412,32 @@ function fleet_drain_init(slots::Int)
     FleetDrain(; asg, instance_id, slots)
 end
 
-"Visible messages across both job queues."
+"The queue backlog, counting an unreadable one as work remaining."
+remaining_backlog(ctx::FarmCtx) =
+    try
+        visible_backlog(ctx)
+    catch err
+        @warn "could not read the queue backlog" err
+        1
+    end
+
+"""
+Work waiting across the queues: visible messages, plus delayed ones on the test
+queues, where a test deferred until its package is sealed waits. Without those,
+a fleet whose tests are all deferred during sealing would look idle and drain.
+"""
 function visible_backlog(ctx::FarmCtx)
     total = 0
-    for queue in unique([ctx.cfg.queue_url, slow_queue(ctx.cfg)])
-        resp = SQS.get_queue_attributes(queue,
-            Dict("AttributeNames" => ["ApproximateNumberOfMessages"]);
-            aws_config=ctx.aws)
-        total += parse(Int, resp["Attributes"]["ApproximateNumberOfMessages"])
+    test_queues = unique([ctx.cfg.queue_url, slow_queue(ctx.cfg)])
+    # seal work only counts where this worker would claim it
+    seal_queues = sealing_enabled(ctx.cfg) && pkgeval_supports_seal() ?
+                  [ctx.cfg.seal_queue_url, ctx.cfg.deriv_queue_url] : String[]
+    for queue in unique(filter(!isempty, [test_queues; seal_queues]))
+        attrs = ["ApproximateNumberOfMessages";
+                 queue in test_queues ? ["ApproximateNumberOfMessagesDelayed"] : String[]]
+        resp = SQS.get_queue_attributes(queue, Dict("AttributeNames" => attrs);
+                                        aws_config=ctx.aws)
+        total += sum(a -> parse(Int, get(resp["Attributes"], a, "0")), attrs)
     end
     return total
 end
@@ -867,12 +886,10 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                 end
             end
             state, gated_seal_run = seal_state(ctx, run, job)
-            state == :pending &&
-                hold_and_fill!(ctx, job, gated_seal_run, cpu, run_cache, run_cache_lock)
+            state == :pending && defer_until_sealed!(ctx, claimed, gated_seal_run) && return
         end
         # wall clock from here prices the slot: setup, install, precompile and
-        # test all occupy it (the seal-gate wait above deliberately does not —
-        # that time went to other jobs, which bill themselves)
+        # test all occupy it
         eval_started = time()
         sealed_kwargs = if isempty(gated_seal_run)
             (;)
