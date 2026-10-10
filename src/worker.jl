@@ -839,6 +839,9 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     @info "evaluating" job.run_id job.config job.package attempt=claimed.attempts slot=cpu nslots=(cpus === nothing ? 1 : length(something(cpus)))
 
     stop_heartbeat = start_heartbeat(ctx, claimed, job.package)
+    # names this evaluation to the cache proxy, which accounts its held fetches
+    held_job = string(rand(UInt64); base=16)
+    register_held!(held_job)
 
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
@@ -879,11 +882,23 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             # a seal run from a retired scheme gates nothing: run cold
             seal_run_scheme(seal_run) == "protocol" ?
                 seal_protocol_kwargs(seal_id_of(gated_seal_run);
-                                     fetch_deadline=test_fetch_deadline()) : (;)
+                                     fetch_deadline=test_fetch_deadline(), job=held_job) : (;)
         end
+        # time the proxy kept this job's fetches waiting is the farm's, not the
+        # package's, so it does not count against the time limit (up to a cap)
+        holds = haskey(sealed_kwargs, :env)
+        held_kwargs = holds && pkgeval_supports_held_time() ?
+            (; held_time=() -> held_seconds(held_job), max_held_time=held_time_cap()) : (;)
         r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
-                                 use_cache, sealed_kwargs...)
+                                 use_cache, sealed_kwargs..., held_kwargs...)
         logtext = r.log === missing ? nothing : String(r.log)
+        held = holds ? held_seconds(held_job) : nothing
+        if held !== nothing && held >= 1 && logtext !== nothing
+            logtext *= "\n[pkgeval-farm] cache fetches were held for $(round(Int, held)) s" *
+                       (isempty(held_kwargs) ? "" :
+                        "; up to $(round(Int, held_time_cap())) s of that is not counted " *
+                        "against the time limit") * "\n"
+        end
         # the container failed to start because the kernel's per-user keyring quota
         # ran out, and PkgEval files that as an uninstallable skip; it says nothing
         # about the package, so retry it. Only this known failure: a Julia that does
@@ -907,7 +922,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                   slots=cpus === nothing ? 1 : length(something(cpus)),
                   # haskey: tolerate a PkgEval pinned before peak_rss existed
                   peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
-                  log=logtext)
+                  held, log=logtext)
     catch err
         if err isa PkgEval.MissingStagedBuild
             # not a job failure: the Julia under test needs building. Ask CI
@@ -941,6 +956,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         end
     finally
         stop_heartbeat()
+        forget_held!(held_job)
     end
 
     if SHUTTING_DOWN[]

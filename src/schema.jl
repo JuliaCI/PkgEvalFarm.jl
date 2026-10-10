@@ -232,6 +232,9 @@ Base.@kwdef struct JobResult
     # peak cgroup memory of the sandbox in bytes (page cache included), for
     # memory-aware scheduling backtests; nothing when the metric was unavailable
     peak_rss::Union{Int,Nothing} = nothing
+    # seconds the proxy held the evaluation's cache fetches; nothing when the
+    # evaluation did not use the cache protocol
+    held::Union{Float64,Nothing} = nothing
     log::Union{String,Nothing} = nothing  # uploaded to S3, not stored in DynamoDB
 end
 

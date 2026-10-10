@@ -115,6 +115,60 @@ const SEAL_PROXY = Ref{Any}(nothing)
 const SEAL_DONOR = Ref{Any}(nothing)
 const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
 
+# Held time per evaluation, named by the client's X-PkgEval-Job header, so a
+# test's time limit can leave out the time its fetches were kept waiting.
+# Concurrent holds for one evaluation count once. Only names the worker
+# registered are counted, so a sandbox cannot grow this table.
+mutable struct HeldClock
+    total::Float64
+    active::Int
+    since::Float64
+end
+const HELD = Dict{String,HeldClock}()
+const HELD_LOCK = ReentrantLock()
+
+register_held!(job::AbstractString) =
+    lock(() -> (HELD[String(job)] = HeldClock(0.0, 0, 0.0); nothing), HELD_LOCK)
+
+function with_held(f, job::AbstractString)
+    counted = lock(HELD_LOCK) do
+        clock = get(HELD, job, nothing)
+        clock === nothing && return false
+        clock.active == 0 && (clock.since = time())
+        clock.active += 1
+        return true
+    end
+    try
+        return f()
+    finally
+        # the evaluation may have ended, and its clock been forgotten, mid-hold
+        counted && lock(HELD_LOCK) do
+            clock = get(HELD, job, nothing)
+            clock === nothing && return
+            clock.active -= 1
+            clock.active == 0 && (clock.total += time() - clock.since)
+        end
+    end
+end
+
+"Seconds `job`'s fetches have been held so far, including holds still in progress."
+function held_seconds(job::AbstractString)
+    lock(HELD_LOCK) do
+        clock = get(HELD, job, nothing)
+        clock === nothing && return 0.0
+        return clock.total + (clock.active > 0 ? time() - clock.since : 0.0)
+    end
+end
+
+forget_held!(job::AbstractString) = lock(() -> delete!(HELD, job), HELD_LOCK)
+
+# The client gives up on its own deadline; holding past it would count time the
+# sandbox no longer waits.
+function client_hold_limit(req::HTTP.Request)
+    limit = tryparse(Float64, HTTP.header(req, "X-PkgEval-Deadline", ""))
+    return limit === nothing ? hold_limit() : limit
+end
+
 maybe_donate!() = ((donor = SEAL_DONOR[]) === nothing || donor(); nothing)
 
 "How long a hold may block before degrading to a local compile: it must
@@ -142,7 +196,7 @@ Underivable wants never reach here (see `want_derivable`): a hold is only
 ever taken for a key some derivation can actually produce.
 """
 function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
-                             key::AbstractString)
+                             key::AbstractString; limit::Float64=hold_limit())
     job = JobRef(deriv_run_id(ns), "deriv", key)
     item = get_seal_item(ctx, job)
     item === nothing && return nothing
@@ -155,7 +209,7 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
     status in ("pending", "running") || return get_kv(ctx, ns, uuid, key)
     Threads.atomic_add!(ACTIVE_HOLDS, 1)
     try
-        deadline = time() + hold_limit()
+        deadline = time() + min(limit, hold_limit())
         while time() < deadline
             # a held slot's capacity is donated for the ENTIRE hold, not once:
             # each donor runs a single seal-queue job and retires, so this must
@@ -213,7 +267,9 @@ function start_seal_proxy!(ctx::FarmCtx)
         if req.method == "GET" && (m = match(PROXY_PATH_RE, target)) !== nothing
             ns, uuid, key = String(m[1]), String(m[2]), String(m[3])
             body = fetch_kv(ns, uuid, key)
-            body === nothing && (body = hold_for_derivation(ctx, ns, uuid, key))
+            body === nothing && (body = with_held(HTTP.header(req, "X-PkgEval-Job", "")) do
+                hold_for_derivation(ctx, ns, uuid, key; limit=client_hold_limit(req))
+            end)
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
         elseif req.method == "POST" && (m = match(ENSURE_PATH_RE, target)) !== nothing
@@ -255,7 +311,10 @@ function start_seal_proxy!(ctx::FarmCtx)
                     catch err
                         @warn "ensure ingestion failed" err
                     end
-                    body = hold_for_derivation(ctx, ns, want.uuid, key)
+                    body = with_held(HTTP.header(req, "X-PkgEval-Job", "")) do
+                        hold_for_derivation(ctx, ns, want.uuid, key;
+                                            limit=client_hold_limit(req))
+                    end
                 end
             end
             body === nothing && return HTTP.Response(404)

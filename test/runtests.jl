@@ -167,6 +167,41 @@ end
         @test PEF.reason_message("build_failed") == "a package build step failed"
     end
 
+    @testset "held fetch time is accounted per evaluation" begin
+        # overlapping holds of one evaluation count once
+        PEF.register_held!("job1")
+        t = Threads.Event()
+        a = @async PEF.with_held(() -> (wait(t); :a), "job1")
+        sleep(0.2)
+        b = @async PEF.with_held(() -> (sleep(0.5); :b), "job1")
+        @test fetch(b) === :b
+        @test PEF.held_seconds("job1") >= 0.6   # still holding: counts the open hold
+        notify(t)
+        @test fetch(a) === :a
+        total = PEF.held_seconds("job1")
+        @test 0.6 <= total < 1.0   # counted once: summing would give about 1.2
+        sleep(0.2)
+        @test PEF.held_seconds("job1") == total   # nothing held now
+        # names the worker did not register are not counted
+        @test PEF.with_held(() -> 1, "other") == 1
+        @test PEF.held_seconds("other") == 0.0
+        @test PEF.with_held(() -> 1, "") == 1
+        # a hold still running when its evaluation is forgotten ends quietly
+        PEF.register_held!("job2")
+        h = @async PEF.with_held(() -> (sleep(0.3); :h), "job2")
+        sleep(0.1)
+        PEF.forget_held!("job2")
+        @test fetch(h) === :h
+        @test PEF.held_seconds("job2") == 0.0
+        PEF.forget_held!("job1")
+        @test PEF.held_seconds("job1") == 0.0
+        # the client's deadline bounds the hold
+        req(h...) = PEF.HTTP.Request("POST", "/ensure/v2/x", collect(h))
+        @test PEF.client_hold_limit(req("X-PkgEval-Deadline" => "600.0")) == 600.0
+        @test PEF.client_hold_limit(req()) == PEF.hold_limit()
+        @test PEF.client_hold_limit(req("X-PkgEval-Deadline" => "junk")) == PEF.hold_limit()
+    end
+
     @testset "sandbox loss is recognised in job logs" begin
         # lines from daily-2026-10-08, where shared sandbox files vanished mid-run
         for line in ("IOError: mkdir(\"/home\"; mode=0o777): no such file or directory (ENOENT)",

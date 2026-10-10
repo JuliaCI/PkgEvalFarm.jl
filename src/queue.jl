@@ -795,7 +795,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, wall = :wall, finished_at = :now, " *
-                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss" *
+                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss, held = :held" *
                                        (line === nothing ? "" : ", error_line = :error_line") *
                                        (lines === nothing ? "" : ", error_lines = :error_lines") *
                                        (pass_sigs === nothing ? "" : ", pass_sigs = :pass_sigs"),
@@ -818,6 +818,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                 (result.wall > 0 ? result.wall : result.duration) /
                                 3600 * something(SLOT_HOURLY_RATE[]) * result.slots,
                      ":peak_rss" => result.peak_rss,
+                     ":held" => result.held,
                      ":log_key" => key,
                      (line === nothing ? () : ((":error_line" => line),))...,
                      (lines === nothing ? () : ((":error_lines" => lines),))...,
@@ -969,7 +970,7 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
             "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
                                   "recheck_of = reused_from " *
                                   "REMOVE reused_from, reason, reason_message, version, " *
-                                  "#d, wall, log_key, cost, peak_rss, error_line, " *
+                                  "#d, wall, log_key, cost, peak_rss, held, error_line, " *
                                   "error_lines, pass_sigs, finished_at",
             "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
             "ExpressionAttributeValues" => ddb_item(Dict(
