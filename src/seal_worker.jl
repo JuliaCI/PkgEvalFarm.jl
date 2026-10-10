@@ -26,6 +26,14 @@ proxy's server-side hold cap."
 test_fetch_deadline() =
     something(tryparse(Float64, get(ENV, "PKGEVAL_TEST_FETCH_DEADLINE", "")), 600.0)
 
+"""How much held fetch time a test job may leave out of its time limit, so a
+derivation that never completes still cannot keep a job running indefinitely."""
+held_time_cap() =
+    something(tryparse(Float64, get(ENV, "PKGEVAL_HELD_TIME_CAP", "")), 1800.0)
+
+pkgeval_supports_held_time() =
+    any(m -> :max_held_time in Base.kwarg_decl(m), methods(PkgEval.evaluate_script))
+
 # Seal jobs deliberately get NO client-side fetch bound (only the proxy's
 # server-side hold cap): a publishing job that gives up a hold compiles the
 # dep locally, which taints every downstream context with a sandbox-local
@@ -108,7 +116,7 @@ proxy address and its namespace. Empty when the proxy isn't running.
 """
 function seal_protocol_kwargs(seal_id::AbstractString;
                               fetch_deadline::Union{Nothing,Float64}=nothing,
-                              publisher::Bool=false)
+                              publisher::Bool=false, job::AbstractString="")
     pkgeval_supports_seal() || return (;)
     # the expansion-side detection guarantees this julia carries the hook
     proxy = SEAL_PROXY[]
@@ -117,6 +125,7 @@ function seal_protocol_kwargs(seal_id::AbstractString;
                "PKGEVAL_CACHE_NAMESPACE" => String(seal_id))
     fetch_deadline === nothing ||
         (env["PKGEVAL_CACHE_FETCH_DEADLINE"] = string(fetch_deadline))
+    isempty(job) || (env["PKGEVAL_CACHE_JOB"] = job)
     if publisher
         if !isempty(seal_cpu_target())            # empty target = host-native
             env["JULIA_CPU_TARGET"] = seal_cpu_target()
