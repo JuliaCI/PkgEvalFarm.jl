@@ -587,6 +587,54 @@ try
         @test PEF.get_run(ctx, run_id)["status"] == "done"
     end
 
+    @testset "a second expansion pass never resets or re-sends jobs" begin
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Kiwi", "Lime"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        expand = nothing
+        for _ in 1:10
+            expand = PEF.claim_job(ctx; wait=1)
+            expand isa PEF.ClaimedExpand && expand.run_id == run_id && break
+        end
+        @test expand isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Kiwi", "Lime"]) == 2
+        SQS.delete_message(expand.queue_url, expand.receipt_handle; aws_config=aws)
+        @test haskey(PEF.get_run(ctx, run_id), "enqueued_at")
+
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedJob && claimed.job.run_id == run_id
+        status(job) = only(j["status"] for j in PEF.run_jobs(ctx, run_id)
+                           if j["job_key"] == PEF.job_key(job))
+        visible() = sum(q -> parse(Int, SQS.get_queue_attributes(q,
+            Dict("AttributeNames" => ["ApproximateNumberOfMessages"]);
+            aws_config=aws)["Attributes"]["ApproximateNumberOfMessages"]),
+            (queue_url, slow_queue_url))
+
+        # a concurrent pass still writing its job items must not reset a claimed job
+        PEF.write_jobs(ctx, [PEF.JobRef(run_id, claimed.job.config, p) for p in ("Kiwi", "Lime")])
+        @test status(claimed.job) == "running"
+
+        # a pass losing the flip after the winner sent everything sends nothing
+        before = visible()
+        @test PEF.expand_run(ctx, run_id, ["Kiwi", "Lime"]) == 2
+        @test visible() == before
+
+        # without the winner's mark (it died part-way), only pending jobs are re-sent
+        PEF.record_result(ctx, claimed, PEF.JobResult(; status="test", duration=1.0))
+        Dynamodb.update_item(PEF.ddb_item(Dict("run_id" => run_id)), cfg.runs_table,
+            Dict("UpdateExpression" => "REMOVE enqueued_at"); aws_config=aws)
+        @test PEF.expand_run(ctx, run_id, ["Kiwi", "Lime"]) == 2
+        @test visible() == before + 1
+
+        for _ in 1:10
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob || continue
+            PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
+        end
+        @test PEF.get_run(ctx, run_id)["status"] == "done"
+        @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2
+    end
+
     @testset "slow queue has priority" begin
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Zebra"], Dict{String,Any}());
                                 submitter="tester", reuse=false)

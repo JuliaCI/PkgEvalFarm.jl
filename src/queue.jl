@@ -252,14 +252,13 @@ function run_unreliable(ctx::FarmCtx, run_id::AbstractString)
     return Set{String}(JSON.parse(get(ddb_parse(resp["Item"]), "unreliable", "[]")))
 end
 
-"Write already-completed job items carrying donors' results (batched)."
+"Create already-completed job items carrying donors' results."
 function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString,
                            jobs::Vector{JobRef}, results::AbstractDict)
     now = isodate()
-    for batch in Iterators.partition(jobs, 25)
-        requests = map(batch) do job
+    put_new_jobs(ctx, map(jobs) do job
             donor = results[job.package]
-            Dict("PutRequest" => Dict("Item" => ddb_item(Dict(
+            Dict(
                 "run_id" => job.run_id,
                 "job_key" => job_key(job),
                 "config" => job.config,
@@ -281,21 +280,13 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString,
                  (("pass_sigs" => donor["pass_sigs"]),))...,
                 "reused_from" => donor["run_id"],
                 "finished_at" => now,
-                "attempts" => 0))))
-        end
-        aws_retry() do
-            resp = Dynamodb.batch_write_item(Dict(ctx.cfg.jobs_table => collect(requests));
-                                             aws_config=ctx.aws)
-            unprocessed = get(resp, "UnprocessedItems", Dict())
-            isempty(unprocessed) || error("unprocessed DynamoDB writes; retrying")
-        end
-    end
+                "attempts" => 0)
+        end)
 end
 
-"Create the DynamoDB job items (25 per BatchWriteItem), idempotently."
+"Create the pending job items."
 function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef}; est=Returns(nothing))
-    for batch in Iterators.partition(jobs, 25)
-        requests = [Dict("PutRequest" => Dict("Item" => ddb_item(Dict(
+    put_new_jobs(ctx, [Dict(
                         "run_id" => job.run_id,
                         "job_key" => job_key(job),
                         "config" => job.config,
@@ -306,14 +297,25 @@ function write_jobs(ctx::FarmCtx, jobs::Vector{JobRef}; est=Returns(nothing))
                         # bot's ETA can weigh remaining work by expected cost
                         # instead of assuming all jobs are equal
                         (est(job) === nothing ? () : ("est" => est(job),))...,
-                    )))) for job in batch]
-        aws_retry() do
-            resp = Dynamodb.batch_write_item(Dict(ctx.cfg.jobs_table => requests);
-                                             aws_config=ctx.aws)
-            unprocessed = get(resp, "UnprocessedItems", Dict())
-            isempty(unprocessed) || error("unprocessed DynamoDB writes; retrying")
+                    ) for job in jobs])
+end
+
+# Never overwrite an existing job item: a concurrent expansion may already have
+# enqueued it and a worker claimed it, and a rewrite would reset it to pending.
+# BatchWriteItem takes no conditions, so this is one put per item.
+function put_new_jobs(ctx::FarmCtx, items::Vector)
+    asyncmap(items; ntasks=16) do item
+        try
+            aws_retry() do
+                Dynamodb.put_item(ddb_item(item), ctx.cfg.jobs_table,
+                    Dict("ConditionExpression" => "attribute_not_exists(job_key)");
+                    aws_config=ctx.aws)
+            end
+        catch err
+            is_conditional_failure(err) || rethrow()
         end
     end
+    return
 end
 
 """
@@ -322,9 +324,11 @@ end
 Worker-side completion of an `expanding` run: write the job items, flip the run to
 `active` with the real job count, and enqueue the job messages.
 
-Safe under at-least-once delivery: job items are written before the conditional
-status flip, so a crashed expansion is simply redone, and because duplicate job
-messages are harmless, a redelivered expand message after the flip just re-enqueues.
+Safe under at-least-once delivery: job items are created (never overwritten)
+before the conditional status flip, so a crashed expansion is simply redone. The
+pass that wins the flip marks the run `enqueued_at` once its messages are out; a
+later or concurrent pass that loses the flip then sends nothing, or, if that mark
+is missing because the winner died part-way, only the jobs still pending.
 """
 function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{String})
     run = get_run(ctx, run_id)
@@ -387,11 +391,11 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
             aws_config=ctx.aws)
     catch err
         if is_conditional_failure(err)
-            # already expanded by an earlier (interrupted) attempt; messages may or
-            # may not have been sent, so fall through and (re-)enqueue everything —
-            # claim_job drops messages for jobs that are already completed (which
-            # covers the reused ones), so over-enqueueing is merely a little churn
-            fresh = jobs
+            # another pass already flipped the run. Re-sending the whole run once
+            # duplicated every message (a full re-enqueue six hours into a daily)
+            haskey(get_run(ctx, run_id), "enqueued_at") && return length(jobs)
+            pending = Set(j["job_key"] for j in run_jobs(ctx, run_id) if j["status"] == "pending")
+            fresh = [j for j in jobs if job_key(j) in pending]
         else
             rethrow()
         end
@@ -402,6 +406,12 @@ function expand_run(ctx::FarmCtx, run_id::AbstractString, packages::Vector{Strin
         @info "routing long jobs to the slow queue" run_id nslow=length(slow_jobs) cutoff
     enqueue_jobs(ctx, slow_jobs; queue_url=slow_queue(ctx.cfg))
     enqueue_jobs(ctx, fast_jobs)
+    aws_retry() do
+        Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+            Dict("UpdateExpression" => "SET enqueued_at = :now",
+                 "ExpressionAttributeValues" => ddb_item(Dict(":now" => isodate())));
+            aws_config=ctx.aws)
+    end
     return length(jobs)
 end
 
