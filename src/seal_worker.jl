@@ -151,6 +151,15 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     job = claimed.job
     seal_id = seal_id_of(job.run_id)
     @info "sealing" job.run_id job.package attempt=claimed.attempts slot=cpu
+    # precompiling this package includes precompiling the dependency from scratch,
+    # so it would hit the same limit, and so would everything above it in the chain
+    blocker = timed_out_dep(ctx, job)
+    if blocker !== nothing
+        @info "dependency hit the seal time limit; not sealing" job.package blocker
+        return finish_seal_job(ctx, claimed, JobResult(; status="unsealable",
+            reason="dep_time_limit",
+            log="Not sealed: its dependency $blocker could not be sealed within the time limit"))
+    end
     stop_heartbeat = start_heartbeat(ctx, claimed, "seal $(job.package)")
 
     result = try
@@ -212,7 +221,24 @@ function process_seal_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     finally
         stop_heartbeat()
     end
+    return finish_seal_job(ctx, claimed, result)
+end
 
+"A direct dependency whose seal job ran out of time, directly or through its own deps."
+function timed_out_dep(ctx::FarmCtx, job::JobRef)
+    item = get_seal_item(ctx, job)
+    item === nothing && return nothing
+    for dep in unique(String.(get(item, "deps", String[])))
+        dep_item = get_seal_item(ctx, JobRef(job.run_id, SEAL_CONFIG_NAME, dep))
+        dep_item === nothing && continue
+        get(dep_item, "status", "") == "unsealable" &&
+            get(dep_item, "reason", "") in ("time_limit", "dep_time_limit") && return dep
+    end
+    return nothing
+end
+
+function finish_seal_job(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
+    job = claimed.job
     try
         record_result(ctx, claimed, result)
         @info "sealed" job.package result.status

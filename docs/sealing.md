@@ -87,7 +87,10 @@ Each seal job item stores its in-run `deps`, reverse `dependents`, and a
 completing seal job atomically decrements each dependent's counter and
 enqueues those that reach zero. Any terminal state (sealed, unsealable, error)
 decrements — a dep that failed to precompile does not orphan its dependents,
-whose own seal jobs then discover the failure first-hand and cheaply.
+whose own seal jobs then discover the failure first-hand and cheaply. The
+exception is a dep that ran out of time: its dependents would precompile it
+from scratch and time out too, so they are recorded unsealable
+(`dep_time_limit`) without running, which also releases their gated tests.
 
 Seal jobs hang off a **seal run** (`run_id = "seal-<seal-id-prefix>"`,
 config name `"seal"` — reserved) so counters, completion, DLQ handling and

@@ -2075,6 +2075,30 @@ try
             PEF.record_result(sctx, c, PEF.JobResult(; status="unsealable",
                                                      reason="precompile", duration=1.0))
 
+            # a dep that ran out of time sealing blocks its dependents' seal jobs,
+            # directly or through a dependency that was itself blocked
+            let tr = "seal-timeoutcascade0"
+                function seal_item(pkg, status, deps; reason=nothing)
+                    Dynamodb.put_item(PEF.ddb_item(Dict(
+                            "run_id" => tr, "job_key" => PEF.job_key(PEF.SEAL_CONFIG_NAME, pkg),
+                            "config" => PEF.SEAL_CONFIG_NAME, "package" => pkg, "kind" => "seal",
+                            "status" => status, "attempts" => 1, "deps" => deps,
+                            "dependents" => Any[], "remaining" => 0,
+                            (reason === nothing ? () : ("reason" => reason,))...)),
+                        "pkgeval-jobs"; aws_config=aws)
+                end
+                seal_item("Slow", "unsealable", Any[]; reason="time_limit")
+                seal_item("Broken", "unsealable", Any[]; reason="precompile")
+                seal_item("Inherited", "unsealable", ["Slow"]; reason="dep_time_limit")
+                seal_item("OnSlow", "pending", ["Broken", "Slow"])
+                seal_item("OnInherited", "pending", ["Inherited"])
+                seal_item("OnBroken", "pending", ["Broken", "NoSealJob"])
+                job(pkg) = PEF.JobRef(tr, PEF.SEAL_CONFIG_NAME, pkg)
+                @test PEF.timed_out_dep(sctx, job("OnSlow")) == "Slow"
+                @test PEF.timed_out_dep(sctx, job("OnInherited")) == "Inherited"
+                @test PEF.timed_out_dep(sctx, job("OnBroken")) === nothing
+            end
+
             # cycle amnesty: a pending component that only waits on itself
             # (items predating seal_dep_graph's cycle collapse — the
             # Compat <-> SHA deadlock that froze every ecosystem seal run) is
