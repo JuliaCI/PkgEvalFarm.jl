@@ -500,13 +500,16 @@ resource "aws_autoscaling_policy" "ec2_worker_backlog" {
 }
 
 # 2. kickstart: from zero instances the ratio above cannot breach the target, so
-#    bring up exactly one worker as soon as the queue is non-empty
+#    bring up one worker once the queue has been non-empty for three minutes
 resource "aws_cloudwatch_metric_alarm" "ec2_worker_kickstart" {
   count               = local.ec2_workers
   alarm_name          = "${var.name_prefix}-ec2-worker-kickstart"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
-  evaluation_periods  = 1
+  # one missing instance datapoint reads as an empty fleet; on 2026-10-12 a
+  # single gap fired this alarm under a running fleet
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
   treat_missing_data  = "notBreaching"
   alarm_description   = "Job queue is non-empty but no EC2 workers are running"
   alarm_actions       = [aws_autoscaling_policy.ec2_worker_kickstart[0].arn]
@@ -559,7 +562,12 @@ resource "aws_autoscaling_policy" "ec2_worker_kickstart" {
   name                   = "kickstart"
   autoscaling_group_name = aws_autoscaling_group.ec2_worker[0].name
   policy_type            = "StepScaling"
-  adjustment_type        = "ExactCapacity"
+  # never set an exact capacity: a false alarm then cut a 384-slot fleet's
+  # desired capacity to 1, and spot reclaims went unreplaced for hours
+  adjustment_type = "ChangeInCapacity"
+  # the alarm re-runs the policy every minute while it stays in ALARM; a
+  # launching instance counts towards the step, so this adds one, not one a minute
+  estimated_instance_warmup = 600
 
   step_adjustment {
     metric_interval_lower_bound = 0
