@@ -870,10 +870,12 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         if job.package in job_run(ctx, job, run_cache, run_cache_lock)["unreliable"]
             config = PkgEval.Configuration(config; goal=:load)
         end
-        # redeliveries skip the package cache: cache interactions are the most likely
-        # source of irreproducible failures (mirrors evaluate()'s retry behavior).
-        # The seal gate and cache protocol are skipped too, for the same reason.
-        use_cache = claimed.attempts <= 1
+        # a retry after an errored attempt skips the package cache: cache interactions
+        # are the most likely source of irreproducible failures (mirrors evaluate()'s
+        # retry behavior). The seal gate and cache protocol are skipped too, for the
+        # same reason. A job handed back by a draining worker (spot reclaim) did not
+        # fail, so it keeps them: on daily-2026-10-12, 49% of those cold reruns were killed
+        use_cache = claimed.failures == 0
         gated_seal_run = ""
         if use_cache
             run = job_run(ctx, job, run_cache, run_cache_lock)
@@ -968,7 +970,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                       log=sprint(showerror, err, catch_backtrace()))
         else
             @error "job errored; releasing for retry" job.package exception=(err, catch_backtrace())
-            release_job(ctx, claimed)
+            release_job(ctx, claimed; failed=true)
             return
         end
     finally

@@ -441,6 +441,9 @@ struct ClaimedJob
     # the claim's stamp on the job item: every slot on a host shares the
     # worker identity, so this is what tells this claim from a later one
     started_at::String
+    # earlier attempts that errored, as opposed to deliveries handed back by a
+    # draining worker or a build wait
+    failures::Int
 end
 
 "A received *expand* message: the worker should compute and fan out the run's jobs."
@@ -530,11 +533,12 @@ function claim_from_queues(ctx::FarmCtx, queues)
     # stamp and are deleted below, exactly like duplicates of finished jobs.
     # A genuinely dead worker's redelivery arrives after the ≥30-minute
     # visibility lapse, by which point the stamp is well past stale.
-    try
+    claimed_item = try
         Dynamodb.update_item(
             ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
             ctx.cfg.jobs_table,
-            Dict("ConditionExpression" => "attribute_exists(run_id) AND " *
+            Dict("ReturnValues" => "ALL_NEW",
+                 "ConditionExpression" => "attribute_exists(run_id) AND " *
                      "(#s = :pending OR (#s = :running AND " *
                      "(attribute_not_exists(heartbeat_at) OR heartbeat_at < :stale)))",
                  "UpdateExpression" => "SET #s = :running, worker = :worker, " *
@@ -556,7 +560,8 @@ function claim_from_queues(ctx::FarmCtx, queues)
         end
         rethrow()
     end
-    return ClaimedJob(job, receipt, receive_count, from_queue, claimed_at)
+    failures = Int(get(ddb_parse(claimed_item["Attributes"]), "failures", 0))
+    return ClaimedJob(job, receipt, receive_count, from_queue, claimed_at, failures)
 end
 
 function unneeded_seal_message(ctx::FarmCtx, message)
@@ -699,8 +704,12 @@ function note_run_waiting(ctx::FarmCtx, run_id::AbstractString;
     return nothing
 end
 
-"Give up on a claimed job without recording a result; it will be redelivered."
-function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60)
+"""
+Give up on a claimed job without recording a result; it will be redelivered.
+`failed` marks the attempt as errored, so the next one runs without the cache.
+"""
+function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; delay::Int=60,
+                     failed::Bool=false)
     # clear the liveness stamp FIRST: a released message must be immediately
     # re-claimable (drain fast-release, transient-error retries), and a fresh
     # heartbeat_at would make the next claim mistake the job for still-live
@@ -711,9 +720,10 @@ function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; del
                 ddb_item(Dict("run_id" => claimed.job.run_id, "job_key" => job_key(claimed.job))),
                 ctx.cfg.jobs_table,
                 Dict("ConditionExpression" => "#s = :running",
-                     "UpdateExpression" => "REMOVE heartbeat_at",
+                     "UpdateExpression" => "REMOVE heartbeat_at" * (failed ? " ADD failures :one" : ""),
                      "ExpressionAttributeNames" => Dict("#s" => "status"),
-                     "ExpressionAttributeValues" => ddb_item(Dict(":running" => "running")));
+                     "ExpressionAttributeValues" => ddb_item(Dict(":running" => "running",
+                         (failed ? (":one" => 1,) : ())...)));
                 aws_config=ctx.aws)
         catch err
             if !is_conditional_failure(err)
