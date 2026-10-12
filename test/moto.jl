@@ -343,8 +343,11 @@ try
             claimed = PEF.claim_job(ctx; wait=1)
             @test claimed !== nothing
             @test claimed.job.package == "Broken"
+            # a drain hands the first claim back; only the errored second one counts
+            # as a failure, which turns the cache off for the next attempt
+            @test claimed.failures == (attempt == 3 ? 1 : 0)
             if attempt < 3
-                PEF.release_job(ctx, claimed; delay=0)
+                PEF.release_job(ctx, claimed; delay=0, failed=attempt == 2)
             else
                 @test claimed.attempts == 3
                 PEF.record_result(ctx, claimed, PEF.JobResult(; status="error",
