@@ -35,6 +35,19 @@ proc, port = start_moto()
 endpoint = "http://127.0.0.1:$port"
 aws = MotoConfig(endpoint, "us-east-1", AWS.AWSCredentials("testing", "testing"))
 
+# moto 5.2.4 enforces SQS's limit of one purge per queue every 60 seconds
+function purge_queue(queue_url)
+    for attempt in 1:3
+        try
+            return SQS.purge_queue(queue_url; aws_config=aws)
+        catch err
+            (err isa AWS.AWSException && err.code == "PurgeQueueInProgress" && attempt < 3) ||
+                rethrow()
+            sleep(61)
+        end
+    end
+end
+
 try
     # provision the same resources terraform would
     for (table, keys) in ["pkgeval-runs" => [("run_id", "HASH")],
@@ -186,7 +199,7 @@ try
             Dict("AttributeNames" => ["ApproximateNumberOfMessagesDelayed"]);
             aws_config=aws)["Attributes"]["ApproximateNumberOfMessagesDelayed"])
         @test delayed() == 1
-        SQS.purge_queue(queue_url; aws_config=aws)
+        purge_queue(queue_url)
         # ...and once the beats stop (worker death), redelivery re-claims
         Dynamodb.update_item(
             PEF.ddb_item(Dict("run_id" => RUN_ID, "job_key" => "primary#LongJob")),
@@ -854,7 +867,7 @@ try
             p, srv
         end
         gh_base[] = "http://127.0.0.1:$gh_port"
-        SQS.purge_queue(queue_url; aws_config=aws)  # drop strays from earlier testsets
+        purge_queue(queue_url)  # drop strays from earlier testsets
         gh = PEF.FarmLite.GitHubCtx("bot-token", gh_base[])
 
         lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
