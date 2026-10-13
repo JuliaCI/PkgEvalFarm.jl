@@ -113,9 +113,10 @@ resource "aws_iam_role_policy" "ec2_worker_fleet" {
         Resource = "arn:aws:ssm:${var.region}:${data.aws_caller_identity.current.account_id}:parameter/pkgeval/worker-ref"
       },
       {
-        Effect   = "Allow"
-        Action   = "sqs:GetQueueAttributes"
-        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn]
+        Effect = "Allow"
+        Action = "sqs:GetQueueAttributes"
+        Resource = [aws_sqs_queue.jobs.arn, aws_sqs_queue.jobs_slow.arn,
+        aws_sqs_queue.jobs_seal.arn, aws_sqs_queue.jobs_deriv.arn]
       },
     ]
   })
