@@ -449,6 +449,18 @@ want_derivable(ctx::FarmCtx, ns::AbstractString, want) =
 
 deriv_run_id(ns::AbstractString) = "deriv-" * ns
 
+"""
+The CPU type a want's preimage names on its `cpu=` line (without the features
+hash), or `nothing` when it names none. A derivation only reproduces the
+wanted key on a host of that type, so its message asks for one.
+"""
+function preimage_cpu(body::AbstractString)
+    for line in eachsplit(body, '\n')
+        startswith(line, "cpu=") && return String(first(split(chopprefix(line, "cpu="), ':')))
+    end
+    return nothing
+end
+
 "Idempotently create the bookkeeping run derivation jobs of one namespace hang off."
 function ensure_deriv_run(ctx::FarmCtx, ns::AbstractString)
     run_id = deriv_run_id(ns)
@@ -517,7 +529,8 @@ function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
         # best-effort can fail. A death right here leaves a pending item whose
         # enqueued_at lease expires, after which any holder or later want
         # re-sends (rearm_derivation!) — never a permanent zombie.
-        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg))
+        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg),
+                     cpu=Returns(preimage_cpu(body)))
         # run counters are observability only and this row is hot (every
         # completing derivation transacts on it): they must never gate the
         # message, and a conflict here must never poison the ingest
@@ -557,7 +570,8 @@ function ingest_want(ctx::FarmCtx, ns::AbstractString, body::AbstractString)
         false
     end
     if rearmed_dead
-        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg))
+        enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg),
+                     cpu=Returns(preimage_cpu(body)))
         @info "re-armed dead derivation" ns want.name key=first(key, 12)
         return key
     end
@@ -632,7 +646,8 @@ function rearm_derivation!(ctx::FarmCtx, run_id::AbstractString, key::AbstractSt
         false
     end
     won || return false
-    enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg))
+    enqueue_jobs(ctx, [JobRef(run_id, "deriv", key)]; queue_url=deriv_queue(ctx.cfg),
+                 cpu=Returns(preimage_cpu(String(get(item, "preimage", "")))))
     @info "re-armed stalled derivation" run_id status rearms=rearms + 1 key=first(key, 12)
     return true
 end

@@ -278,6 +278,7 @@ function write_reused_jobs(ctx::FarmCtx, run_id::AbstractString,
                  (("error_lines" => donor["error_lines"]),))...,
                 (get(donor, "pass_sigs", nothing) === nothing ? () :
                  (("pass_sigs" => donor["pass_sigs"]),))...,
+                (get(donor, "cpu", nothing) === nothing ? () : (("cpu" => donor["cpu"]),))...,
                 "reused_from" => donor["run_id"],
                 "finished_at" => now,
                 "attempts" => 0)
@@ -417,9 +418,10 @@ end
 
 "Enqueue SQS messages for jobs (also used to re-drive stalled jobs)."
 function enqueue_jobs(ctx::FarmCtx, jobs::Vector{JobRef};
-                      queue_url::AbstractString=ctx.cfg.queue_url, delay::Int=0)
+                      queue_url::AbstractString=ctx.cfg.queue_url, delay::Int=0,
+                      cpu=Returns(nothing))
     for batch in Iterators.partition(jobs, 10)
-        entries = [Dict("Id" => string(i), "MessageBody" => json_message(job),
+        entries = [Dict("Id" => string(i), "MessageBody" => json_message(job; cpu=cpu(job)),
                         "DelaySeconds" => delay)
                    for (i, job) in enumerate(batch)]
         aws_retry() do
@@ -444,6 +446,8 @@ struct ClaimedJob
     # earlier attempts that errored, as opposed to deliveries handed back by a
     # draining worker or a build wait
     failures::Int
+    # the CPU type the message asked for, kept when the job goes back on a queue
+    cpu::Union{String,Nothing}
 end
 
 "A received *expand* message: the worker should compute and fan out the run's jobs."
@@ -523,6 +527,15 @@ function claim_from_queues(ctx::FarmCtx, queues)
     get(body, "expand", false) == true &&
         return ClaimedExpand(body["run_id"], receipt, from_queue)
     job = JobRef(body)
+    want_cpu = get(body, "cpu", nothing)
+    if want_cpu !== nothing && want_cpu != host_cpu()
+        if !cpu_wait_over(body)
+            pass_to_other_cpu(ctx, from_queue, receipt, body)
+            return nothing
+        end
+        # past the wait the request is spent, so a later re-send drops it
+        want_cpu = nothing
+    end
     receive_count = parse(Int, get(get(message, "Attributes", Dict()), "ApproximateReceiveCount", "1"))
     claimed_at = isodate()
 
@@ -533,6 +546,9 @@ function claim_from_queues(ctx::FarmCtx, queues)
     # stamp and are deleted below, exactly like duplicates of finished jobs.
     # A genuinely dead worker's redelivery arrives after the ≥30-minute
     # visibility lapse, by which point the stamp is well past stale.
+    # A job that asks for a CPU type (a recheck) refuses other hosts until its
+    # wait is up, also through messages that don't carry the request: a stray
+    # duplicate from before the recheck would otherwise run it on any host.
     claimed_item = try
         Dynamodb.update_item(
             ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
@@ -540,7 +556,8 @@ function claim_from_queues(ctx::FarmCtx, queues)
             Dict("ReturnValues" => "ALL_NEW",
                  "ConditionExpression" => "attribute_exists(run_id) AND " *
                      "(#s = :pending OR (#s = :running AND " *
-                     "(attribute_not_exists(heartbeat_at) OR heartbeat_at < :stale)))",
+                     "(attribute_not_exists(heartbeat_at) OR heartbeat_at < :stale))) AND " *
+                     "(attribute_not_exists(want_cpu) OR want_cpu = :host OR want_since < :cpu_cutoff)",
                  "UpdateExpression" => "SET #s = :running, worker = :worker, " *
                                        "started_at = :now, heartbeat_at = :now ADD attempts :one",
                  "ExpressionAttributeNames" => Dict("#s" => "status"),
@@ -548,6 +565,9 @@ function claim_from_queues(ctx::FarmCtx, queues)
                      ":pending" => "pending", ":running" => "running",
                      ":worker" => worker_identity(), ":now" => claimed_at,
                      ":stale" => isodate(Dates.now(Dates.UTC) - Dates.Second(3 * HEARTBEAT_INTERVAL)),
+                     ":host" => host_cpu(),
+                     ":cpu_cutoff" => isodate(Dates.now(Dates.UTC) -
+                                              Dates.Second(round(Int, cpu_wait_limit()))),
                      ":one" => 1)));
             aws_config=ctx.aws)
     catch err
@@ -561,7 +581,43 @@ function claim_from_queues(ctx::FarmCtx, queues)
         rethrow()
     end
     failures = Int(get(ddb_parse(claimed_item["Attributes"]), "failures", 0))
-    return ClaimedJob(job, receipt, receive_count, from_queue, claimed_at, failures)
+    return ClaimedJob(job, receipt, receive_count, from_queue, claimed_at, failures, want_cpu)
+end
+
+"""
+The CPU type of this host, as LLVM names it (`znver4`, `icelake-server`, ...).
+Results record it, and a message can ask for it (see `pass_to_other_cpu`).
+"""
+host_cpu() = get(ENV, "PKGEVAL_HOST_CPU", Sys.CPU_NAME)
+
+"How long a job waits for a host of the CPU type it asks for before running anywhere."
+cpu_wait_limit() = something(tryparse(Float64, get(ENV, "PKGEVAL_CPU_WAIT", "")), 30.0 * 60)
+
+const CPU_PASS_DELAY = Ref(60)  # seconds; the tests set it to 0
+
+cpu_wait_over(body) = haskey(body, "cpu_since") &&
+    Dates.now(UTC) - parse_expiration(body["cpu_since"]) >
+        Dates.Second(round(Int, cpu_wait_limit()))
+
+"""
+Put a job that asks for another CPU type back as a new message, so a host of
+that type can take it. A test job goes on the slow queue, which every worker
+polls before the main one; seal-pipeline work stays on its own queue. The
+message keeps the time of its first pass, so it runs anywhere once the wait
+limit is up (the fleet may have no host of that type). A new message rather
+than a visibility change, so the passes never count towards the dead-letter
+limit.
+"""
+function pass_to_other_cpu(ctx::FarmCtx, queue_url::AbstractString,
+                           receipt::AbstractString, body::AbstractDict)
+    body = merge(body, Dict("cpu_since" => get(body, "cpu_since", isodate())))
+    aws_retry() do
+        SQS.send_message(JSON.json(body),
+                         queue_url == ctx.cfg.queue_url ? slow_queue(ctx.cfg) : queue_url,
+                         Dict("DelaySeconds" => CPU_PASS_DELAY[]); aws_config=ctx.aws)
+    end
+    SQS.delete_message(queue_url, receipt; aws_config=ctx.aws)
+    return nothing
 end
 
 function unneeded_seal_message(ctx::FarmCtx, message)
@@ -819,7 +875,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                  "UpdateExpression" => "SET #s = :status, reason = :reason, " *
                                        "reason_message = :reason_message, version = :version, " *
                                        "#d = :duration, wall = :wall, finished_at = :now, " *
-                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss, held = :held" *
+                                       "log_key = :log_key, cost = :cost, peak_rss = :peak_rss, held = :held, " *
+                                       "cpu = :cpu" *
                                        (line === nothing ? "" : ", error_line = :error_line") *
                                        (lines === nothing ? "" : ", error_lines = :error_lines") *
                                        (pass_sigs === nothing ? "" : ", pass_sigs = :pass_sigs"),
@@ -843,6 +900,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                 3600 * something(SLOT_HOURLY_RATE[]) * result.slots,
                      ":peak_rss" => result.peak_rss,
                      ":held" => result.held,
+                     ":cpu" => host_cpu(),
                      ":log_key" => key,
                      (line === nothing ? () : ((":error_line" => line),))...,
                      (lines === nothing ? () : ((":error_lines" => lines),))...,
@@ -876,7 +934,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     if attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
         # a recheck reopens jobs, and the run finishes after them instead
         nrecheck = try
-            recheck_reused_baselines(ctx, attrs)
+            recheck_baselines(ctx, attrs)
         catch err
             @error "baseline recheck failed; reporting with the reused results" run_id=job.run_id exception=(err, catch_backtrace())
             0
@@ -922,19 +980,25 @@ function pick_rechecks(candidates::Vector{Tuple{String,JobRef}})
 end
 
 """
-    recheck_reused_baselines(ctx, run_attrs) -> Int
+    recheck_baselines(ctx, run_attrs) -> Int
 
-When a run that reused baseline results has finished, re-run the baseline of
-every package that failed on primary but passed on the reused result. The donor
-ran on an older registry, so the difference may come from a package or dependency
-release rather than from the change under test; a fresh baseline settles it.
-Returns the number of re-run jobs (0 when there is nothing to recheck).
+When a run has finished, re-run the baseline of every package that failed on
+primary but passed on a baseline that may not be comparable:
+
+- a reused result: the donor ran on an older registry, so the difference may
+  come from a package or dependency release rather than from the change under
+  test;
+- a result from another CPU type than primary's: the fleet mixes CPUs, and
+  packages, their binaries and caches can behave differently on each (#47).
+
+The re-run asks for primary's CPU type, so the two results compare like for
+like. Returns the number of re-run jobs (0 when there is nothing to recheck).
 
 Happens at most once per run: the run item's `rechecked` field, set in the same
 transaction that reopens the jobs, guards against racing workers and against
 the re-runs triggering another round.
 """
-function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
+function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
     haskey(attrs, "rechecked") && return 0
     haskey(attrs, "kind") && return 0  # seal and deriv bookkeeping runs
     run_id = String(attrs["run_id"])
@@ -945,17 +1009,23 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
     jobs = run_jobs(ctx, run_id)
     by_key = Dict(String(j["job_key"]) => j for j in jobs)
     candidates = Tuple{String,JobRef}[]  # (primary status, baseline to re-run)
+    primary_cpu = Dict{String,String}()     # package => the CPU type primary ran on
     for j in jobs
-        j["config"] == "against" && haskey(j, "reused_from") || continue
+        j["config"] == "against" || continue
         issuccess(String(get(j, "status", ""))) || continue
         p = get(by_key, job_key(primary, String(j["package"])), nothing)
         p === nothing && continue
         pst = String(get(p, "status", ""))
         pst in TERMINAL_STATUSES && !issuccess(pst) && pst != "skip" || continue
+        pcpu = get(p, "cpu", nothing)
+        other_cpu = pcpu !== nothing && get(j, "cpu", pcpu) != pcpu
+        haskey(j, "reused_from") || other_cpu || continue
+        pcpu === nothing || (primary_cpu[String(j["package"])] = String(pcpu))
         push!(candidates, (pst, JobRef(run_id, "against", String(j["package"]))))
     end
     isempty(candidates) && return 0
     recheck, skipped = pick_rechecks(candidates)
+    nreused = count(job -> haskey(by_key[job_key(job)], "reused_from"), recheck)
 
     # the re-runs must evaluate under the same scheme as primary did: sealed
     # if primary was, which needs the packages added to the against seal run
@@ -969,7 +1039,8 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
 
     # messages first, delayed so they arrive after the reset below: if the
     # reset loses a race or fails, they meet finished jobs and are dropped
-    enqueue_jobs(ctx, recheck; delay=RECHECK_DELAY[])
+    enqueue_jobs(ctx, recheck; queue_url=slow_queue(ctx.cfg), delay=RECHECK_DELAY[],
+                 cpu=job -> get(primary_cpu, job.package, nothing))
     now = isodate()
     items = Any[Dict("Update" => Dict(
         "TableName" => ctx.cfg.runs_table,
@@ -984,21 +1055,31 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         "ExpressionAttributeValues" => ddb_item(Dict(
             ":active" => "active", ":n" => length(recheck), ":skipped" => skipped, ":now" => now,
             ":minus" => -length(recheck),
-            ":reused" => count(j -> haskey(j, "reused_from"), jobs) - length(recheck),
+            ":reused" => count(j -> haskey(j, "reused_from"), jobs) - nreused,
             (seal_runs isa AbstractDict ? ((":sr" => seal_runs),) : ())...))))]
     for job in recheck
+        # a fresh baseline is re-run in its own run, so it points at that
+        reused = haskey(by_key[job_key(job)], "reused_from")
         push!(items, Dict("Update" => Dict(
             "TableName" => ctx.cfg.jobs_table,
             "Key" => ddb_item(Dict("run_id" => run_id, "job_key" => job_key(job))),
-            "ConditionExpression" => "attribute_exists(reused_from)",
+            "ConditionExpression" => reused ? "attribute_exists(reused_from)" :
+                                              "attribute_not_exists(reused_from) AND #s = :was",
             "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
-                                  "recheck_of = reused_from " *
+                                  (haskey(primary_cpu, job.package) ?
+                                   "want_cpu = :want_cpu, want_since = :now, " : "") *
+                                  "recheck_of = " * (reused ? "reused_from " : ":run ") *
                                   "REMOVE reused_from, reason, reason_message, version, " *
                                   "#d, wall, log_key, cost, peak_rss, held, error_line, " *
-                                  "error_lines, pass_sigs, finished_at",
+                                  "error_lines, pass_sigs, finished_at, cpu, failures, " *
+                                  "seal_wait_since",
             "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
             "ExpressionAttributeValues" => ddb_item(Dict(
-                ":pending" => "pending", ":zero" => 0)))))
+                ":pending" => "pending", ":zero" => 0,
+                (haskey(primary_cpu, job.package) ?
+                 (":want_cpu" => primary_cpu[job.package], ":now" => now) : ())...,
+                (reused ? () : (":was" => by_key[job_key(job)]["status"],
+                                ":run" => run_id))...)))))
     end
     try
         aws_retry() do
@@ -1008,7 +1089,7 @@ function recheck_reused_baselines(ctx::FarmCtx, attrs::AbstractDict)
         is_conditional_failure(err) && return 0  # another worker got there first
         rethrow()
     end
-    @info "re-running reused baselines of packages that fail on primary" run_id n=length(recheck) skipped
+    @info "re-running baselines of packages that fail on primary" run_id n=length(recheck) nreused skipped
     return length(recheck)
 end
 
