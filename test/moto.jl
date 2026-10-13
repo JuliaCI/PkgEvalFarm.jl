@@ -1995,6 +1995,7 @@ try
             @test haskey(item, "seal_wait_since") && !haskey(item, "heartbeat_at")
             tc = claim_test("JSON")
             @test tc isa PEF.ClaimedJob && tc.attempts == 1   # a fresh message
+            @test tc.queue_url == PEF.slow_queue(scfg)
             # a stalled seal run, or a wait past the limit, runs the test anyway
             withenv("PKGEVAL_SEAL_STALL" => "-1") do
                 @test !PEF.defer_until_sealed!(sctx, tc, sr)

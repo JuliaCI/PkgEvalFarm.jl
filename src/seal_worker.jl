@@ -569,7 +569,9 @@ running while its cache fetches are held (on daily-2026-10-09, 31% of tests
 started with their seal job pending were killed, against 1% of the rest).
 
 The job goes back as a new, delayed message and its claim is undone, so neither
-the queue's receive count nor the job's attempts grow. Returns `false`, and the
+the queue's receive count nor the job's attempts grow. The message goes on the
+slow queue, which workers poll first: on the main queue it could wait hours
+behind another run's backlog, since SQS only roughly keeps order. Returns `false`, and the
 test runs with whatever has been sealed, once it has waited the seal wait limit
 in total or its seal job has stalled (see `seal_stalled`). Each deferral offers
 a (throttled) reconcile of the seal run: the waiting party heals the pipeline it
@@ -595,7 +597,7 @@ function defer_until_sealed!(ctx::FarmCtx, claimed::ClaimedJob, seal_run_id::Abs
         @info "seal job has stalled; evaluating with whatever sealed" job.package seal_run_id
         return false
     end
-    enqueue_jobs(ctx, [job]; queue_url=claimed.queue_url, delay=seal_defer_delay())
+    enqueue_jobs(ctx, [job]; queue_url=slow_queue(ctx.cfg), delay=seal_defer_delay())
     try
         aws_retry() do
             Dynamodb.update_item(
