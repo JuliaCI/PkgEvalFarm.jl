@@ -1736,14 +1736,21 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         println(io, "- ", count(j -> opt_str(j, "reused_from") !== nothing, jobs),
                 " baseline results reused from run ", join(map(d -> "`$d`", donors), ", "),
                 " (pass `fresh_baseline = true` to re-evaluate)")
-    nrecheck = count(j -> opt_str(j, "recheck_of") !== nothing, jobs)
+    # a re-run of a fresh baseline points at its own run, of a reused one at the donor
+    nrecheck = count(j -> something(opt_str(j, "recheck_of"), run_id) != run_id, jobs)
     nrecheck == 0 ||
         println(io, "- ", nrecheck, " reused baseline", nrecheck == 1 ? "" : "s",
                 " re-run because the package failed on primary")
+    ncpu = count(j -> opt_str(j, "recheck_of") == run_id, jobs)
+    ncpu == 0 ||
+        println(io, "- ", ncpu, " baseline", ncpu == 1 ? "" : "s",
+                " re-run because the package failed on primary but passed on another CPU type ",
+                "(the re-run asks for primary's CPU type)")
     nskipped = int(run, "rechecks_skipped", 0)
     nskipped == 0 ||
-        println(io, "- ", nskipped, " more reused baseline", nskipped == 1 ? " was" : "s were",
-                " not re-run (over the limit of re-runs per run); their new failures may come from registry changes")
+        println(io, "- ", nskipped, " more baseline", nskipped == 1 ? " was" : "s were",
+                " not re-run (over the limit of re-runs per run); their new failures may come from ",
+                "registry changes or CPU type differences")
     total_cost = 0.0
     nmetered = 0
     for j in jobs

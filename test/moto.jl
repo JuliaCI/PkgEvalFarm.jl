@@ -556,7 +556,7 @@ try
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
         @test run["completed_jobs"] == 4
-        @test PEF.recheck_reused_baselines(ctx, run) == 0
+        @test PEF.recheck_baselines(ctx, run) == 0
         job = only(filter(j -> j["job_key"] == "against#Example", PEF.run_jobs(ctx, run_id)))
         @test job["status"] == "fail"
         @test job["log_key"] == PEF.log_key(run_id, "against", "Example")
@@ -601,6 +601,99 @@ try
             PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0))
         end
         @test PEF.get_run(ctx, run_id)["status"] == "done"
+    end
+
+    @testset "a baseline from another CPU type is re-run on primary's" begin
+        PEF.RECHECK_DELAY[] = 0
+        PEF.CPU_PASS_DELAY[] = 0
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && claimed.run_id == run_id && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+
+        # against passes on one CPU type, primary fails on another
+        host = Dict("against" => "znver4", "primary" => "skylake-avx512")
+        for _ in 1:12
+            run = PEF.get_run(ctx, run_id)
+            (haskey(run, "rechecked") || run["status"] == "done") && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
+            withenv("PKGEVAL_HOST_CPU" => host[c.job.config]) do
+                PEF.record_result(ctx, c, PEF.JobResult(;
+                    status=c.job.config == "against" ? "test" : "fail", duration=1.0))
+            end
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "active"
+        @test run["rechecked"] == 1
+        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
+        @test jobs["primary#Example"]["cpu"] == "skylake-avx512"
+        @test jobs["against#Example"]["status"] == "pending"
+        @test jobs["against#Example"]["recheck_of"] == run_id
+        @test !haskey(jobs["against#Example"], "cpu")
+        @test jobs["against#Example"]["want_cpu"] == "skylake-avx512"
+
+        # a message without the request can't run it on another host either
+        withenv("PKGEVAL_HOST_CPU" => "znver4") do
+            stray = PEF.JobRef(run_id, "against", "Example")
+            PEF.enqueue_jobs(ctx, [stray]; queue_url=slow_queue_url)
+            for _ in 1:6
+                c = PEF.claim_from_queues(ctx, [(slow_queue_url, 1)])
+                @test !(c isa PEF.ClaimedJob && c.job.run_id == run_id)
+                c isa PEF.ClaimedJob && PEF.release_job(ctx, c; delay=0)
+            end
+        end
+        @test PEF.run_jobs(ctx, run_id) |> js -> only(j["status"] for j in js
+                                                   if j["job_key"] == "against#Example") == "pending"
+
+        # a host of another type passes the re-run on, and primary's type takes it
+        status() = only(j["status"] for j in PEF.run_jobs(ctx, run_id)
+                        if j["job_key"] == "against#Example")
+        passed = false
+        withenv("PKGEVAL_HOST_CPU" => "znver4") do
+            for _ in 1:6
+                c = PEF.claim_job(ctx; wait=1)
+                @test !(c isa PEF.ClaimedJob && c.job.run_id == run_id)
+                c isa PEF.ClaimedJob && PEF.release_job(ctx, c; delay=0)
+                c === nothing && status() == "pending" && (passed = true; break)
+            end
+        end
+        @test passed
+        rerun = nothing
+        withenv("PKGEVAL_HOST_CPU" => "skylake-avx512") do
+            for _ in 1:12
+                c = PEF.claim_job(ctx; wait=1)
+                c isa PEF.ClaimedJob && c.job.run_id == run_id && (rerun = c; break)
+            end
+            @test rerun isa PEF.ClaimedJob && rerun.cpu == "skylake-avx512"
+            PEF.record_result(ctx, rerun, PEF.JobResult(; status="fail", duration=1.0))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"
+        @test PEF.recheck_baselines(ctx, run) == 0
+        report = PEF.FarmBot.generate_report(PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint), run_id)
+        @test occursin("1 baseline re-run because the package failed on primary but passed on another CPU type", report.markdown)
+        @test !occursin("reused baseline re-run", report.markdown)
+
+        # past the wait limit, any host runs it
+        body = Dict("run_id" => run_id, "config" => "against", "package" => "Example",
+                    "cpu" => "znver4")
+        @test !PEF.cpu_wait_over(body)
+        @test !PEF.cpu_wait_over(merge(body, Dict("cpu_since" => PEF.isodate())))
+        withenv("PKGEVAL_CPU_WAIT" => "-1") do
+            @test PEF.cpu_wait_over(merge(body, Dict("cpu_since" => PEF.isodate())))
+        end
+        PEF.RECHECK_DELAY[] = 60
+        PEF.CPU_PASS_DELAY[] = 60
     end
 
     @testset "a second expansion pass never resets or re-sends jobs" begin

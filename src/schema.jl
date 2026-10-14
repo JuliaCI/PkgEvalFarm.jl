@@ -211,8 +211,9 @@ end
 job_key(job::JobRef) = job_key(job.config, job.package)
 
 JobRef(d::AbstractDict) = JobRef(d["run_id"], d["config"], d["package"])
-json_message(job::JobRef) =
-    JSON.json(Dict("run_id" => job.run_id, "config" => job.config, "package" => job.package))
+json_message(job::JobRef; cpu::Union{AbstractString,Nothing}=nothing) =
+    JSON.json(Dict("run_id" => job.run_id, "config" => job.config, "package" => job.package,
+                   (cpu === nothing ? () : ("cpu" => cpu,))...))
 
 "Final result of one job, as recorded in DynamoDB (log goes to S3)."
 Base.@kwdef struct JobResult
@@ -248,6 +249,7 @@ reason_message(reason::AbstractString) =
     reason == "worker_exception" ? "the worker failed to evaluate the package" :
     reason == "unresolvable" ? "package dependencies could not be resolved" :
     reason == "build_failed" ? "a package build step failed" :
+    reason == "cpu_mismatch" ? "no host of the wanted CPU type was available" :
     PkgEval.reason_message(Symbol(reason))
 
 """

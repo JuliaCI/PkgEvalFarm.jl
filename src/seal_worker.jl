@@ -321,9 +321,15 @@ function process_derivation_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         item = get_seal_item(ctx, job)
         want = item === nothing ? nothing :
                parse_want_preimage(String(get(item, "preimage", "")))
+        want_cpu = item === nothing ? nothing : preimage_cpu(String(get(item, "preimage", "")))
         if want === nothing || !isdefined(PkgEval, :evaluate_derive)
             JobResult(; status="unsealable", reason="worker_exception",
                       log="derivation item unreadable, or PkgEval lacks evaluate_derive")
+        elseif want_cpu !== nothing && want_cpu != host_cpu()
+            # the wanted key can't be produced on this host. Ending it unsealable
+            # rather than sealed lets a later want re-arm it for a host of that type
+            JobResult(; status="unsealable", reason="cpu_mismatch",
+                      log="no $want_cpu host took this derivation in time; this host is $(host_cpu())")
         else
             # the julia/flags context comes from the namespace's seal run — the
             # trusted record of what this fingerprint means
@@ -597,7 +603,8 @@ function defer_until_sealed!(ctx::FarmCtx, claimed::ClaimedJob, seal_run_id::Abs
         @info "seal job has stalled; evaluating with whatever sealed" job.package seal_run_id
         return false
     end
-    enqueue_jobs(ctx, [job]; queue_url=slow_queue(ctx.cfg), delay=seal_defer_delay())
+    enqueue_jobs(ctx, [job]; queue_url=slow_queue(ctx.cfg), delay=seal_defer_delay(),
+                 cpu=Returns(claimed.cpu))
     try
         aws_retry() do
             Dynamodb.update_item(

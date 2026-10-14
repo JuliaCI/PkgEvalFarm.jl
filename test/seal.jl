@@ -173,6 +173,13 @@ end
         "flags=1", "prefs=0"], "\n"))
     @test v2 !== nothing && v2.ext_of === nothing
 
+    # a want names the CPU type its key is for; older clients name none
+    withcpu = join(["v2", "julia=1+a", "name=Foo", "uuid=$parent", "version=1.0.0",
+                    "tree=$("11"^20)", "flags=1", "prefs=0", "cpu=znver4:0123456789ab"], "\n")
+    @test PEF.parse_want_preimage(withcpu) !== nothing
+    @test PEF.preimage_cpu(withcpu) == "znver4"
+    @test PEF.preimage_cpu(lines(ext_uuid)) === nothing
+
     # extension pins carry unversioned (stdlib) triggers as uuid-only directs
     pins = Dict{String,Any}()
     PEF.merge_want_pins!(pins, want; include_unversioned=true)
