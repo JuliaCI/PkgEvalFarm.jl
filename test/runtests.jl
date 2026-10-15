@@ -152,6 +152,29 @@ end
         @test skipped == length(cands) - PEF.MAX_BASELINE_RECHECKS
         @test [j.package for j in recheck[1:2]] == ["C", "F"]   # kills go last
         @test PEF.pick_rechecks([("kill", ref("A"))]) == ([ref("A")], 0)
+        # re-runs started while the run was going use up part of the limit
+        recheck, skipped = PEF.pick_rechecks(cands; limit=1)
+        @test [j.package for j in recheck] == ["C"] && skipped == length(cands) - 1
+        @test PEF.pick_rechecks(cands; limit=-3) == (PEF.JobRef[], length(cands))
+    end
+
+    @testset "which baselines are due a re-run" begin
+        due = PEF.recheck_due
+        failed = Dict{String,Any}("status" => "fail", "cpu" => "znver4")
+        @test due(failed, Dict{String,Any}("status" => "test", "reused_from" => "r0"))
+        @test due(failed, Dict{String,Any}("status" => "test", "cpu" => "znver1"))
+        @test !due(failed, Dict{String,Any}("status" => "test", "cpu" => "znver4"))
+        @test !due(failed, Dict{String,Any}("status" => "fail", "reused_from" => "r0"))
+        # a baseline is re-run once at most
+        @test !due(failed, Dict{String,Any}("status" => "test", "cpu" => "znver1",
+                                            "recheck_of" => "r"))
+        @test !due(Dict{String,Any}("status" => "skip"),
+                   Dict{String,Any}("status" => "test", "reused_from" => "r0"))
+        @test !due(Dict{String,Any}("status" => "running"),
+                   Dict{String,Any}("status" => "test", "reused_from" => "r0"))
+        # without primary's CPU type only a reused baseline is in doubt
+        @test !due(Dict{String,Any}("status" => "fail"),
+                   Dict{String,Any}("status" => "test", "cpu" => "znver1"))
     end
 
     @testset "uninstallable skips are refined by cause" begin

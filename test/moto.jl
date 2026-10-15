@@ -524,49 +524,60 @@ try
         @test PEF.get_run(ctx, run_id)["completed_jobs"] == 2  # both baselines reused
         @test PEF.get_run(ctx, run_id)["reused_jobs"] == 2
 
-        # primary: Example fails where its reused baseline passed, JSON passes
-        for _ in 1:12
-            run = PEF.get_run(ctx, run_id)
-            (haskey(run, "rechecked") || run["status"] == "done") && break
+        # primary: Example fails where its reused baseline passed, and its
+        # baseline is re-run right away; JSON is killed, which is left to the
+        # end of the run. The fresh baselines fail too.
+        early = nothing
+        for _ in 1:16
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
             c = PEF.claim_job(ctx; wait=1)
-            c isa PEF.ClaimedJob || continue
+            c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
+            if c.job.config == "against"
+                PEF.record_result(ctx, c, PEF.JobResult(; status="fail", duration=1.0, log="failed"))
+                continue
+            end
             PEF.record_result(ctx, c, PEF.JobResult(;
-                status=c.job.package == "Example" ? "fail" : "test", duration=1.0))
+                status=c.job.package == "Example" ? "fail" : "kill", duration=1.0))
+            if c.job.package == "Example"
+                early = (PEF.get_run(ctx, run_id),
+                         Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id)))
+            end
         end
-        run = PEF.get_run(ctx, run_id)
+        @test early !== nothing
+        run, jobs = early
         @test run["status"] == "active"   # held open for the re-run
-        @test run["rechecked"] == 1
-        @test run["completed_jobs"] == 3
+        @test run["early_rechecks"] == 1
+        @test !haskey(run, "rechecked")
         @test run["reused_jobs"] == 1
-        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
         @test jobs["against#Example"]["status"] == "pending"
         @test haskey(jobs["against#Example"], "recheck_of")
         @test !haskey(jobs["against#Example"], "reused_from")
         @test !haskey(jobs["against#Example"], "log_key")
-        @test haskey(jobs["against#JSON"], "reused_from")   # JSON passed on primary
+        @test jobs["against#Example"]["want_cpu"] == PEF.host_cpu()
 
-        # the fresh baseline fails too, so the run finishes without another round
-        for _ in 1:12
-            PEF.get_run(ctx, run_id)["status"] == "done" && break
-            c = PEF.claim_job(ctx; wait=1)
-            c isa PEF.ClaimedJob || continue
-            @test PEF.job_key(c.job) == "against#Example"
-            PEF.record_result(ctx, c, PEF.JobResult(; status="fail", duration=1.0, log="failed"))
-        end
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
         @test run["completed_jobs"] == 4
+        @test run["reused_jobs"] == 0
+        # the end-of-run pass took the kill, and counts both re-runs
+        @test run["early_rechecks"] == 1
+        @test run["rechecked"] == 2
+        @test run["rechecks_skipped"] == 0
         @test PEF.recheck_baselines(ctx, run) == 0
-        job = only(filter(j -> j["job_key"] == "against#Example", PEF.run_jobs(ctx, run_id)))
-        @test job["status"] == "fail"
-        @test job["log_key"] == PEF.log_key(run_id, "against", "Example")
+        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
+        for pkg in ("Example", "JSON")
+            job = jobs["against#$pkg"]
+            @test job["status"] == "fail"
+            @test haskey(job, "recheck_of")
+            @test job["log_key"] == PEF.log_key(run_id, "against", pkg)
+        end
 
         lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
             creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
             queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
             bucket=cfg.bucket, endpoint)
         report = PEF.FarmBot.generate_report(lite, run_id)
-        @test occursin("1 reused baseline re-run because the package failed on primary",
+        @test occursin("2 reused baselines re-run because the package failed on primary",
                        report.markdown)
         @test occursin("no new package failures", report.summary)
         PEF.RECHECK_DELAY[] = 60
@@ -617,11 +628,12 @@ try
         @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
         SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
-        # against passes on one CPU type, primary fails on another
+        # against passes on one CPU type, primary fails on another, and the
+        # baseline is re-run as soon as both results are in
         host = Dict("against" => "znver4", "primary" => "skylake-avx512")
         for _ in 1:12
             run = PEF.get_run(ctx, run_id)
-            (haskey(run, "rechecked") || run["status"] == "done") && break
+            (haskey(run, "early_rechecks") || run["status"] == "done") && break
             c = PEF.claim_job(ctx; wait=1)
             c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
             withenv("PKGEVAL_HOST_CPU" => host[c.job.config]) do
@@ -631,7 +643,8 @@ try
         end
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "active"
-        @test run["rechecked"] == 1
+        @test run["early_rechecks"] == 1
+        @test run["completed_jobs"] == 1
         jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
         @test jobs["primary#Example"]["cpu"] == "skylake-avx512"
         @test jobs["against#Example"]["status"] == "pending"
@@ -676,6 +689,7 @@ try
         end
         run = PEF.get_run(ctx, run_id)
         @test run["status"] == "done"
+        @test !haskey(run, "rechecked")   # nothing was left for the end of the run
         @test PEF.recheck_baselines(ctx, run) == 0
         report = PEF.FarmBot.generate_report(PEF.FarmLite.LiteCtx(; region="us-east-1",
             creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),

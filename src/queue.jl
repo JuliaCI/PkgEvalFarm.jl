@@ -627,6 +627,17 @@ function unneeded_seal_message(ctx::FarmCtx, message)
     return is_seal_job(job) && !seal_run_wanted(ctx, job.run_id)
 end
 
+"A job's item, read consistently, or `nothing` when there is none."
+function get_job_item(ctx::FarmCtx, job::JobRef)
+    resp = aws_retry() do
+        Dynamodb.get_item(
+            ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+            ctx.cfg.jobs_table, Dict("ConsistentRead" => true);
+            aws_config=ctx.aws)
+    end
+    return haskey(resp, "Item") ? ddb_parse(resp["Item"]) : nothing
+end
+
 function job_is_running(ctx::FarmCtx, job::JobRef)
     resp = Dynamodb.get_item(
         ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
@@ -931,7 +942,14 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
             aws_config=ctx.aws)
     end
     attrs = ddb_parse(resp["Item"])
-    if attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
+    reopened = try
+        recheck_now(ctx, attrs, job, result.status)
+    catch err
+        @error "early baseline recheck failed; leaving it to the end of the run" run_id=job.run_id exception=(err, catch_backtrace())
+        false
+    end
+    # a reopened baseline holds the run open, so it can't be finished here
+    if !reopened && attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
         # a recheck reopens jobs, and the run finishes after them instead
         nrecheck = try
             recheck_baselines(ctx, attrs)
@@ -967,23 +985,148 @@ const RECHECK_DELAY = Ref(60)  # seconds; the tests set it to 0
 """
     pick_rechecks(candidates) -> (recheck, skipped)
 
-The reused baselines to re-run, at most `MAX_BASELINE_RECHECKS`, from
+The reused baselines to re-run, at most `limit`, from
 `(primary status, baseline job)` pairs, and how many were left out. Over the
 cap, the failures a newer registry most plausibly explains go first: a kill on
 primary is mostly a busy fleet, which a fresh baseline does not settle.
 """
-function pick_rechecks(candidates::Vector{Tuple{String,JobRef}})
+function pick_rechecks(candidates::Vector{Tuple{String,JobRef}};
+                       limit::Integer=MAX_BASELINE_RECHECKS)
     rank = Dict("crash" => 0, "fail" => 1, "kill" => 2)
     sorted = sort(candidates; by=c -> (get(rank, c[1], 3), c[2].package))
-    recheck = [c[2] for c in first(sorted, MAX_BASELINE_RECHECKS)]
+    recheck = [c[2] for c in first(sorted, max(limit, 0))]
     return recheck, length(candidates) - length(recheck)
+end
+
+"The config compared against the baseline in a two-config run, or `nothing` for any other run."
+function primary_config(attrs::AbstractDict)
+    haskey(attrs, "kind") && return nothing  # seal and deriv bookkeeping runs
+    configs = attrs["configs"]
+    # raw run items carry the configs as JSON, parsed run items as a vector
+    configs isa AbstractString && (configs = JSON.parse(configs))
+    names = [String(c["name"]) for c in configs]
+    (length(names) == 2 && "against" in names) || return nothing
+    return only(filter(!=("against"), names))
+end
+
+"""
+Whether a package's baseline needs a re-run, from its primary and baseline job
+items: primary failed, and the baseline passed but may not be comparable (see
+`recheck_baselines`). A baseline is re-run once at most.
+"""
+function recheck_due(primary::AbstractDict, against::AbstractDict)
+    haskey(against, "recheck_of") && return false
+    issuccess(String(get(against, "status", ""))) || return false
+    pst = String(get(primary, "status", ""))
+    pst in TERMINAL_STATUSES && !issuccess(pst) && pst != "skip" || return false
+    pcpu = get(primary, "cpu", nothing)
+    other_cpu = pcpu !== nothing && get(against, "cpu", pcpu) != pcpu
+    return haskey(against, "reused_from") || other_cpu
+end
+
+"The transaction item that resets a finished baseline job for its re-run."
+function reopen_baseline(ctx::FarmCtx, job::JobRef, item::AbstractDict,
+                         want_cpu::Union{Nothing,AbstractString}, now::AbstractString)
+    # a fresh baseline is re-run in its own run, so it points at that
+    reused = haskey(item, "reused_from")
+    return Dict("Update" => Dict(
+        "TableName" => ctx.cfg.jobs_table,
+        "Key" => ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+        "ConditionExpression" => "attribute_not_exists(recheck_of) AND " *
+                                 (reused ? "attribute_exists(reused_from)" :
+                                           "attribute_not_exists(reused_from) AND #s = :was"),
+        "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
+                              (want_cpu === nothing ? "" : "want_cpu = :want_cpu, want_since = :now, ") *
+                              "recheck_of = " * (reused ? "reused_from " : ":run ") *
+                              "REMOVE reused_from, reason, reason_message, version, " *
+                              "#d, wall, log_key, cost, peak_rss, held, error_line, " *
+                              "error_lines, pass_sigs, finished_at, cpu, failures, " *
+                              "seal_wait_since",
+        "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
+        "ExpressionAttributeValues" => ddb_item(Dict(
+            ":pending" => "pending", ":zero" => 0,
+            (want_cpu === nothing ? () : (":want_cpu" => want_cpu, ":now" => now))...,
+            (reused ? () : (":was" => item["status"], ":run" => job.run_id))...))))
+end
+
+"""
+    recheck_now(ctx, run_attrs, job, status) -> Bool
+
+Re-run a package's baseline as soon as both of its results are in, instead of
+waiting for the run to end. By the end of a run the fleet has mostly scaled in,
+and the few hosts left are rarely of primary's CPU type, so a re-run then waits
+out its CPU wait and runs on whatever host is left (#65). Returns whether the
+baseline was reopened.
+
+What this leaves out goes to the end-of-run pass: kills on primary (mostly a
+busy fleet, ranked last there), baselines whose sealing isn't set up yet (that
+setup is costly, and done there once for all re-runs), and anything over the
+limit of re-runs per run, which this shares with that pass.
+"""
+function recheck_now(ctx::FarmCtx, attrs::AbstractDict, job::JobRef, status::AbstractString)
+    attrs["status"] == "active" && !haskey(attrs, "rechecked") || return false
+    primary = primary_config(attrs)
+    primary === nothing && return false
+    if job.config == primary
+        status in ("crash", "fail") || return false
+    elseif job.config == "against"
+        issuccess(status) || return false
+    else
+        return false
+    end
+    get(attrs, "early_rechecks", 0) < MAX_BASELINE_RECHECKS || return false
+    rejob = JobRef(job.run_id, "against", job.package)
+    p = get_job_item(ctx, JobRef(job.run_id, primary, job.package))
+    a = get_job_item(ctx, rejob)
+    (p === nothing || a === nothing) && return false
+    String(get(p, "status", "")) in ("crash", "fail") && recheck_due(p, a) || return false
+    seal_runs = get(attrs, "seal_runs", nothing)
+    if seal_runs isa AbstractDict && !isempty(seal_runs)
+        id = get(seal_runs, "against", nothing)
+        id isa AbstractString || return false
+        seal_status(ctx, String(id), job.package) == :none && return false
+    end
+
+    # message first, as at the end of the run: a lost race leaves it to meet a
+    # finished job and be dropped. When both results land at once, both
+    # workers may get here, and the job's condition lets only one reopen it.
+    want_cpu = get(p, "cpu", nothing)
+    want_cpu = want_cpu === nothing ? nothing : String(want_cpu)
+    enqueue_jobs(ctx, [rejob]; queue_url=slow_queue(ctx.cfg), delay=RECHECK_DELAY[],
+                 cpu=Returns(want_cpu))
+    reused = haskey(a, "reused_from")
+    now = isodate()
+    items = Any[
+        Dict("Update" => Dict(
+            "TableName" => ctx.cfg.runs_table,
+            "Key" => ddb_item(Dict("run_id" => job.run_id)),
+            "ConditionExpression" => "#s = :active AND attribute_not_exists(rechecked) AND " *
+                                     "(attribute_not_exists(early_rechecks) OR early_rechecks < :limit)",
+            "UpdateExpression" => "SET updated_at = :now ADD early_rechecks :one, " *
+                                  "completed_jobs :minus" * (reused ? ", reused_jobs :minus" : ""),
+            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeValues" => ddb_item(Dict(
+                ":active" => "active", ":limit" => MAX_BASELINE_RECHECKS, ":now" => now,
+                ":one" => 1, ":minus" => -1)))),
+        reopen_baseline(ctx, rejob, a, want_cpu, now)]
+    try
+        aws_retry() do
+            Dynamodb.transact_write_items(items; aws_config=ctx.aws)
+        end
+    catch err
+        is_conditional_failure(err) && return false
+        rethrow()
+    end
+    @info "re-running a baseline as soon as both results are in" run_id=job.run_id job.package want_cpu reused
+    return true
 end
 
 """
     recheck_baselines(ctx, run_attrs) -> Int
 
 When a run has finished, re-run the baseline of every package that failed on
-primary but passed on a baseline that may not be comparable:
+primary but passed on a baseline that may not be comparable, unless it was
+already re-run while the run was going (see `recheck_now`):
 
 - a reused result: the donor ran on an older registry, so the difference may
   come from a package or dependency release rather than from the change under
@@ -1000,11 +1143,9 @@ the re-runs triggering another round.
 """
 function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
     haskey(attrs, "rechecked") && return 0
-    haskey(attrs, "kind") && return 0  # seal and deriv bookkeeping runs
+    primary = primary_config(attrs)
+    primary === nothing && return 0
     run_id = String(attrs["run_id"])
-    names = [String(c["name"]) for c in JSON.parse(attrs["configs"])]
-    (length(names) == 2 && "against" in names) || return 0
-    primary = only(filter(!=("against"), names))
 
     jobs = run_jobs(ctx, run_id)
     by_key = Dict(String(j["job_key"]) => j for j in jobs)
@@ -1012,19 +1153,32 @@ function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
     primary_cpu = Dict{String,String}()     # package => the CPU type primary ran on
     for j in jobs
         j["config"] == "against" || continue
-        issuccess(String(get(j, "status", ""))) || continue
         p = get(by_key, job_key(primary, String(j["package"])), nothing)
         p === nothing && continue
-        pst = String(get(p, "status", ""))
-        pst in TERMINAL_STATUSES && !issuccess(pst) && pst != "skip" || continue
+        recheck_due(p, j) || continue
         pcpu = get(p, "cpu", nothing)
-        other_cpu = pcpu !== nothing && get(j, "cpu", pcpu) != pcpu
-        haskey(j, "reused_from") || other_cpu || continue
         pcpu === nothing || (primary_cpu[String(j["package"])] = String(pcpu))
-        push!(candidates, (pst, JobRef(run_id, "against", String(j["package"]))))
+        push!(candidates, (String(p["status"]), JobRef(run_id, "against", String(j["package"]))))
     end
     isempty(candidates) && return 0
-    recheck, skipped = pick_rechecks(candidates)
+    # re-runs started while the run was going count towards the limit too
+    early = Int(get(attrs, "early_rechecks", 0))
+    recheck, skipped = pick_rechecks(candidates; limit=MAX_BASELINE_RECHECKS - early)
+    if isempty(recheck)
+        try
+            Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,
+                Dict("ConditionExpression" => "#s = :active AND completed_jobs >= total_jobs AND " *
+                                              "attribute_not_exists(rechecked)",
+                     "UpdateExpression" => "SET rechecked = :n, rechecks_skipped = :skipped",
+                     "ExpressionAttributeNames" => Dict("#s" => "status"),
+                     "ExpressionAttributeValues" => ddb_item(Dict(
+                         ":active" => "active", ":n" => early, ":skipped" => skipped)));
+                aws_config=ctx.aws)
+        catch err
+            is_conditional_failure(err) || rethrow()
+        end
+        return 0
+    end
     nreused = count(job -> haskey(by_key[job_key(job)], "reused_from"), recheck)
 
     # the re-runs must evaluate under the same scheme as primary did: sealed
@@ -1053,33 +1207,13 @@ function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
                               " ADD completed_jobs :minus",
         "ExpressionAttributeNames" => Dict("#s" => "status"),
         "ExpressionAttributeValues" => ddb_item(Dict(
-            ":active" => "active", ":n" => length(recheck), ":skipped" => skipped, ":now" => now,
+            ":active" => "active", ":n" => early + length(recheck), ":skipped" => skipped, ":now" => now,
             ":minus" => -length(recheck),
             ":reused" => count(j -> haskey(j, "reused_from"), jobs) - nreused,
             (seal_runs isa AbstractDict ? ((":sr" => seal_runs),) : ())...))))]
     for job in recheck
-        # a fresh baseline is re-run in its own run, so it points at that
-        reused = haskey(by_key[job_key(job)], "reused_from")
-        push!(items, Dict("Update" => Dict(
-            "TableName" => ctx.cfg.jobs_table,
-            "Key" => ddb_item(Dict("run_id" => run_id, "job_key" => job_key(job))),
-            "ConditionExpression" => reused ? "attribute_exists(reused_from)" :
-                                              "attribute_not_exists(reused_from) AND #s = :was",
-            "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
-                                  (haskey(primary_cpu, job.package) ?
-                                   "want_cpu = :want_cpu, want_since = :now, " : "") *
-                                  "recheck_of = " * (reused ? "reused_from " : ":run ") *
-                                  "REMOVE reused_from, reason, reason_message, version, " *
-                                  "#d, wall, log_key, cost, peak_rss, held, error_line, " *
-                                  "error_lines, pass_sigs, finished_at, cpu, failures, " *
-                                  "seal_wait_since",
-            "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
-            "ExpressionAttributeValues" => ddb_item(Dict(
-                ":pending" => "pending", ":zero" => 0,
-                (haskey(primary_cpu, job.package) ?
-                 (":want_cpu" => primary_cpu[job.package], ":now" => now) : ())...,
-                (reused ? () : (":was" => by_key[job_key(job)]["status"],
-                                ":run" => run_id))...)))))
+        push!(items, reopen_baseline(ctx, job, by_key[job_key(job)],
+                                     get(primary_cpu, job.package, nothing), now))
     end
     try
         aws_retry() do
