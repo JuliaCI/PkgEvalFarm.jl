@@ -215,7 +215,12 @@ has a derivation in flight is *held* by the proxy until the artifact lands
 (the suspended sandbox idles at zero CPU; PkgEval's inactivity windows are
 widened for seal/derive goals to accommodate this), and the worker donates
 the held slot's capacity to seal-queue work — typically the very derivation
-being waited on. Wants are posted dep-before-dependent by the loader's
+being waited on. A key names the CPU type it was computed on, and its
+derivation's message waits for a host of that type, which on a mixed fleet
+can take minutes per link of a chain. The held host is of that type, so its
+donor claims a still-unclaimed derivation directly, without the message; the
+message stays queued as a backstop and is dropped once the job is done.
+Wants are posted dep-before-dependent by the loader's
 bottom-up walk, so whole chains resolve within one pass.
 
 Holds are bounded and self-healing. Anything can die at any time — in

@@ -169,7 +169,19 @@ function client_hold_limit(req::HTTP.Request)
     return limit === nothing ? hold_limit() : limit
 end
 
-maybe_donate!() = ((donor = SEAL_DONOR[]) === nothing || donor(); nothing)
+# a derivation passed in is claimed directly, before any queued work
+maybe_donate!(want::Union{JobRef,Nothing}=nothing) =
+    ((donor = SEAL_DONOR[]) === nothing || donor(want); nothing)
+
+"""
+Whether a held host may run the derivation behind a hold itself: it is still
+unclaimed, and this host is of the CPU type its key names (or it names none).
+"""
+function directly_claimable(item::AbstractDict)
+    String(get(item, "status", "")) == "pending" || return false
+    cpu = preimage_cpu(String(get(item, "preimage", "")))
+    return cpu === nothing || cpu == host_cpu()
+end
 
 "How long a hold may block before degrading to a local compile: it must
 resolve comfortably inside PkgEval's inactivity window (~40 min), or the very
@@ -216,7 +228,7 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
             # re-offer every iteration (the donor cap makes it idempotent —
             # measured live: one-shot donation left slots idle for the
             # remaining ~18 minutes of a capped hold, fleet at 30% CPU)
-            maybe_donate!()
+            maybe_donate!(directly_claimable(item) ? job : nothing)
             sleep(3)
             body = get_kv(ctx, ns, uuid, key)
             body === nothing || return body

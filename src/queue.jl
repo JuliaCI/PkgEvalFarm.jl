@@ -485,6 +485,40 @@ function claim_job(ctx::FarmCtx; wait::Int=20)
     return claim_from_queues(ctx, queues)
 end
 
+"""
+Claim a pending derivation without its queue message, for a host whose test is
+held on that derivation's artifact. The message waits for a host of the key's
+CPU type and can take minutes to reach one, while the held host is one already:
+the key was computed there. The message stays queued as a backstop, and is
+dropped once it meets the finished job.
+"""
+function claim_derivation(ctx::FarmCtx, job::JobRef)
+    claimed_at = isodate()
+    resp = try
+        Dynamodb.update_item(
+            ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(job))),
+            ctx.cfg.jobs_table,
+            Dict("ReturnValues" => "ALL_NEW",
+                 "ConditionExpression" => "#s = :pending",
+                 "UpdateExpression" => "SET #s = :running, worker = :worker, " *
+                                       "started_at = :now, heartbeat_at = :now ADD attempts :one",
+                 "ExpressionAttributeNames" => Dict("#s" => "status"),
+                 "ExpressionAttributeValues" => ddb_item(Dict(
+                     ":pending" => "pending", ":running" => "running",
+                     ":worker" => worker_identity(), ":now" => claimed_at, ":one" => 1)));
+            aws_config=ctx.aws)
+    catch err
+        is_conditional_failure(err) && return nothing
+        rethrow()
+    end
+    item = ddb_parse(resp["Attributes"])
+    return ClaimedJob(job, "", Int(get(item, "attempts", 1)), "", claimed_at,
+                      Int(get(item, "failures", 0)), nothing)
+end
+
+"Whether a claim came with a queue message (a claimed derivation may not)."
+has_message(claimed::Union{ClaimedJob,ClaimedExpand}) = !isempty(claimed.receipt_handle)
+
 "Claim seal-pipeline work only (derivations first): the donor slots and the
 spill receiver."
 function claim_seal_job(ctx::FarmCtx; wait::Int=1)
@@ -665,8 +699,9 @@ duplicate execution, which publication and recording already tolerate.
 """
 function heartbeat(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand};
                    extend::Int=VISIBILITY_TIMEOUT)
-    SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, extend;
-                                  aws_config=ctx.aws)
+    has_message(claimed) &&
+        SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, extend;
+                                      aws_config=ctx.aws)
     claimed isa ClaimedJob || return
     try
         Dynamodb.update_item(
@@ -771,14 +806,19 @@ function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; del
     # heartbeat_at would make the next claim mistake the job for still-live
     # and delete the very message being released
     if claimed isa ClaimedJob
+        # with no message to hand back, the job goes back to pending, where a
+        # holder can claim it again or a re-arm can send it a new message
+        requeue = !has_message(claimed)
         try
             Dynamodb.update_item(
                 ddb_item(Dict("run_id" => claimed.job.run_id, "job_key" => job_key(claimed.job))),
                 ctx.cfg.jobs_table,
                 Dict("ConditionExpression" => "#s = :running",
-                     "UpdateExpression" => "REMOVE heartbeat_at" * (failed ? " ADD failures :one" : ""),
+                     "UpdateExpression" => (requeue ? "SET #s = :pending " : "") *
+                                           "REMOVE heartbeat_at" * (failed ? " ADD failures :one" : ""),
                      "ExpressionAttributeNames" => Dict("#s" => "status"),
                      "ExpressionAttributeValues" => ddb_item(Dict(":running" => "running",
+                         (requeue ? (":pending" => "pending",) : ())...,
                          (failed ? (":one" => 1,) : ())...)));
                 aws_config=ctx.aws)
         catch err
@@ -790,6 +830,7 @@ function release_job(ctx::FarmCtx, claimed::Union{ClaimedJob,ClaimedExpand}; del
             end
         end
     end
+    has_message(claimed) || return
     try
         SQS.change_message_visibility(claimed.queue_url, claimed.receipt_handle, delay;
                                       aws_config=ctx.aws)
@@ -954,7 +995,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
         end
     end
 
-    SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
+    has_message(claimed) &&
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=ctx.aws)
     return nothing
 end
 

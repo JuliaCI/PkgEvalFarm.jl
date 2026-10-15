@@ -2582,7 +2582,7 @@ try
                 # until the artifact lands (dataflow ordering by blocking);
                 # a donor is summoned for the held slot's capacity
                 donations = Ref(0)
-                PEF.SEAL_DONOR[] = () -> (donations[] += 1)
+                PEF.SEAL_DONOR[] = _ -> (donations[] += 1)
                 want_uuid = "aaaaaaaa-0000-0000-0000-000000000003"
                 held_key = c3.job.package     # its item is `running` right now
                 ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("66"^32)";
@@ -2603,6 +2603,54 @@ try
                 @test donations[] >= 1
                 PEF.SEAL_DONOR[] = nothing
                 PEF.record_result(sctx, c3, PEF.JobResult(; status="sealed", duration=0.1))
+
+                # a held host of the key's CPU type runs a still-pending
+                # derivation itself, rather than waiting for its message to be
+                # passed around to such a host
+                wants = Any[]
+                PEF.SEAL_DONOR[] = want -> push!(wants, want)
+                pre_cpu(cpu) = join(["v2", "julia=1.99.0+abc", "name=JSON", "uuid=$want_uuid",
+                                     "version=1.3.0", "tree=$("44"^20)", "flags=163",
+                                     "prefs=0", "cpu=$cpu:0123456789ab"], "\n")
+                short_hold = ["X-PkgEval-Deadline" => "2"]
+                deriv_job(key) = PEF.JobRef(PEF.deriv_run_id("otherns"), "deriv", key)
+                withenv("PKGEVAL_HOST_CPU" => "znver4") do
+                    mine = PEF.ingest_want(sctx, "otherns", pre_cpu("znver4"))
+                    other = PEF.ingest_want(sctx, "otherns", pre_cpu("cascadelake"))
+                    resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$other";
+                                         headers=short_hold, status_exception=false)
+                    @test resp.status == 404
+                    @test !isempty(wants) && all(isnothing, wants)  # not this host's type
+                    empty!(wants)
+                    ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$mine";
+                                  headers=short_hold, status_exception=false)
+                    @test any(w -> w isa PEF.JobRef && w.package == mine, wants)
+
+                    direct = PEF.claim_derivation(sctx, deriv_job(mine))
+                    @test direct isa PEF.ClaimedJob && !PEF.has_message(direct)
+                    @test PEF.claim_derivation(sctx, deriv_job(mine)) === nothing
+                    PEF.heartbeat(sctx, direct)   # nothing to extend; stamps the item
+                    # released without a message, the job goes back to pending
+                    PEF.release_job(sctx, direct; failed=true)
+                    item = PEF.get_seal_item(sctx, deriv_job(mine))
+                    @test item["status"] == "pending" && item["failures"] == 1
+                    @test !haskey(item, "heartbeat_at")
+                    direct = PEF.claim_derivation(sctx, deriv_job(mine))
+                    @test direct.attempts == 2 && direct.failures == 1
+                    PEF.record_result(sctx, direct, PEF.JobResult(; status="sealed", duration=0.1))
+                    @test PEF.get_seal_item(sctx, deriv_job(mine))["status"] == "sealed"
+                end
+                PEF.SEAL_DONOR[] = nothing
+                # retire both derivations' queued messages, which a host of
+                # another type would only pass on
+                while true
+                    msgs = get(SQS.receive_message(PEF.deriv_queue(sctx.cfg),
+                        Dict("MaxNumberOfMessages" => 1, "WaitTimeSeconds" => 1);
+                        aws_config=sctx.aws), "Messages", nothing)
+                    (msgs === nothing || isempty(msgs)) && break
+                    SQS.delete_message(PEF.deriv_queue(sctx.cfg), only(msgs)["ReceiptHandle"];
+                                       aws_config=sctx.aws)
+                end
 
                 # no derivation in flight for a key -> 404 without holding
                 resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("77"^32)";

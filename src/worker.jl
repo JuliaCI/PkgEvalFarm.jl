@@ -114,10 +114,12 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # Donation: when the proxy holds a fetch (a sandbox suspended, zero CPU,
     # waiting on a derivation), its slot's capacity is free — spawn a bounded
     # donor that runs one piece of seal-queue work, typically the very
-    # derivation being waited on. CPU pinning is shared with a blocked
-    # process, so oversubscription is nominal.
+    # derivation being waited on. That derivation is claimed directly when it
+    # is still unclaimed, since its message may wait minutes for a host of its
+    # CPU type. CPU pinning is shared with a blocked process, so
+    # oversubscription is nominal.
     donors = Threads.Atomic{Int}(0)
-    SEAL_DONOR[] = function ()
+    SEAL_DONOR[] = function (want=nothing)
         # The budget must count PARKED donors against something: a donated job
         # that itself holds keeps its donor slot for the whole hold, and with
         # a flat ninstances cap a few waves of chained holds consume the
@@ -130,7 +132,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         draining[] && return
         Threads.atomic_add!(donors, 1)
         errormonitor(@async try
-            donated = claim_seal_job(ctx)
+            donated = want === nothing ? nothing : claim_derivation(ctx, want)
+            donated === nothing && (donated = claim_seal_job(ctx))
             donated isa ClaimedJob &&
                 process_job(ctx, donated, rand(0:max(ninstances - 1, 0)),
                             run_cache, run_cache_lock)
