@@ -102,12 +102,13 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         done = Ref(false)
         donors = Threads.Atomic{Int}(0)
         donations = Threads.Atomic{Int}(0)
-        PEF.SEAL_DONOR[] = function ()
+        PEF.SEAL_DONOR[] = function (want=nothing)
             donors[] >= 8 && return
             Threads.atomic_add!(donors, 1)
             Threads.atomic_add!(donations, 1)
             errormonitor(@async try
-                donated = PEF.claim_seal_job(ctx)
+                donated = want === nothing ? nothing : PEF.claim_derivation(ctx, want)
+                donated === nothing && (donated = PEF.claim_seal_job(ctx))
                 donated isa PEF.ClaimedJob &&
                     PEF.process_job(ctx, donated, 0, run_cache, run_cache_lock)
             catch err
