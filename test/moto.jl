@@ -918,7 +918,12 @@ try
         TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/pulls/12345",
             req -> TestHTTP.Response(200, JSON.json(Dict(
                 "head" => Dict("sha" => "abcdef123456"),
-                "base" => Dict("ref" => "master")))))
+                "base" => Dict("ref" => "master", "sha" => "base000tip")))))
+        # the PR branched off master before master moved on to base000tip
+        TestHTTP.register!(router, "GET", "/repos/JuliaLang/julia/compare/base000tip...abcdef123456",
+            req -> TestHTTP.Response(200, JSON.json(Dict(
+                "merge_base_commit" => Dict("sha" => "mergebase0"),
+                "commits" => [Dict("sha" => "abcdef123456")]))))
         # author authorization: keno is an active submitter, rando is nobody
         TestHTTP.register!(router, "GET",
             "/orgs/KenoAIStaging/teams/pkgeval-submitters/memberships/keno",
@@ -984,6 +989,8 @@ try
             @test PEF.FarmBot.resolve_vs("other/repo#branch", "JuliaLang/julia") == "other/repo#branch"
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#1.9.9") == "JuliaLang/julia#$pin_sha"
             @test PEF.FarmBot.pin_commit(gh, "JuliaLang/julia#nosuchref") == "JuliaLang/julia#nosuchref"
+            @test PEF.FarmBot.find_merge_base(gh, "JuliaLang/julia", "base000tip", "abcdef123456") == "mergebase0"
+            @test PEF.FarmBot.find_merge_base(gh, "JuliaLang/julia", "master", "nosuchsha") === nothing
 
             # PR runs carry the published unreliable-package list; without one they still run
             TestHTTP.register!(router, "GET", "/daily/unreliable.json",
@@ -1012,6 +1019,7 @@ try
             @test length(posted) == 1
             @test occursin("has been submitted as run", posted[1])
             @test occursin("JuliaLang/julia#abcdef123456", posted[1])
+            @test occursin("against: `JuliaLang/julia#mergebase0`, where the PR branched off `master`", posted[1])
             run_id = match(r"run `([^`]+)`", posted[1]).captures[1]
 
             run = PEF.get_run(ctx, run_id)
@@ -1025,7 +1033,9 @@ try
             @test run["context"]["comment"] == parse(Int, chopprefix(run_id, "gh-"))
             @test run["configs"][1]["name"] == "primary"
             @test run["configs"][1]["julia"] == "JuliaLang/julia#abcdef123456"
-            @test run["configs"][2]["julia"] == "JuliaLang/julia#master"
+            # against is the merge base, not master's tip, so changes merged to
+            # master after the PR branched are not blamed on the PR
+            @test run["configs"][2]["julia"] == "JuliaLang/julia#mergebase0"
             # the config json round-trips into a PkgEval Configuration
             config = PEF.config_from_dict(run["configs"][1])
             @test config.buildflags == ["LLVM_ASSERTIONS=1", "FORCE_ASSERTIONS=1"]

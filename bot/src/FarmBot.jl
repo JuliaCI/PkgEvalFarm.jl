@@ -177,6 +177,9 @@ struct GhPr
     head::Union{Nothing,GhCommit}
     base::Union{Nothing,GhCommit}
 end
+struct GhCompare
+    merge_base_commit::Union{Nothing,GhCommit}
+end
 
 # lazy materializers (see FarmLite.parse_json: typed `JSON.parse(body, T)` cannot
 # pass the `juliac --trim=safe` verifier, so shapes are built by walking JSON.jl's
@@ -317,6 +320,18 @@ function json_make(::Type{GhPr}, x::LazyVal)
         return nothing
     end
     return GhPr(head[], base[]), pos::Int
+end
+
+function json_make(::Type{GhCompare}, x::LazyVal)
+    merge_base = Ref{Union{Nothing,GhCommit}}(nothing)
+    pos = JSON.applyobject(x) do k, v
+        isnullval(v) && return nothing
+        if k == "merge_base_commit"
+            c, p = json_make(GhCommit, v); merge_base[] = c; return p
+        end
+        return nothing
+    end
+    return GhCompare(merge_base[]), pos::Int
 end
 
 
@@ -802,13 +817,22 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     resp.status == 200 || error("failed to fetch PR (HTTP $(resp.status))")
     pr = parse_json(resp.body, GhPr)
     (pr.head === nothing || something(pr.head).sha === nothing) && error("PR without head sha")
-    primary = "$repo#$(something(something(pr.head).sha))"
+    head_sha = something(something(pr.head).sha)
+    primary = "$repo#$head_sha"
+    against_note = ""
     against = if command.vs !== nothing
         resolve_vs(something(command.vs), repo)
     else
         base = pr.base === nothing ? nothing : something(pr.base).ref
         base === nothing && error("PR without base ref")
-        "$repo#$(something(base))"
+        base_sha = something(pr.base).sha
+        merge_base = find_merge_base(gh, repo, something(base_sha, something(base)), head_sha)
+        if merge_base === nothing
+            "$repo#$(something(base))"
+        else
+            against_note = ", where the PR branched off `$(something(base))`"
+            "$repo#$(something(merge_base))"
+        end
     end
     # pin branches to the commit they name right now: consistent across workers,
     # and immutable specs are what makes baseline reuse possible at all
@@ -835,7 +859,7 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     end
     comment_id = post_comment(gh, repo, number, """
         Your package evaluation job has been submitted as run `$run_id` \
-        (primary: `$primary`, against: `$against`). I will keep this comment \
+        (primary: `$primary`, against: `$against`$against_note). I will keep this comment \
         updated with progress, and post the report as a new comment when it \
         finishes.""")
     if comment_id !== nothing
@@ -847,6 +871,21 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
         end
     end
     @info "submitted run" run_id repo number
+end
+
+"""
+The commit where `head` branched off `base`, or `nothing` when the API cannot say.
+A PR run compares against this rather than the base branch tip, so that changes
+merged to the base after the PR branched are not reported as caused by the PR.
+"""
+function find_merge_base(gh::GitHubCtx, repo::String, base::String, head::String)
+    # per_page bounds the commit list the response carries; only the merge base is used
+    resp = github_request(gh, "GET",
+        "/repos/$repo/compare/$(urlencode(base))...$(urlencode(head))?per_page=1")
+    resp.status == 200 || return nothing
+    merge_base = parse_json(resp.body, GhCompare).merge_base_commit
+    merge_base === nothing && return nothing
+    return something(merge_base).sha
 end
 
 "Remember the submission comment's id so progress and final updates can edit it."

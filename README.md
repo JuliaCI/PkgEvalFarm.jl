@@ -148,7 +148,9 @@ same secret). Its execution role carries the submitter policy directly — no br
 hop, no long-running server.
 
 Mention it on a PR: `@pkgeval runtests()`, `runtests(["Foo"])`, or
-`runtests(vs = ":master")`. Commands are only executed for authorized authors —
+`runtests(vs = ":master")`. Without `vs`, the PR head is compared against the
+commit where it branched off its base, so changes merged to the base since then
+are not reported as caused by the PR. Commands are only executed for authorized authors —
 by default active members of the submitter team, or (with
 `bot_submitter_team = ""`) any org member. Classic Nanosoldier's collaborator
 check was disabled in 2021, leaving it open to any commenter; this bot
