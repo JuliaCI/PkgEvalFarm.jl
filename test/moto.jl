@@ -710,6 +710,64 @@ try
         PEF.CPU_PASS_DELAY[] = 60
     end
 
+    @testset "a time-limit kill on another CPU type is re-run under its own limit" begin
+        PEF.RECHECK_DELAY[] = 0
+        PEF.CPU_PASS_DELAY[] = 0
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && claimed.run_id == run_id && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+
+        # the shared limit is used up, which must not hold back the kill
+        Dynamodb.update_item(
+            PEF.ddb_item(Dict("run_id" => run_id)), cfg.runs_table,
+            Dict("UpdateExpression" => "SET early_rechecks = :n",
+                 "ExpressionAttributeValues" => PEF.ddb_item(Dict(
+                     ":n" => PEF.MAX_BASELINE_RECHECKS)));
+            aws_config=aws)
+        host = Dict("against" => "znver4", "primary" => "znver1")
+        for _ in 1:12
+            run = PEF.get_run(ctx, run_id)
+            (haskey(run, "early_kill_rechecks") || run["status"] == "done") && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
+            withenv("PKGEVAL_HOST_CPU" => host[c.job.config]) do
+                PEF.record_result(ctx, c, c.job.config == "against" ?
+                    PEF.JobResult(; status="test", duration=1.0) :
+                    PEF.JobResult(; status="kill", reason="time_limit", wall=2700.0))
+            end
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "active"
+        @test run["early_kill_rechecks"] == 1
+        @test run["early_rechecks"] == PEF.MAX_BASELINE_RECHECKS
+        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
+        @test jobs["against#Example"]["status"] == "pending"
+        @test jobs["against#Example"]["want_cpu"] == "znver1"
+
+        # on primary's CPU type the baseline runs out of time too, so the kill is not new
+        rerun = nothing
+        withenv("PKGEVAL_HOST_CPU" => "znver1") do
+            for _ in 1:12
+                c = PEF.claim_job(ctx; wait=1)
+                c isa PEF.ClaimedJob && c.job.run_id == run_id && (rerun = c; break)
+            end
+            @test rerun isa PEF.ClaimedJob
+            PEF.record_result(ctx, rerun, PEF.JobResult(; status="kill", reason="time_limit"))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"
+        @test !haskey(run, "rechecked")
+        PEF.RECHECK_DELAY[] = 60
+        PEF.CPU_PASS_DELAY[] = 60
+    end
+
     @testset "a second expansion pass never resets or re-sends jobs" begin
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Kiwi", "Lime"], Dict{String,Any}());
                                 submitter="tester", reuse=false)

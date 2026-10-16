@@ -1022,6 +1022,11 @@ end
 # and re-running all their baselines would cost more than it clears up, so only
 # this many are re-run.
 const MAX_BASELINE_RECHECKS = 50
+# Time-limit kills on another CPU type than the baseline's have their own limit. How
+# many there are depends on which instance types the fleet got, not on the change
+# under test: on daily-2026-10-16, 78 of 85 new kills ran on another CPU type than
+# their baseline, and none of them fit under the shared limit.
+const MAX_KILL_RECHECKS = 100
 const RECHECK_DELAY = Ref(60)  # seconds; the tests set it to 0
 
 """
@@ -1030,7 +1035,8 @@ const RECHECK_DELAY = Ref(60)  # seconds; the tests set it to 0
 The reused baselines to re-run, at most `limit`, from
 `(primary status, baseline job)` pairs, and how many were left out. Over the
 cap, the failures a newer registry most plausibly explains go first: a kill on
-primary is mostly a busy fleet, which a fresh baseline does not settle.
+primary on the baseline's CPU type is mostly a busy fleet, which a fresh
+baseline does not settle.
 """
 function pick_rechecks(candidates::Vector{Tuple{String,JobRef}};
                        limit::Integer=MAX_BASELINE_RECHECKS)
@@ -1064,6 +1070,19 @@ function recheck_due(primary::AbstractDict, against::AbstractDict)
     pcpu = get(primary, "cpu", nothing)
     other_cpu = pcpu !== nothing && get(against, "cpu", pcpu) != pcpu
     return haskey(against, "reused_from") || other_cpu
+end
+
+"""
+Whether primary ran out of time on another CPU type than the baseline passed on.
+CPU types in the fleet differ in speed by up to 3x, so the baseline may only have
+passed because it ran on a faster host. A re-run on primary's CPU type settles it.
+"""
+function cpu_kill(primary::AbstractDict, against::AbstractDict)
+    get(primary, "status", nothing) == "kill" && get(primary, "reason", nothing) == "time_limit" ||
+        return false
+    pcpu = get(primary, "cpu", nothing)
+    acpu = get(against, "cpu", nothing)
+    return pcpu !== nothing && acpu !== nothing && acpu != pcpu
 end
 
 "The transaction item that resets a finished baseline job for its re-run."
@@ -1100,28 +1119,34 @@ and the few hosts left are rarely of primary's CPU type, so a re-run then waits
 out its CPU wait and runs on whatever host is left (#65). Returns whether the
 baseline was reopened.
 
-What this leaves out goes to the end-of-run pass: kills on primary (mostly a
-busy fleet, ranked last there), baselines whose sealing isn't set up yet (that
-setup is costly, and done there once for all re-runs), and anything over the
-limit of re-runs per run, which this shares with that pass.
+Time-limit kills on another CPU type than the baseline's count against their
+own limit. What this leaves out goes to the end-of-run pass: other kills on
+primary (mostly a busy fleet, ranked last there), baselines whose sealing isn't
+set up yet (that setup is costly, and done there once for all re-runs), and
+anything over the limits of re-runs per run, which this shares with that pass.
 """
 function recheck_now(ctx::FarmCtx, attrs::AbstractDict, job::JobRef, status::AbstractString)
     attrs["status"] == "active" && !haskey(attrs, "rechecked") || return false
     primary = primary_config(attrs)
     primary === nothing && return false
     if job.config == primary
-        status in ("crash", "fail") || return false
+        status in ("crash", "fail", "kill") || return false
     elseif job.config == "against"
         issuccess(status) || return false
     else
         return false
     end
-    get(attrs, "early_rechecks", 0) < MAX_BASELINE_RECHECKS || return false
+    get(attrs, "early_rechecks", 0) < MAX_BASELINE_RECHECKS ||
+        get(attrs, "early_kill_rechecks", 0) < MAX_KILL_RECHECKS || return false
     rejob = JobRef(job.run_id, "against", job.package)
     p = get_job_item(ctx, JobRef(job.run_id, primary, job.package))
     a = get_job_item(ctx, rejob)
     (p === nothing || a === nothing) && return false
-    String(get(p, "status", "")) in ("crash", "fail") && recheck_due(p, a) || return false
+    kill = cpu_kill(p, a)
+    (kill || String(get(p, "status", "")) in ("crash", "fail")) && recheck_due(p, a) || return false
+    counter, limit = kill ? ("early_kill_rechecks", MAX_KILL_RECHECKS) :
+                            ("early_rechecks", MAX_BASELINE_RECHECKS)
+    get(attrs, counter, 0) < limit || return false
     seal_runs = get(attrs, "seal_runs", nothing)
     if seal_runs isa AbstractDict && !isempty(seal_runs)
         id = get(seal_runs, "against", nothing)
@@ -1143,12 +1168,12 @@ function recheck_now(ctx::FarmCtx, attrs::AbstractDict, job::JobRef, status::Abs
             "TableName" => ctx.cfg.runs_table,
             "Key" => ddb_item(Dict("run_id" => job.run_id)),
             "ConditionExpression" => "#s = :active AND attribute_not_exists(rechecked) AND " *
-                                     "(attribute_not_exists(early_rechecks) OR early_rechecks < :limit)",
-            "UpdateExpression" => "SET updated_at = :now ADD early_rechecks :one, " *
+                                     "(attribute_not_exists(#e) OR #e < :limit)",
+            "UpdateExpression" => "SET updated_at = :now ADD #e :one, " *
                                   "completed_jobs :minus" * (reused ? ", reused_jobs :minus" : ""),
-            "ExpressionAttributeNames" => Dict("#s" => "status"),
+            "ExpressionAttributeNames" => Dict("#s" => "status", "#e" => counter),
             "ExpressionAttributeValues" => ddb_item(Dict(
-                ":active" => "active", ":limit" => MAX_BASELINE_RECHECKS, ":now" => now,
+                ":active" => "active", ":limit" => limit, ":now" => now,
                 ":one" => 1, ":minus" => -1)))),
         reopen_baseline(ctx, rejob, a, want_cpu, now)]
     try
@@ -1177,7 +1202,9 @@ already re-run while the run was going (see `recheck_now`):
   packages, their binaries and caches can behave differently on each (#47).
 
 The re-run asks for primary's CPU type, so the two results compare like for
-like. Returns the number of re-run jobs (0 when there is nothing to recheck).
+like. Time-limit kills on another CPU type than the baseline's have their own
+limit (see `cpu_kill`). Returns the number of re-run jobs (0 when there is
+nothing to recheck).
 
 Happens at most once per run: the run item's `rechecked` field, set in the same
 transaction that reopens the jobs, guards against racing workers and against
@@ -1192,6 +1219,7 @@ function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
     jobs = run_jobs(ctx, run_id)
     by_key = Dict(String(j["job_key"]) => j for j in jobs)
     candidates = Tuple{String,JobRef}[]  # (primary status, baseline to re-run)
+    kill_candidates = Tuple{String,JobRef}[]  # the same, for kills that `cpu_kill` covers
     primary_cpu = Dict{String,String}()     # package => the CPU type primary ran on
     for j in jobs
         j["config"] == "against" || continue
@@ -1200,12 +1228,18 @@ function recheck_baselines(ctx::FarmCtx, attrs::AbstractDict)
         recheck_due(p, j) || continue
         pcpu = get(p, "cpu", nothing)
         pcpu === nothing || (primary_cpu[String(j["package"])] = String(pcpu))
-        push!(candidates, (String(p["status"]), JobRef(run_id, "against", String(j["package"]))))
+        push!(cpu_kill(p, j) ? kill_candidates : candidates,
+              (String(p["status"]), JobRef(run_id, "against", String(j["package"]))))
     end
-    isempty(candidates) && return 0
-    # re-runs started while the run was going count towards the limit too
-    early = Int(get(attrs, "early_rechecks", 0))
-    recheck, skipped = pick_rechecks(candidates; limit=MAX_BASELINE_RECHECKS - early)
+    isempty(candidates) && isempty(kill_candidates) && return 0
+    # re-runs started while the run was going count towards the limits too
+    early = Int(get(attrs, "early_rechecks", 0)) + Int(get(attrs, "early_kill_rechecks", 0))
+    recheck, skipped = pick_rechecks(candidates;
+                                     limit=MAX_BASELINE_RECHECKS - Int(get(attrs, "early_rechecks", 0)))
+    kill_recheck, kill_skipped = pick_rechecks(kill_candidates;
+        limit=MAX_KILL_RECHECKS - Int(get(attrs, "early_kill_rechecks", 0)))
+    append!(recheck, kill_recheck)
+    skipped += kill_skipped
     if isempty(recheck)
         try
             Dynamodb.update_item(ddb_item(Dict("run_id" => run_id)), ctx.cfg.runs_table,

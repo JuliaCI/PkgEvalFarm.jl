@@ -175,6 +175,17 @@ end
         # without primary's CPU type only a reused baseline is in doubt
         @test !due(Dict{String,Any}("status" => "fail"),
                    Dict{String,Any}("status" => "test", "cpu" => "znver1"))
+
+        # only a time-limit kill on another CPU type gets the separate limit
+        ck = PEF.cpu_kill
+        killed = Dict{String,Any}("status" => "kill", "reason" => "time_limit", "cpu" => "znver1")
+        @test ck(killed, Dict{String,Any}("status" => "test", "cpu" => "znver4"))
+        @test !ck(killed, Dict{String,Any}("status" => "test", "cpu" => "znver1"))
+        @test !ck(killed, Dict{String,Any}("status" => "test"))
+        @test !ck(merge(killed, Dict("reason" => "log_limit")),
+                  Dict{String,Any}("status" => "test", "cpu" => "znver4"))
+        @test !ck(merge(killed, Dict("status" => "fail")),
+                  Dict{String,Any}("status" => "test", "cpu" => "znver4"))
     end
 
     @testset "uninstallable skips are refined by cause" begin
