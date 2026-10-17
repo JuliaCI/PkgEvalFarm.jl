@@ -1894,6 +1894,7 @@ function main(D) {
 
   // ---- classification ---------------------------------------------------
   const newFails = [], nowPassing = [], stillFailing = [], newlySkipped = [], noBaseline = [];
+  const cpuKills = [], cpuKilled = new Set(D.cpukills || []);
   for (const r of D.pkgs) {
     const ps = r[PSTAT], as = r[ASTAT];
     if (!hasAgainst || !as) {
@@ -1902,7 +1903,8 @@ function main(D) {
       if (!hasAgainst && !OK.has(ps) && ps !== "s") newFails.push(r);
       continue;
     }
-    if (!OK.has(ps) && ps !== "s" && OK.has(as)) newFails.push(r);
+    if (cpuKilled.has(r[0])) cpuKills.push(r);
+    else if (!OK.has(ps) && ps !== "s" && OK.has(as)) newFails.push(r);
     else if (OK.has(ps) && !OK.has(as) && as !== "s") nowPassing.push(r);
     else if (ps === "s" && as !== "s") newlySkipped.push(r);
     else if (!OK.has(ps) && ps !== "s" && as === "s") noBaseline.push(r);
@@ -2429,10 +2431,15 @@ function main(D) {
   }
 
   // ---- other outcomes ---------------------------------------------------
-  if (hasAgainst && (nowPassing.length || stillFailing.length || newlySkipped.length || noBaseline.length)) {
+  if (hasAgainst && (cpuKills.length || nowPassing.length || stillFailing.length ||
+                     newlySkipped.length || noBaseline.length)) {
     $("other-block").hidden = false;
     const otherHost = $("other-groups");
     const otherSections = [
+      { id: "grp-cpukill", title: "Out of time on another CPU type", n: cpuKills.length,
+        lede: "Ran out of time on primary, but the baseline passed on another CPU type, " +
+              "which can be up to 3x faster. Not counted as new failures.",
+        groups: groupBy(cpuKills, PSTAT, PREASON) },
       { id: "grp-newskip", title: "Newly skipped", n: newlySkipped.length,
         lede: "Evaluated on the baseline but not tested on primary, grouped by why. " +
               "A change that breaks installing a package shows up here.",

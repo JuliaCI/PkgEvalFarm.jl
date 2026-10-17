@@ -1720,6 +1720,14 @@ function json_make(::Type{Vector{ConfigInfo}}, x::LazyVal)
     return out, pos::Int
 end
 
+# A time-limit kill on primary is no new failure while the baseline only passed on another
+# CPU type: the fleet's CPU types differ in speed by up to 3x.
+function cpu_mismatched_kill(p::Item, a::Item)
+    str(p, "status") == "kill" && opt_str(p, "reason") == "time_limit" || return false
+    pcpu, acpu = opt_str(p, "cpu"), opt_str(a, "cpu")
+    return pcpu !== nothing && acpu !== nothing && pcpu != acpu
+end
+
 function describe_job(ctx::LiteCtx, job::Item)
     version = opt_str(job, "version")
     status = str(job, "status")
@@ -1822,12 +1830,14 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     config_names = String[something(c.name, "?") for c in configs]
     summary = ""
     new_fails = 0
+    unverified = String[]  # packages of `cpu_kills`, for report.json
     if length(config_names) == 2
         by_pkg = Dict{String,Dict{String,Item}}()
         for job in jobs
             get!(by_pkg, str(job, "package"), Dict{String,Item}())[str(job, "config")] = job
         end
         new_failures = String[]
+        cpu_kills = String[]
         now_passing = String[]
         still_failing = String[]
         newly_skipped = String[]
@@ -1842,7 +1852,11 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             # baseline tested a different version
             av = opt_str(a, "version")
             vs = av === nothing || av == opt_str(p, "version") ? "" : " v$(something(av))"
-            if !issuccess(pst) && issuccess(ast) && pst != "skip"
+            if cpu_mismatched_kill(p, a) && issuccess(ast)
+                push!(unverified, pkg)
+                push!(cpu_kills, "- " * describe_job(ctx, p) *
+                      " on $(str(p, "cpu")) (vs. $(status_emoji(ast)) on $(str(a, "cpu"))$vs)")
+            elseif !issuccess(pst) && issuccess(ast) && pst != "skip"
                 push!(new_failures, "- " * describe_job(ctx, p) *
                       " (vs. $(status_emoji(ast))$vs)")
             elseif issuccess(pst) && !issuccess(ast) && ast != "skip"
@@ -1875,9 +1889,14 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         # no longer installs, say) is not a failure, but it is worth a look
         (infra_failure || isempty(newly_skipped)) ||
             (summary *= "; $(length(newly_skipped)) newly skipped")
+        (infra_failure || isempty(cpu_kills)) ||
+            (summary *= "; $(length(cpu_kills)) killed on another CPU type than the baseline")
         println(io, "**", summary, "**\n")
         for (title, entries, open) in (
                 ("❌ Packages that failed on primary but not on against", new_failures, true),
+                ("⏱️ Packages that ran out of time on primary but passed on the baseline on " *
+                 "another CPU type, which can be up to 3x faster (not counted as new)",
+                 cpu_kills, true),
                 ("⏭️ Packages skipped on primary but evaluated on against", newly_skipped, !infra_failure),
                 ("✅ Packages that now pass", now_passing, false),
                 ("💔 Packages that failed on both", still_failing, false),
@@ -1914,7 +1933,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
     s3_put(ctx, report_key(run_id, "report.json"),
-           report_json(ctx, run, jobs, configs, total_cost, nmetered < nran);
+           report_json(ctx, run, jobs, configs, total_cost, nmetered < nran, unverified);
            content_type="application/json")
     return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
             cost_partial=(nmetered < nran), new_fails, jobs)
@@ -1949,6 +1968,8 @@ end
 #           every candidate is shared stays unclustered; omitted when no lines
 #           were recorded
 #   nfsig   {package: sig index, ...}  cluster membership for those packages
+#   cpukills [package, ...]  time-limit kills on primary whose baseline passed on
+#           another CPU type; not new failures. Omitted when there are none
 
 # grouping key for a stored error line: collapse details that vary per package
 # or process (addresses, source locations, LoadError nesting) but keep the
@@ -2008,7 +2029,7 @@ end
 
 function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
                      configs::Vector{ConfigInfo}, total_cost::Float64,
-                     cost_partial::Bool)
+                     cost_partial::Bool, unverified::Vector{String}=String[])
     io = IOBuffer()
     print(io, "{\"run\":{\"id\":", JSON.json(str(run, "run_id")))
     print(io, ",\"bucket\":",
@@ -2204,6 +2225,15 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
             print(io, JSON.json(pkg), ":", string(remap[idx + 1]))
         end
         print(io, "}")
+    end
+
+    if !isempty(unverified)
+        print(io, ",\"cpukills\":[")
+        for (i, pkg) in enumerate(unverified)
+            i == 1 || print(io, ",")
+            print(io, JSON.json(pkg))
+        end
+        print(io, "]")
     end
 
     print(io, ",\"logdirs\":[")
