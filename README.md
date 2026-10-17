@@ -10,16 +10,8 @@ each worker.
 
 ## Architecture
 
-```
-                 ┌─────────────────────────────────────────────────┐
-                 │                     AWS                          │
-  submitter ───▶ │  DynamoDB (runs, jobs)      SQS (job queue+DLQ) │ ◀─── worker
-  (@pkgeval │                                                  │      (any Linux box,
-   bot or CLI)   │  S3 (results, logs, reports)                     │       enrolled via
-                 │                                                  │       GitHub login)
-                 │  Lambda: credential broker (juliac-compiled)     │
-                 └─────────────────────────────────────────────────┘
-```
+[docs/architecture.md](docs/architecture.md) has diagrams of the components and
+of the life of a run.
 
 - **State** lives in two DynamoDB tables: `runs` (one item per submitted evaluation
   run) and `jobs` (one item per `(configuration, package)` pair). DynamoDB is the
