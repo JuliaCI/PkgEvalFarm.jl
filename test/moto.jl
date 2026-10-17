@@ -768,6 +768,53 @@ try
         PEF.CPU_PASS_DELAY[] = 60
     end
 
+    @testset "a kill with no baseline on its CPU type is not a new failure" begin
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && claimed.run_id == run_id && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+
+        # no re-runs left, so the baseline stays on its own CPU type
+        Dynamodb.update_item(
+            PEF.ddb_item(Dict("run_id" => run_id)), cfg.runs_table,
+            Dict("UpdateExpression" => "SET early_kill_rechecks = :n",
+                 "ExpressionAttributeValues" => PEF.ddb_item(Dict(
+                     ":n" => PEF.MAX_KILL_RECHECKS)));
+            aws_config=aws)
+        host = Dict("against" => "znver4", "primary" => "znver1")
+        for _ in 1:12
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
+            withenv("PKGEVAL_HOST_CPU" => host[c.job.config]) do
+                PEF.record_result(ctx, c, c.job.config == "against" ?
+                    PEF.JobResult(; status="test", duration=1.0) :
+                    PEF.JobResult(; status="kill", reason="time_limit", wall=2700.0))
+            end
+        end
+        @test PEF.get_run(ctx, run_id)["status"] == "done"
+
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        report = PEF.FarmBot.generate_report(lite, run_id)
+        @test report.new_fails == 0
+        @test occursin("no new package failures", report.summary)
+        @test occursin("1 killed on another CPU type than the baseline", report.summary)
+        @test occursin("on znver1 (vs. ✅ on znver4)", report.markdown)
+        rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+            PEF.report_key(run_id, "report.json"),
+            Dict("return_raw" => true); aws_config=aws))))
+        @test rj["cpukills"] == ["Example"]
+    end
+
     @testset "a second expansion pass never resets or re-sends jobs" begin
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Kiwi", "Lime"], Dict{String,Any}());
                                 submitter="tester", reuse=false)
