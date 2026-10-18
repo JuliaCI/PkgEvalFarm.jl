@@ -103,8 +103,10 @@ try
 
     @testset "claim/heartbeat/complete lifecycle" begin
         PEF.SLOT_HOURLY_RATE[] = 0.36   # price the fabricated results: 42 s -> $0.0042
+        PEF.RECHECK_DELAY[] = 0
         seen = Set{Tuple{String,String}}()
-        for i in 1:6
+        # the 7th is JSON's re-run on primary, which fails again
+        for i in 1:7
             claimed = PEF.claim_job(ctx; wait=1)
             @test claimed !== nothing
             push!(seen, (claimed.job.config, claimed.job.package))
@@ -142,6 +144,7 @@ try
         end
         @test length(seen) == 6
         PEF.SLOT_HOURLY_RATE[] = nothing
+        PEF.RECHECK_DELAY[] = 60
         jobs = PEF.run_jobs(ctx, RUN_ID)
         for j in jobs
             billed = j["job_key"] == "primary#JSON" ? 84.0 : 42.0   # wall beats duration
@@ -259,9 +262,10 @@ try
         @test occursin("package has test failures", report.markdown)  # stored reason_message
         @test occursin("possible new issues: 1 package", report.summary)
         @test report.new_fails == 1  # JSON regressed; Crayons fails on both
-        # 5 jobs x 42 s + one 84 s wall-billed at $0.36/slot-h -> $0.0294
-        @test occursin("estimated compute cost: \$0.03", report.markdown)
-        @test isapprox(report.cost, (5 * 42.0 + 84.0) / 3600 * 0.36; rtol=1e-6)
+        @test occursin("failed on a re-run too", report.markdown)
+        # 5 jobs x 42 s + JSON's two 84 s runs wall-billed at $0.36/slot-h -> $0.0378
+        @test occursin("estimated compute cost: \$0.04", report.markdown)
+        @test isapprox(report.cost, (5 * 42.0 + 2 * 84.0) / 3600 * 0.36; rtol=1e-6)
         @test PEF.FarmBot.dollars(12.3) == "\$12.30"
         @test PEF.FarmBot.dollars(0.0252) == "\$0.03"
 
@@ -297,7 +301,8 @@ try
         @test rows["Example"][9] == 0  # same version on both sides
         @test rows["Example"][5] == 42  # duration in whole seconds
         # log locations come from each job's log_key
-        @test rj["logdirs"][rows["JSON"][10] + 1] == "runs/$RUN_ID/logs/primary"
+        # (JSON's re-run on primary logs under a numbered key, listed whole)
+        @test rj["logdirs"][rows["JSON"][10] + 1] == PEF.log_key(RUN_ID, "primary", "JSON", 2)
         @test rj["logdirs"][rows["JSON"][11] + 1] == "runs/$RUN_ID/logs/against"
         # the new failure's stored candidates become a failure signature — but
         # not the first one: the baseline's passing log shares it (pass_sigs),
@@ -780,12 +785,12 @@ try
         @test PEF.expand_run(ctx, run_id, ["Example"]) == 2
         SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
 
-        # no re-runs left, so the baseline stays on its own CPU type
+        # no re-runs left, so the two sides stay on their own CPU types
         Dynamodb.update_item(
             PEF.ddb_item(Dict("run_id" => run_id)), cfg.runs_table,
-            Dict("UpdateExpression" => "SET early_kill_rechecks = :n",
+            Dict("UpdateExpression" => "SET early_kill_rechecks = :n, primary_retries = :r",
                  "ExpressionAttributeValues" => PEF.ddb_item(Dict(
-                     ":n" => PEF.MAX_KILL_RECHECKS)));
+                     ":n" => PEF.MAX_KILL_RECHECKS, ":r" => PEF.MAX_PRIMARY_RETRIES)));
             aws_config=aws)
         host = Dict("against" => "znver4", "primary" => "znver1")
         for _ in 1:12
@@ -813,6 +818,69 @@ try
             PEF.report_key(run_id, "report.json"),
             Dict("return_raw" => true); aws_config=aws))))
         @test rj["cpukills"] == ["Example"]
+    end
+
+    @testset "a new failure on primary is re-run once" begin
+        PEF.RECHECK_DELAY[] = 0
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs, ["Example", "JSON"], Dict{String,Any}());
+                                submitter="tester", reuse=false)
+        claimed = nothing
+        for _ in 1:10
+            claimed = PEF.claim_job(ctx; wait=1)
+            claimed isa PEF.ClaimedExpand && claimed.run_id == run_id && break
+        end
+        @test claimed isa PEF.ClaimedExpand
+        @test PEF.expand_run(ctx, run_id, ["Example", "JSON"]) == 4
+        SQS.delete_message(claimed.queue_url, claimed.receipt_handle; aws_config=aws)
+
+        # both fail on primary where the baseline passed; on the re-run Example
+        # passes and JSON fails again
+        attempts = Dict{String,Int}()
+        for _ in 1:20
+            PEF.get_run(ctx, run_id)["status"] == "done" && break
+            c = PEF.claim_job(ctx; wait=1)
+            c isa PEF.ClaimedJob && c.job.run_id == run_id || continue
+            if c.job.config == "against"
+                PEF.record_result(ctx, c, PEF.JobResult(; status="test", duration=1.0, log="ok"))
+                continue
+            end
+            n = attempts[c.job.package] = get(attempts, c.job.package, 0) + 1
+            if n == 2
+                @test PEF.get_job_item(ctx, c.job)["want_cpu"] == PEF.host_cpu()
+            end
+            PEF.record_result(ctx, c, PEF.JobResult(;
+                status=n == 2 && c.job.package == "Example" ? "test" : "fail",
+                duration=1.0, log="attempt $n"))
+        end
+        run = PEF.get_run(ctx, run_id)
+        @test run["status"] == "done"
+        @test run["primary_retries"] == 2
+        @test run["completed_jobs"] == 4
+        @test attempts == Dict("Example" => 2, "JSON" => 2)
+        jobs = Dict(j["job_key"] => j for j in PEF.run_jobs(ctx, run_id))
+        ex = jobs["primary#Example"]
+        @test ex["status"] == "test"
+        @test ex["first_status"] == "fail"
+        @test ex["first_log_key"] == PEF.log_key(run_id, "primary", "Example")
+        @test ex["log_key"] != ex["first_log_key"]
+        @test jobs["primary#JSON"]["status"] == "fail"
+
+        lite = PEF.FarmLite.LiteCtx(; region="us-east-1",
+            creds=PEF.FarmLite.AwsCreds("testing", "testing", nothing),
+            queue_url, runs_table=cfg.runs_table, jobs_table=cfg.jobs_table,
+            bucket=cfg.bucket, endpoint)
+        report = PEF.FarmBot.generate_report(lite, run_id)
+        @test report.new_fails == 1
+        @test occursin("possible new issues: 1 package ❌; 1 passed on a re-run", report.summary)
+        @test occursin("2 primary failures re-run because the baseline passed", report.markdown)
+        @test occursin("**JSON**", report.markdown) && occursin("failed on a re-run too", report.markdown)
+        @test occursin(r"\*\*Example\*\*: ❌ fail — \[log\]\([^)]*Example\.log\), then ✅ test on a re-run",
+                       report.markdown)
+        rj = JSON.parse(String(copy(S3.get_object(cfg.bucket,
+            PEF.report_key(run_id, "report.json"),
+            Dict("return_raw" => true); aws_config=aws))))
+        @test rj["flaky"] == ["Example"]
+        PEF.RECHECK_DELAY[] = 60
     end
 
     @testset "a second expansion pass never resets or re-sends jobs" begin
