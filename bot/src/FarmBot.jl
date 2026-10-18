@@ -575,14 +575,40 @@ function maybe_submit_daily(ctx::LiteCtx, gh::GitHubCtx; now::DateTime=Dates.now
 end
 
 "Publish the summaries of the past week's finished dailies that don't have one yet."
-function publish_missing_daily_summaries(ctx::LiteCtx; now::DateTime=Dates.now(UTC))
+function publish_missing_daily_summaries(ctx::LiteCtx, gh::GitHubCtx; now::DateTime=Dates.now(UTC))
+    published = false
     for back in 0:7
         found = find_run(ctx, daily_run_id(Date(now) - Day(back)))
         found === nothing && continue
         run = something(found)
         str(run, "status", "") == "done" && !haskey(run, "daily_published") || continue
         publish_daily_summary(ctx, run)
+        published = true
     end
+    published && rebuild_site(gh)
+    return published
+end
+
+# The site's Daily page is built from the published summaries, and its scheduled rebuild
+# runs only every six hours.
+pages_repo() = get(ENV, "PKGEVAL_PAGES_REPO", "JuliaCI/PkgEvalFarm.jl")
+
+"""
+Start the site's Pages workflow so a new daily summary shows up on the Daily page. This is
+best-effort: if it fails, the scheduled rebuild picks the summary up later.
+"""
+function rebuild_site(gh::GitHubCtx)
+    repo = pages_repo()
+    isempty(repo) && return false
+    try
+        resp = github_request(gh, "POST", "/repos/$repo/actions/workflows/pages.yml/dispatches";
+                              body="{\"ref\":\"master\"}")
+        resp.status == 204 && return true
+        @error "failed to start the Pages workflow" repo status=resp.status
+    catch err
+        @error "failed to start the Pages workflow" repo msg=error_message(err)
+    end
+    return false
 end
 
 # Nanosoldier's status names, which perf.julialang.org and older tooling count by
@@ -1209,6 +1235,7 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     if is_daily(run_id)
         try
             publish_daily_summary(ctx, run; jobs=report.jobs)
+            rebuild_site(gh)
         catch err
             @error "failed to publish the daily summary; the next poll retries" run_id msg=error_message(err)
         end
@@ -2537,7 +2564,7 @@ function handle_invocation(ctx::LiteCtx=ctx_from_env(), gh::GitHubCtx=bot_gh())
         @error "failed to submit the daily run" msg=error_message(err)
     end
     try
-        publish_missing_daily_summaries(ctx)
+        publish_missing_daily_summaries(ctx, gh)
     catch err
         @error "failed to publish daily summaries" msg=error_message(err)
     end

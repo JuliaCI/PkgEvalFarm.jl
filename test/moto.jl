@@ -1445,8 +1445,17 @@ try
                 Dict("UpdateExpression" => "SET #s = :d", "ExpressionAttributeNames" => Dict("#s" => "status"),
                      "ExpressionAttributeValues" => PEF.ddb_item(Dict(":d" => "done")));
                 aws_config=aws)
-            PEF.FarmBot.publish_missing_daily_summaries(lite; now=DateTime(2026, 1, 5, 12))
+            dispatched = String[]  # refs the Pages workflow was started on
+            TestHTTP.register!(router, "POST", "/repos/JuliaCI/PkgEvalFarm.jl/actions/workflows/pages.yml/dispatches",
+                req -> begin
+                    push!(dispatched, JSON.parse(String(req.body))["ref"])
+                    TestHTTP.Response(204)
+                end)
+            @test PEF.FarmBot.publish_missing_daily_summaries(lite, gh; now=DateTime(2026, 1, 5, 12))
             @test PEF.get_run(ctx, "daily-2026-01-03")["daily_published"] == true
+            @test dispatched == ["master"]  # the site is rebuilt to show the new summary
+            @test !PEF.FarmBot.publish_missing_daily_summaries(lite, gh; now=DateTime(2026, 1, 5, 13))
+            @test dispatched == ["master"]  # nothing new, so no rebuild
             @test JSON.parse(String(copy(S3.get_object(cfg.bucket,
                 PEF.report_key("daily-2026-01-03", "daily.json"), Dict("return_raw" => true);
                 aws_config=aws))))["build"]["sha"] == "2" ^ 40
