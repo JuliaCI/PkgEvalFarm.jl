@@ -1895,6 +1895,7 @@ function main(D) {
   // ---- classification ---------------------------------------------------
   const newFails = [], nowPassing = [], stillFailing = [], newlySkipped = [], noBaseline = [];
   const cpuKills = [], cpuKilled = new Set(D.cpukills || []);
+  const flaky = [], flakySet = new Set(D.flaky || []);
   for (const r of D.pkgs) {
     const ps = r[PSTAT], as = r[ASTAT];
     if (!hasAgainst || !as) {
@@ -1904,6 +1905,7 @@ function main(D) {
       continue;
     }
     if (cpuKilled.has(r[0])) cpuKills.push(r);
+    else if (flakySet.has(r[0])) flaky.push(r);
     else if (!OK.has(ps) && ps !== "s" && OK.has(as)) newFails.push(r);
     else if (OK.has(ps) && !OK.has(as) && as !== "s") nowPassing.push(r);
     else if (ps === "s" && as !== "s") newlySkipped.push(r);
@@ -2431,7 +2433,7 @@ function main(D) {
   }
 
   // ---- other outcomes ---------------------------------------------------
-  if (hasAgainst && (cpuKills.length || nowPassing.length || stillFailing.length ||
+  if (hasAgainst && (cpuKills.length || flaky.length || nowPassing.length || stillFailing.length ||
                      newlySkipped.length || noBaseline.length)) {
     $("other-block").hidden = false;
     const otherHost = $("other-groups");
@@ -2440,6 +2442,10 @@ function main(D) {
         lede: "Ran out of time on primary, but the baseline passed on another CPU type, " +
               "which can be up to 3x faster. Not counted as new failures.",
         groups: groupBy(cpuKills, PSTAT, PREASON) },
+      { id: "grp-flaky", title: "Passed on a re-run", n: flaky.length,
+        lede: "Failed on primary where the baseline passed, then passed when primary was re-run. " +
+              "Likely flaky tests or a slow host. Not counted as new failures.",
+        groups: groupBy(flaky, PSTAT, PREASON) },
       { id: "grp-newskip", title: "Newly skipped", n: newlySkipped.length,
         lede: "Evaluated on the baseline but not tested on primary, grouped by why. " +
               "A change that breaks installing a package shows up here.",

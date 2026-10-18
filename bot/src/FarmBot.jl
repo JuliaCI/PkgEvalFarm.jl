@@ -1728,6 +1728,21 @@ function cpu_mismatched_kill(p::Item, a::Item)
     return pcpu !== nothing && acpu !== nothing && pcpu != acpu
 end
 
+log_link(ctx::LiteCtx, key::Union{Nothing,String}) =
+    key === nothing ? "no log" : "[log]($(s3_public_url(ctx, something(key))))"
+
+# A package whose primary failed once and passed on a re-run, with both results.
+function describe_retried(ctx::LiteCtx, job::Item)
+    version = opt_str(job, "version")
+    first_status, status = str(job, "first_status"), str(job, "status")
+    reason_msg = str(job, "first_reason_message", "")
+    string("**", str(job, "package"), "**",
+           version === nothing ? "" : " v$(something(version))",
+           ": $(status_emoji(first_status)) $first_status", isempty(reason_msg) ? "" : " ($reason_msg)",
+           " — ", log_link(ctx, opt_str(job, "first_log_key")),
+           ", then $(status_emoji(status)) $status on a re-run — ", log_link(ctx, opt_str(job, "log_key")))
+end
+
 function describe_job(ctx::LiteCtx, job::Item)
     version = opt_str(job, "version")
     status = str(job, "status")
@@ -1793,6 +1808,10 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         println(io, "- ", ncpu, " baseline", ncpu == 1 ? "" : "s",
                 " re-run because the package failed on primary but passed on another CPU type ",
                 "(the re-run asks for primary's CPU type)")
+    nretry = count(j -> opt_str(j, "first_status") !== nothing, jobs)
+    nretry == 0 ||
+        println(io, "- ", nretry, " primary failure", nretry == 1 ? "" : "s",
+                " re-run because the baseline passed")
     nskipped = int(run, "rechecks_skipped", 0)
     nskipped == 0 ||
         println(io, "- ", nskipped, " more baseline", nskipped == 1 ? " was" : "s were",
@@ -1809,6 +1828,8 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             total_cost += flt(j, "cost", 0.0)
             nmetered += 1
         end
+        # a re-run primary job also paid for its first run
+        total_cost += flt(j, "first_cost", 0.0)
     end
     nran = count(jobs) do j
         opt_str(j, "reused_from") === nothing && str(j, "status") in TERMINAL_STATUSES
@@ -1831,6 +1852,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     summary = ""
     new_fails = 0
     unverified = String[]  # packages of `cpu_kills`, for report.json
+    flaky_pkgs = String[]  # packages of `flaky`, for report.json
     if length(config_names) == 2
         by_pkg = Dict{String,Dict{String,Item}}()
         for job in jobs
@@ -1838,6 +1860,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
         end
         new_failures = String[]
         cpu_kills = String[]
+        flaky = String[]
         now_passing = String[]
         still_failing = String[]
         newly_skipped = String[]
@@ -1852,13 +1875,17 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             # baseline tested a different version
             av = opt_str(a, "version")
             vs = av === nothing || av == opt_str(p, "version") ? "" : " v$(something(av))"
-            if cpu_mismatched_kill(p, a) && issuccess(ast)
+            retried = opt_str(p, "first_status") !== nothing
+            if retried && issuccess(pst) && issuccess(ast)
+                push!(flaky_pkgs, pkg)
+                push!(flaky, "- " * describe_retried(ctx, p))
+            elseif cpu_mismatched_kill(p, a) && issuccess(ast)
                 push!(unverified, pkg)
                 push!(cpu_kills, "- " * describe_job(ctx, p) *
                       " on $(str(p, "cpu")) (vs. $(status_emoji(ast)) on $(str(a, "cpu"))$vs)")
             elseif !issuccess(pst) && issuccess(ast) && pst != "skip"
                 push!(new_failures, "- " * describe_job(ctx, p) *
-                      " (vs. $(status_emoji(ast))$vs)")
+                      " (vs. $(status_emoji(ast))$vs" * (retried ? "; failed on a re-run too)" : ")"))
             elseif issuccess(pst) && !issuccess(ast) && ast != "skip"
                 push!(now_passing, "- " * describe_job(ctx, p))
             elseif pst == "skip" && ast != "skip"
@@ -1891,12 +1918,16 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
             (summary *= "; $(length(newly_skipped)) newly skipped")
         (infra_failure || isempty(cpu_kills)) ||
             (summary *= "; $(length(cpu_kills)) killed on another CPU type than the baseline")
+        (infra_failure || isempty(flaky)) ||
+            (summary *= "; $(length(flaky)) passed on a re-run")
         println(io, "**", summary, "**\n")
         for (title, entries, open) in (
                 ("❌ Packages that failed on primary but not on against", new_failures, true),
                 ("⏱️ Packages that ran out of time on primary but passed on the baseline on " *
                  "another CPU type, which can be up to 3x faster (not counted as new)",
                  cpu_kills, true),
+                ("🎲 Packages that failed on primary but passed on a re-run (not counted as new)",
+                 flaky, false),
                 ("⏭️ Packages skipped on primary but evaluated on against", newly_skipped, !infra_failure),
                 ("✅ Packages that now pass", now_passing, false),
                 ("💔 Packages that failed on both", still_failing, false),
@@ -1933,7 +1964,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     s3_put(ctx, report_key(run_id, "db.json"), db_json(run, jobs);
            content_type="application/json")
     s3_put(ctx, report_key(run_id, "report.json"),
-           report_json(ctx, run, jobs, configs, total_cost, nmetered < nran, unverified);
+           report_json(ctx, run, jobs, configs, total_cost, nmetered < nran, unverified, flaky_pkgs);
            content_type="application/json")
     return (; summary, markdown, url=report_url(ctx, run_id), cost=total_cost,
             cost_partial=(nmetered < nran), new_fails, jobs)
@@ -1970,6 +2001,8 @@ end
 #   nfsig   {package: sig index, ...}  cluster membership for those packages
 #   cpukills [package, ...]  time-limit kills on primary whose baseline passed on
 #           another CPU type; not new failures. Omitted when there are none
+#   flaky   [package, ...]  failed on primary where the baseline passed, then passed
+#           on a re-run of primary; not new failures. Omitted when there are none
 
 # grouping key for a stored error line: collapse details that vary per package
 # or process (addresses, source locations, LoadError nesting) but keep the
@@ -2029,7 +2062,8 @@ end
 
 function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
                      configs::Vector{ConfigInfo}, total_cost::Float64,
-                     cost_partial::Bool, unverified::Vector{String}=String[])
+                     cost_partial::Bool, unverified::Vector{String}=String[],
+                     flaky::Vector{String}=String[])
     io = IOBuffer()
     print(io, "{\"run\":{\"id\":", JSON.json(str(run, "run_id")))
     print(io, ",\"bucket\":",
@@ -2230,6 +2264,14 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     if !isempty(unverified)
         print(io, ",\"cpukills\":[")
         for (i, pkg) in enumerate(unverified)
+            i == 1 || print(io, ",")
+            print(io, JSON.json(pkg))
+        end
+        print(io, "]")
+    end
+    if !isempty(flaky)
+        print(io, ",\"flaky\":[")
+        for (i, pkg) in enumerate(flaky)
             i == 1 || print(io, ",")
             print(io, JSON.json(pkg))
         end

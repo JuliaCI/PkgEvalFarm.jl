@@ -989,6 +989,13 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
         @error "early baseline recheck failed; leaving it to the end of the run" run_id=job.run_id exception=(err, catch_backtrace())
         false
     end
+    # after the baseline re-run above, which holds this one back until it passes
+    reopened |= try
+        retry_primary_now(ctx, attrs, job, result.status)
+    catch err
+        @error "primary retry failed; reporting the first result" run_id=job.run_id exception=(err, catch_backtrace())
+        false
+    end
     # a reopened baseline holds the run open, so it can't be finished here
     if !reopened && attrs["completed_jobs"] >= attrs["total_jobs"] && attrs["status"] == "active"
         # a recheck reopens jobs, and the run finishes after them instead
@@ -1185,6 +1192,83 @@ function recheck_now(ctx::FarmCtx, attrs::AbstractDict, job::JobRef, status::Abs
         rethrow()
     end
     @info "re-running a baseline as soon as both results are in" run_id=job.run_id job.package want_cpu reused
+    return true
+end
+
+# A run whose change under test breaks many packages would otherwise re-run them all.
+const MAX_PRIMARY_RETRIES = 100
+
+"""
+    retry_primary_now(ctx, run_attrs, job, status) -> Bool
+
+Re-run primary once when it failed and the baseline passed, so that a single slow
+or flaky run is not reported as a new failure. The re-run asks for the baseline's
+CPU type. It waits for any re-run of the baseline, so a baseline that fails too
+costs no retry. The first result is kept in the job's `first_*` fields. Returns
+whether primary was reopened.
+"""
+function retry_primary_now(ctx::FarmCtx, attrs::AbstractDict, job::JobRef, status::AbstractString)
+    attrs["status"] == "active" || return false
+    primary = primary_config(attrs)
+    primary === nothing && return false
+    if job.config == primary
+        status in ("crash", "fail", "kill") || return false
+    elseif job.config == "against"
+        issuccess(status) || return false
+    else
+        return false
+    end
+    get(attrs, "primary_retries", 0) < MAX_PRIMARY_RETRIES || return false
+    rejob = JobRef(job.run_id, primary, job.package)
+    p = get_job_item(ctx, rejob)
+    a = get_job_item(ctx, JobRef(job.run_id, "against", job.package))
+    (p === nothing || a === nothing) && return false
+    haskey(p, "first_status") && return false
+    String(get(p, "status", "")) in ("crash", "fail", "kill") || return false
+    issuccess(String(get(a, "status", ""))) || return false
+
+    want_cpu = get(a, "cpu", nothing)
+    want_cpu = want_cpu === nothing ? nothing : String(want_cpu)
+    enqueue_jobs(ctx, [rejob]; queue_url=slow_queue(ctx.cfg), delay=RECHECK_DELAY[],
+                 cpu=Returns(want_cpu))
+    now = isodate()
+    kept = [f for f in ("status", "reason", "reason_message", "log_key", "cpu", "duration", "wall", "cost")
+             if get(p, f, nothing) !== nothing]
+    try
+        aws_retry() do
+            Dynamodb.transact_write_items(Any[
+                Dict("Update" => Dict(
+                    "TableName" => ctx.cfg.runs_table,
+                    "Key" => ddb_item(Dict("run_id" => job.run_id)),
+                    "ConditionExpression" => "#s = :active AND " *
+                                             "(attribute_not_exists(primary_retries) OR primary_retries < :limit)",
+                    "UpdateExpression" => "SET updated_at = :now ADD primary_retries :one, completed_jobs :minus",
+                    "ExpressionAttributeNames" => Dict("#s" => "status"),
+                    "ExpressionAttributeValues" => ddb_item(Dict(
+                        ":active" => "active", ":limit" => MAX_PRIMARY_RETRIES, ":now" => now,
+                        ":one" => 1, ":minus" => -1)))),
+                Dict("Update" => Dict(
+                    "TableName" => ctx.cfg.jobs_table,
+                    "Key" => ddb_item(Dict("run_id" => job.run_id, "job_key" => job_key(rejob))),
+                    "ConditionExpression" => "#s = :was AND attribute_not_exists(first_status)",
+                    "UpdateExpression" => "SET #s = :pending, attempts = :zero, " *
+                                          (want_cpu === nothing ? "" : "want_cpu = :want_cpu, want_since = :now, ") *
+                                          join(("first_$f = :first_$f" for f in kept), ", ") *
+                                          " REMOVE reason, reason_message, version, #d, wall, log_key, " *
+                                          "cost, peak_rss, held, error_line, error_lines, pass_sigs, " *
+                                          "finished_at, cpu, failures, seal_wait_since",
+                    "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
+                    "ExpressionAttributeValues" => ddb_item(Dict(
+                        ":was" => p["status"], ":pending" => "pending", ":zero" => 0,
+                        (want_cpu === nothing ? () : (":want_cpu" => want_cpu, ":now" => now))...,
+                        (":first_$f" => p[f] for f in kept)...))))];
+                aws_config=ctx.aws)
+        end
+    catch err
+        is_conditional_failure(err) && return false
+        rethrow()
+    end
+    @info "re-running primary after it failed where the baseline passed" run_id=job.run_id job.package want_cpu
     return true
 end
 
