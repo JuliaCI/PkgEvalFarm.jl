@@ -2009,14 +2009,16 @@ end
 #   reasons [[code, message], ...]  (severity ordering lives in the page)
 #   pkgs    [[name, version, pstatus, preason, pduration,
 #             astatus, areason, aduration, aversion-if-different,
-#             plogdir, alogdir], ...]
+#             plogdir, alogdir, pcpu, acpu], ...]
 #           statuses as single chars (t/l/f/c/k/s/e), reasons as indices into
-#           `reasons` (-1 = none), durations in whole seconds
+#           `reasons` (-1 = none), durations in whole seconds, CPU types as
+#           indices into `cpus` (-1 = not recorded)
 #   logdirs ["runs/<id>/logs/<config>", ...]  log directory of each job's
 #           log_key, indexed by plogdir/alogdir (-1 = no log recorded); a
 #           reused baseline's log lives under the donor run's prefix, so the
 #           page must not assume this run's. A non-canonical log_key (a
 #           retry's <pkg>.<n>.log) is listed whole, ending in ".log"
+#   cpus    ["znver4", ...]  CPU type each job ran on, indexed by pcpu/acpu
 #   sigs    [{label, n}, ...]  shared failure signatures: hard new failures
 #           (fail/crash on primary, baseline OK) clustered by their stored
 #           error line, most common first; the line is each failure's first
@@ -2181,6 +2183,17 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         end
     end
 
+    cpus = String[]
+    cpu_ids = Dict{String,Int}()
+    cpu_idx(job::Item) = begin
+        c = opt_str(job, "cpu")
+        c === nothing && return -1
+        get!(cpu_ids, something(c)) do
+            push!(cpus, something(c))
+            length(cpus) - 1
+        end
+    end
+
     print(io, "],\"pkgs\":[")
     primary_name = something(configs[1].name, "primary")
     against_name = length(configs) == 2 ? something(configs[2].name, "against") : nothing
@@ -2237,7 +2250,7 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
               ",", string(reason_idx(p)),
               ",", string(round(Int, flt(p, "duration", 0.0))))
         if a === nothing
-            print(io, ",\"\",-1,0,0,", string(logdir_idx(p)), ",-1]")
+            print(io, ",\"\",-1,0,0,", string(logdir_idx(p)), ",-1,", string(cpu_idx(p)), ",-1]")
         else
             aa = something(a)
             print(io, ",", JSON.json(status_char(str(aa, "status"))),
@@ -2245,7 +2258,8 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
                   ",", string(round(Int, flt(aa, "duration", 0.0))))
             changed = pver !== nothing && aver !== nothing && pver != aver
             print(io, ",", changed ? JSON.json(something(aver)) : "0",
-                  ",", string(logdir_idx(p)), ",", string(logdir_idx(aa)), "]")
+                  ",", string(logdir_idx(p)), ",", string(logdir_idx(aa)),
+                  ",", string(cpu_idx(p)), ",", string(cpu_idx(aa)), "]")
         end
     end
     print(io, "]")
@@ -2309,6 +2323,11 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     for (i, dir) in enumerate(logdirs)
         i == 1 || print(io, ",")
         print(io, JSON.json(dir))
+    end
+    print(io, "],\"cpus\":[")
+    for (i, cpu) in enumerate(cpus)
+        i == 1 || print(io, ",")
+        print(io, JSON.json(cpu))
     end
     print(io, "]}")
     return String(take!(io))
