@@ -340,6 +340,19 @@ end
     row = only(dl["pkgs"])
     @test dl["logdirs"][row[10] + 1] == "runs/RID/logs/primary/A.2.log"
     @test dl["logdirs"][row[11] + 1] == "runs/RID/logs/against"
+
+    # each side's CPU type indexes into `cpus`; -1 when not recorded
+    oncpu(it, cpu) = (it["cpu"] = attr(cpu); it)
+    dc = JSON.parse(FB.report_json(ctx, run,
+        [oncpu(job("primary", "A", "test"), "znver1"), oncpu(job("against", "A", "test"), "znver4"),
+         oncpu(job("primary", "B", "test"), "znver4"), job("against", "B", "test")],
+        configs, 0.0, false))
+    rows = Dict(r[1] => r for r in dc["pkgs"])
+    @test dc["cpus"][rows["A"][12] + 1] == "znver1"
+    @test dc["cpus"][rows["A"][13] + 1] == "znver4"
+    @test dc["cpus"][rows["B"][12] + 1] == "znver4"
+    @test rows["B"][13] == -1
+    @test length(dc["cpus"]) == 2
 end
 
 @testset "fleet load history" begin

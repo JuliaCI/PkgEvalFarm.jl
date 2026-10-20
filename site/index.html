@@ -12,9 +12,9 @@
         `done_jobs` of `total_jobs` evaluated as of `as_of`) plus `pkgs`
         rows [name, version, primary status, reason idx, duration, against
         status, reason idx, duration, version-if-different, primary logdir
-        idx, against logdir idx]; status chars t/l = pass, f = fail,
+        idx, against logdir idx, primary CPU idx, against CPU idx]; status chars t/l = pass, f = fail,
         c = crash, k = kill, s = skip, e = error; reason/logdir indices
-        point into the `reasons` and `logdirs` arrays (-1 = none).
+        point into the `reasons`, `logdirs` and `cpus` arrays (-1 = none).
     runs/<run_id>/report/db.json      full per-job records
     <logdirs[i]>/<Package>.log        per-package logs — build the path from
         `logdirs` (reused baseline results keep their donor run's prefix,
@@ -1848,9 +1848,12 @@ function main(D) {
       "Listed in PkgEval's Packages.toml: deprecated, needs proprietary software or services, or misbehaves."],
   };
   const OK = new Set(["t", "l"]);
-  // pkgs row layout: [name, version, ps, pr, pdur, as, ar, adur, aver-if-different, plogdir, alogdir]
+  // pkgs row layout: [name, version, ps, pr, pdur, as, ar, adur, aver-if-different, plogdir, alogdir,
+  //                   pcpu, acpu]
   const PSTAT = 2, PREASON = 3, PDUR = 4, ASTAT = 5, AREASON = 6, ADUR = 7, AVER = 8,
-        PLOG = 9, ALOG = 10;
+        PLOG = 9, ALOG = 10, PCPU = 11, ACPU = 12;
+  // older reports have no CPU columns
+  const cpuOf = (r, i) => (D.cpus && r[i] >= 0 ? D.cpus[r[i]] : null);
   const hasAgainst = !!D.run.against;
 
   // severity order mirrors PkgEval.jl's reasons list (crash → fail → kill → skip)
@@ -2395,34 +2398,44 @@ function main(D) {
   nfRender();
 
   // ---- performance signal ----------------------------------------------
+  // CPU types differ up to 3x in speed, so only pairs timed on the same type are compared
   if (hasAgainst) {
-    let n = 0, ge2 = 0;
+    let n = 0, ge2 = 0, mixed = 0;
     const top = [];
     for (const r of D.pkgs) {
       if (!OK.has(r[PSTAT]) || !OK.has(r[ASTAT])) continue;
       const pd = r[PDUR], ad = r[ADUR];
       if (ad >= 30 && pd > 0) {
+        const pc = cpuOf(r, PCPU), ac = cpuOf(r, ACPU);
+        if (pc && ac && pc !== ac) { mixed++; continue; }
         n++;
         const ratio = pd / ad;
         if (ratio >= 2) ge2++;
         if (ad >= 60 && ratio >= 1.5) top.push([r, ratio]);
       }
     }
+    if (n || mixed) {
+      $("slow-block").hidden = false;
+      const left = mixed ? ` ${fmtInt(mixed)} pairs that ran on different CPU types, which can differ up to 3× ` +
+        `in speed, are left out.` : "";
+      const which = D.cpus ? "on the same CPU type " : "";
+      $("slow-lede").innerHTML =
+        `Test-suite durations compared for packages that <b>passed on both builds</b> ${which}(baseline ≥ 30 s): ` +
+        `<b>${fmtInt(ge2)}</b> of ${fmtInt(n)} took over 2× longer on primary.${left}` +
+        (top.length ? " The biggest slowdowns, by ratio:" : " None was 1.5× slower or more.");
+    }
     if (top.length) {
       top.sort((a, b) => b[1] - a[1]);
       const rows = top.slice(0, 25);
-      $("slow-block").hidden = false;
-      $("slow-lede").innerHTML =
-        `Test-suite durations compared for packages that <b>passed on both builds</b> (baseline ≥ 30 s): ` +
-        `<b>${fmtInt(ge2)}</b> of ${fmtInt(n)} took over 2× longer on primary. The biggest slowdowns, by ratio:`;
       const maxr = rows[0][1];
       $("slow-table").innerHTML = `<table class="slowtable">
-        <thead><tr><th>Package</th><th style="text-align: right">baseline</th>
+        <thead><tr><th>Package</th>${D.cpus ? "<th>CPU</th>" : ""}<th style="text-align: right">baseline</th>
           <th style="text-align: right">primary</th><th style="text-align: right">slowdown</th><th style="width: 30%"></th></tr></thead>
         <tbody>` + rows.map(([r, ratio]) => {
           const name = r[0], ver = r[1], pd = r[PDUR], ad = r[ADUR], pl = plog(r), al = alog(r);
           return `<tr><td>${pl ? `<a class="mono" href="${pl}">${esc(name)}</a>` : `<span class="mono">${esc(name)}</span>`}
                ${ver ? `<span class="ver" style="color: var(--ink-3); font-size: 12px"> v${esc(ver)}</span>` : ""}</td>
+           ${D.cpus ? `<td class="mono">${esc(cpuOf(r, PCPU) || cpuOf(r, ACPU) || "")}</td>` : ""}
            <td class="num">${fmtDur(ad)}${al ? `<a class="lg" href="${al}">log</a>` : ""}</td>
            <td class="num">${fmtDur(pd)}${pl ? `<a class="lg" href="${pl}">log</a>` : ""}</td>
            <td class="ratio">${ratio.toFixed(1)}×</td>
