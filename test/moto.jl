@@ -1204,10 +1204,10 @@ try
                     "latest_comment_url" => "$(gh_base[])/repos/JuliaLang/julia/issues/comments/1"))])
             PEF.FarmBot.handle_invocation(lite, gh)
             @test length(posted) == 1
-            @test occursin("has been submitted as run", posted[1])
+            @test occursin("Submitted PkgEval run [`", posted[1])
             @test occursin("JuliaLang/julia#abcdef123456", posted[1])
-            @test occursin("against: `JuliaLang/julia#mergebase0`, where the PR branched off `master`", posted[1])
-            run_id = match(r"run `([^`]+)`", posted[1]).captures[1]
+            @test occursin("against `JuliaLang/julia#mergebase0`, where the PR branched off `master`.", posted[1])
+            run_id = match(r"run \[`([^`]+)`\]", posted[1]).captures[1]
 
             run = PEF.get_run(ctx, run_id)
             @test run["status"] == "expanding"
@@ -1230,8 +1230,8 @@ try
             # already edits an in-place status body over the ack text
             @test run["comment_id"] == 700001
             @test !isempty(edited) && edited[end].first == "700001"
-            @test occursin("**Status**", edited[end].second)
-            @test occursin("expanding", edited[end].second)
+            @test occursin("PkgEval run [`$run_id`](https://", edited[end].second)
+            @test occursin("**Building Julia**", edited[end].second)
 
             # 2. a worker picks it up, expands and completes it
             notifications[] = "[]"
@@ -1275,7 +1275,7 @@ try
             #    email notification) and removes the superseded status comment
             PEF.FarmBot.handle_invocation(lite, gh)
             @test length(posted) == 2
-            @test occursin("@keno: run `$run_id` finished", posted[end])
+            @test occursin("@keno: PkgEval run [`$run_id`](", posted[end])
             @test occursin("no new package failures", posted[end])
             @test deleted == ["700001"]   # the status comment is gone
             # the published report anchors its trigger link on the comment
@@ -1323,8 +1323,8 @@ try
                 @test resp["statusCode"] == 200
             end
             @test length(posted) == 3
-            @test occursin("has been submitted as run", posted[3])
-            webhook_run_id = match(r"run `([^`]+)`", posted[3]).captures[1]
+            @test occursin("Submitted PkgEval run [`", posted[3])
+            webhook_run_id = match(r"run \[`([^`]+)`\]", posted[3]).captures[1]
             @test webhook_run_id == "gh-555111"  # deterministic, comment-derived
 
             # 5a. duplicate deliveries collapse into the one run: a webhook
@@ -1390,7 +1390,7 @@ try
                 "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item))))]))
             @test JSON.parse(PEF.FarmBot.handle_event(stream_event, lite, gh))["ok"] == true
             @test length(posted) == 4  # a fresh report comment...
-            @test occursin("@keno: run `$webhook_run_id` finished", posted[end])
+            @test occursin("@keno: PkgEval run [`$webhook_run_id`](", posted[end])
             @test deleted[end] == "700003"   # ...replacing the status comment
             # reporting also annotated the run item with the scalars the
             # dashboard's verdict chips read straight off its table scan
@@ -1417,7 +1417,7 @@ try
             PEF.fail_run(ctx, failed_id,
                 "the Julia build for JuliaLang/julia@deadbeefde (linuxassert) failed: http://bk/7")
             PEF.FarmBot.handle_invocation(lite, gh)
-            @test occursin("@keno: run `$failed_id` **failed** — the Julia build", posted[end])
+            @test occursin("$failed_id) **failed**: the Julia build", posted[end])
             @test occursin("http://bk/7", posted[end])
             n8p, n8e = length(posted), length(edited)
             PEF.FarmBot.handle_invocation(lite, gh)  # reported exactly once
@@ -1435,7 +1435,7 @@ try
                 "eventName" => "MODIFY",
                 "dynamodb" => Dict("NewImage" => JSON.parse(PEF.FarmLite.json_item(run_item2))))]))
             @test JSON.parse(PEF.FarmBot.handle_event(stream2, lite, gh))["ok"] == true
-            @test occursin("@keno: run `$failed2` **failed** — its Julia build failed", posted[end])
+            @test occursin("$failed2) **failed**: its Julia build failed", posted[end])
             n8p2 = length(posted)
             @test JSON.parse(PEF.FarmBot.handle_event(stream2, lite, gh))["ok"] == true  # no double
             @test length(posted) == n8p2
@@ -1580,29 +1580,29 @@ try
         reused["reused_from"] = PEF.FarmLite.attr("run-0")
         @test FB.own_work_done([reused, mk("test"; dur=60.0), mk("pending"; est=30.0)]) == 60.0
 
-        body = FB.status_comment_body("run-1", "primary: `a`, against: `b`",
+        body = FB.status_comment_body("run-1", "https://r/?run=run-1", "`a` against `b`",
                                       "active", 80, 200, now, eta)
-        @test occursin("run `run-1` (primary: `a`, against: `b`)", body)
-        @test occursin("80/200 jobs completed", body)
-        @test occursin("Estimated completion: 2026-07-28 14:00 UTC (~2h 0m left)", body)
+        @test occursin("PkgEval run [`run-1`](https://r/?run=run-1): `a` against `b`", body)
+        @test occursin("**80/200 jobs done**, about 2h 0m left (done around 2026-07-28 14:00 UTC).", body)
         @test FB.remaining_str(now, now + Dates.Minute(45)) == "45m"
         @test FB.remaining_str(now, now + Dates.Minute(200)) == "3h 20m"
         @test FB.remaining_str(now, now + Dates.Hour(52)) == "2d 4h"
         @test FB.remaining_str(now, now - Dates.Hour(1)) == "0m"  # never negative
-        body = FB.status_comment_body("run-1", "", "expanding", 0, 0, now, nothing)
-        @test occursin("expanding — building Julia", body)
-        @test occursin("as of 2026-07-28 12:00 UTC", body)
-        @test !occursin("Estimated", body)
+        body = FB.status_comment_body("run-1", "u", "", "expanding", 0, 0, now, nothing)
+        @test occursin("**Building Julia**", body)
+        @test occursin("Updated 2026-07-28 12:00 UTC.", body)
+        @test !occursin("left", body)
         # active but no ETA yet: progress without a prediction
-        body = FB.status_comment_body("run-1", "", "active", 5, 200, now, nothing)
-        @test occursin("5/200 jobs completed.", body)
-        @test !occursin("Estimated", body)
+        body = FB.status_comment_body("run-1", "u", "", "active", 5, 200, now, nothing)
+        @test occursin("**5/200 jobs done**.", body)
+        @test !occursin("left", body)
         # reused baselines are left out of the progress
-        body = FB.status_comment_body("run-1", "", "active", 105, 200, now, nothing; reused=100)
-        @test occursin("5/100 jobs completed (plus 100 baseline results reused from earlier runs).", body)
+        body = FB.status_comment_body("run-1", "u", "", "active", 105, 200, now, nothing; reused=100)
+        @test occursin("**5/100 jobs done** (100 baseline results reused from earlier runs).", body)
 
         @test FB.configs_summary("[{\"name\":\"primary\",\"julia\":\"x#1\"},{\"name\":\"against\",\"julia\":\"#1.12\"}]") ==
-              "primary: `x#1`, against: `#1.12`"
+              "`x#1` against `#1.12`"
+        @test FB.configs_summary("[{\"name\":\"primary\",\"julia\":\"x#1\"}]") == "primary: `x#1`"
         @test FB.configs_summary("garbage") == ""
 
         # the hand-rolled isodate parser (trim-safe replacement for DateTime(str, df))

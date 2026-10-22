@@ -884,10 +884,9 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
         return
     end
     comment_id = post_comment(gh, repo, number, """
-        Your package evaluation job has been submitted as run `$run_id` \
-        (primary: `$primary`, against: `$against`$against_note). I will keep this comment \
-        updated with progress, and post the report as a new comment when it \
-        finishes.""")
+        Submitted $(run_link(ctx, run_id)): `$primary` against `$against`$against_note.
+
+        I will update this comment with progress, and post the results as a new comment when the run finishes.""")
     if comment_id !== nothing
         try
             record_comment_id(ctx, run_id, something(comment_id))
@@ -1188,7 +1187,7 @@ function mark_run_failed(ctx::LiteCtx, gh::GitHubCtx, run_id::String, why::Strin
     (context.repo === nothing || context.issue === nothing) && return
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
     deliver_final(gh, something(context.repo), something(context.issue), run,
-                  mention * "run `" * run_id * "` **failed** — " * why * ".")
+                  failed_body(ctx, run_id, mention, why))
     return nothing
 end
 
@@ -1259,12 +1258,10 @@ function report_finished_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
     costline = report.cost <= 0 ? "" :
         report.cost_partial ?
-        "\nCompute cost: at least " * dollars(report.cost) * " (EC2 spot; partially metered)" :
-        "\nEstimated compute cost: " * dollars(report.cost) * " (EC2 spot)"
-    deliver_final(gh, something(context.repo), something(context.issue), run, """
-        $(mention)run `$run_id` finished — **$(report.summary)**
-
-        Full report: $(report_url(ctx, run_id))$(costline)""")
+        "\n\nCompute cost: at least " * dollars(report.cost) * " (EC2 spot, partially metered)." :
+        "\n\nCompute cost: about " * dollars(report.cost) * " (EC2 spot)."
+    deliver_final(gh, something(context.repo), something(context.issue), run,
+                  "$(mention)$(run_link(ctx, run_id)) finished: **$(report.summary)**$(costline)")
     @info "posted report" run_id
 end
 
@@ -1291,6 +1288,9 @@ function check_failed_runs(ctx::LiteCtx, gh::GitHubCtx)
     end
 end
 
+failed_body(ctx::LiteCtx, run_id::String, mention::String, why::String) =
+    "$(mention)$(run_link(ctx, run_id)) **failed**: $why."
+
 function report_failed_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     run_id = str(run, "run_id")
 
@@ -1312,7 +1312,7 @@ function report_failed_run(ctx::LiteCtx, gh::GitHubCtx, run::Item)
     why = str(run, "failure_reason", "unspecified failure")
     mention = context.requester === nothing ? "" : "@$(something(context.requester)): "
     deliver_final(gh, something(context.repo), something(context.issue), run,
-                  mention * "run `" * run_id * "` **failed** — " * why * ".")
+                  failed_body(ctx, run_id, mention, why))
     @info "reported failed run" run_id
 end
 
@@ -1403,7 +1403,7 @@ function run_work(jobs::Vector{Item})
     return (work_done, remaining)
 end
 
-"One-line human summary of a run's configurations (\"primary: `...`, against: `...`\")."
+"One-line human summary of a run's configurations (\"`...` against `...`\")."
 function configs_summary(configs_json::String)
     configs = try
         parse_json(configs_json, Vector{ConfigInfo})
@@ -1411,6 +1411,9 @@ function configs_summary(configs_json::String)
         ConfigInfo[]
     end
     isempty(configs) && return ""
+    if length(configs) == 2 && configs[1].name == "primary" && configs[2].name == "against"
+        return "`$(something(configs[1].julia, "?"))` against `$(something(configs[2].julia, "?"))`"
+    end
     return join(("$(something(c.name, "?")): `$(something(c.julia, "?"))`" for c in configs), ", ")
 end
 
@@ -1430,30 +1433,30 @@ the exact rendering; `eta === nothing` means "don't print one". Deliberately
 mention-free: GitHub notifies on mentions an edit adds, and only the final
 message should ping the requester.
 """
-function status_comment_body(run_id::String, config_desc::String, status::String,
+function status_comment_body(run_id::String, url::String, config_desc::String, status::String,
                              completed::Int, total::Int, asof::DateTime,
                              eta::Union{Nothing,DateTime}; reused::Int=0)
-    desc = isempty(config_desc) ? "" : " ($config_desc)"
+    desc = isempty(config_desc) ? "" : ": $config_desc"
     stampfmt = dateformat"yyyy-mm-dd HH:MM \U\T\C"
     line = if status == "expanding"
-        "expanding — building Julia and enumerating packages."
+        "**Building Julia** and listing packages."
     elseif total > 0
         eta_note = eta === nothing ? "" :
-            " Estimated completion: $(Dates.format(something(eta), stampfmt)) " *
-            "(~$(remaining_str(asof, something(eta))) left)."
+            ", about $(remaining_str(asof, something(eta))) left " *
+            "(done around $(Dates.format(something(eta), stampfmt)))"
         # reused baseline results count as completed from the start, so they are
         # left out of the progress and mentioned on their own
-        reused_note = reused > 0 ? " (plus $reused baseline results reused from earlier runs)" : ""
-        "$(max(0, completed - reused))/$(total - reused) jobs completed$reused_note.$eta_note"
+        reused_note = reused > 0 ? " ($reused baseline results reused from earlier runs)" : ""
+        "**$(max(0, completed - reused))/$(total - reused) jobs done**$reused_note$eta_note."
     else
-        "starting up."
+        "**Starting up.**"
     end
     return """
-        Your package evaluation job has been submitted as run `$run_id`$desc.
+        PkgEval run [`$run_id`]($url)$desc
 
-        **Status** as of $(Dates.format(asof, stampfmt)): $line
+        $line Updated $(Dates.format(asof, stampfmt)).
 
-        I will keep updating this comment (about once an hour) and post the report as a new comment when the run finishes."""
+        This comment updates about once an hour. The results will be posted as a new comment when the run finishes."""
 end
 
 """
@@ -1518,7 +1521,7 @@ function update_status_comment(ctx::LiteCtx, gh::GitHubCtx, run::Item;
     comment_id = int(run, "comment_id", 0)
     context = parse_json(str(run, "context", "{}"), RunContext)
     if comment_id > 0 && context.repo !== nothing && context.issue !== nothing
-        body = status_comment_body(run_id, configs_summary(str(run, "configs", "[]")),
+        body = status_comment_body(run_id, report_url(ctx, run_id), configs_summary(str(run, "configs", "[]")),
                                    status, completed, total, now, eta;
                                    reused=int(run, "reused_jobs", 0))
         update_comment(gh, something(context.repo), comment_id, body)
@@ -1592,6 +1595,7 @@ s3_public_url(ctx::LiteCtx, key::String) =
 # their data and the link just carries the run id
 report_page() = get(ENV, "PKGEVAL_REPORT_PAGE", "https://pkgeval-reports.julialang.org/")
 report_url(::LiteCtx, run_id::String) = report_page() * "?run=" * urlencode(run_id)
+run_link(ctx::LiteCtx, run_id::String) = "PkgEval run [`$run_id`]($(report_url(ctx, run_id)))"
 
 issuccess(status::String) = status == "test" || status == "load"
 const TERMINAL_STATUSES = ("test", "load", "fail", "crash", "kill", "skip", "error")
@@ -1932,7 +1936,7 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
                                    str(j, "status") == "skip", jobs)
         infra_failure = nprimary > 0 && 2 * nprimary_skip >= nprimary
         summary = if infra_failure
-            "⚠️ $nprimary_skip of $nprimary primary evaluations were skipped — " *
+            "⚠️ $nprimary_skip of $nprimary primary evaluations were skipped, " *
             "likely an infrastructure failure; results are not meaningful"
         elseif isempty(new_failures)
             "no new package failures ✅"
