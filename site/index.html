@@ -561,9 +561,12 @@
   .runidx-prog { display: inline-flex; align-items: center; gap: 8px; vertical-align: middle; }
   .runidx-prog .bar {
     width: 120px; height: 6px; border-radius: 3px;
-    background: var(--muted-wash); overflow: hidden;
+    background: color-mix(in srgb, var(--ink-3) 35%, transparent); overflow: hidden;
   }
   .runidx-prog .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+  #liveprog { border-bottom: 0; padding-bottom: 10px; }
+  #liveprog .runidx-prog { flex-wrap: wrap; }
+  #liveprog .bar { width: 200px; }
 
   .dchart { margin: 8px 0 0; position: relative; }
   .dchart .runmark { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 2 3; }
@@ -629,6 +632,7 @@
       <a href="https://github.com/JuliaCI/PkgEvalFarm.jl">GitHub</a>
     </nav>
   </header>
+  <div class="meta-line" id="liveprog" hidden></div>
   <div class="load-state" id="loadstate">Loading report data…</div>
   <div id="runindex" hidden>
     <section class="block" id="runidx-active" hidden>
@@ -866,6 +870,22 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   document.title = "PkgEval — " + runId;
   const back = ' <a href="./" target="_self">Back to the dashboard.</a>';
   const reportUrl = `${bucket}/runs/${encodeURIComponent(runId)}/report/report.json`;
+  // the live progress gauge of a run still in flight, as on the dashboard;
+  // returns the run item so callers can react to the run finishing or failing
+  const showProgress = async () => {
+    const ddb = ddbClient(params);
+    const live = await ddb.getRun(runId);
+    const inFlight = live && (live.status === "expanding" || live.status === "active");
+    if (inFlight) {
+      const ids = [...new Set(Object.values(live.seal_runs || {}))];
+      const seals = await Promise.all(ids.map((id) => ddb.getRun(id).catch(() => null)));
+      const sealById = new Map(seals.filter(Boolean).map((s) => [s.run_id, s]));
+      $("liveprog").innerHTML =
+        `<span class="runidx-prog">${runGauge(live, sealById).gauge}</span>`;
+    }
+    $("liveprog").hidden = !inFlight;
+    return live;
+  };
   try {
     D = await fetchJson(reportUrl);
   } catch (err) {
@@ -882,12 +902,12 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
       $("loadstate").innerHTML = `Run ${rid} failed — ` +
         linkify(run.failure_reason || "unspecified failure") + "." + back;
     } else {
-      const prog = jobsDone(run);
-      $("loadstate").innerHTML = `Run ${rid} is still in progress${prog} — ` +
-        "its report will appear here once it finishes." + back;
+      $("loadstate").innerHTML = `Run ${rid} is still in progress. ` +
+        "Its report will appear here once it finishes." + back;
+      await showProgress().catch(() => null);
       // reload once the report (or a snapshot of it) appears, or the run fails
       keepFresh(async () => {
-        const live = await ddbClient(params).getRun(runId);
+        const live = await showProgress();
         const head = await fetch(reportUrl, { method: "HEAD", cache: "no-store" });
         if (head.ok || (live && live.status === "failed")) location.reload();
       }, 60_000, "checked");
@@ -917,14 +937,18 @@ const IDENTITY_POOL = "us-east-2:75dfe5f2-4bc8-439d-9cd2-ed8dc2ab8cab";
   $("app").hidden = false;
   main(D);
   if (D.run.in_progress) {
-    // snapshots are republished about hourly: reload for a newer one, the
-    // final report, or the run's failure
+    await showProgress().catch(() => null);
+    // the gauge refreshes every minute; snapshots are republished about
+    // hourly, so a newer one or the final report is looked for every 5th
+    // minute, or as soon as the run has left the in-flight states
+    let ticks = 0;
     keepFresh(async () => {
+      const live = await showProgress().catch(() => null);
+      if (live && live.status === "failed") return location.reload();
+      if (++ticks % 5 && !(live && live.status === "done")) return;
       const fresh = await (await fetch(reportUrl, { cache: "no-store" })).json();
-      const live = await ddbClient(params).getRun(runId).catch(() => null);
-      if (!fresh.run.in_progress || fresh.run.as_of !== D.run.as_of ||
-          (live && live.status === "failed")) location.reload();
-    }, 5 * 60_000, "checked");
+      if (!fresh.run.in_progress || fresh.run.as_of !== D.run.as_of) location.reload();
+    }, 60_000, "checked");
   }
 })();
 
@@ -1642,75 +1666,7 @@ async function dashboard(params) {
             linkify(r.failure_reason || "unspecified failure", 40)}</span></div>`));
       } else {   // expanding | active: the in-progress section
         bits.push(timeHTML(r.created_at));
-        // say what a run without visible progress is actually doing, so it
-        // doesn't read as hung: waiting on CI Julia builds (the workers stamp
-        // `waiting` per config — both sides of a comparison can need one —
-        // with the Buildkite URLs once known)…
-        const w = r.waiting;
-        const builds = w ? Object.keys(w)
-          .sort((a, b) => (a === "primary" ? -1 : b === "primary" ? 1 : a < b ? -1 : 1))
-          .map((c) => {
-            const b = w[c] || {};
-            const sha = esc((b.sha || "").slice(0, 10));
-            const link = b.url
-              ? `<a class="mono" href="${esc(b.url)}">${sha} ↗</a>`
-              : `<span class="mono">${sha}</span>`;
-            const label = [...(c === "?" ? [] : [esc(c)]),   // "?": config unknown
-                           ...(b.variant && b.variant !== "linux" ? [esc(b.variant)] : [])]
-              .join(", ");
-            return link + (label ? ` (${label})` : "");
-          }) : [];
-        const buildWait = builds.length
-          ? "waiting for CI to build Julia " + builds.join(" and ") : null;
-        let gauge, chip;
-        if (r.status === "active" && r.total_jobs > 0) {
-          chip = ["run", "running"];
-          const { done, total } = jobCounts(r);
-          // …or the shared precompile (seal) phase its test jobs are gated
-          // on, whose progress lives on the referenced seal-* run items
-          let phase = buildWait, tick = r.updated_at;
-          if (r.seal_runs) {
-            const seals = [...new Set(Object.values(r.seal_runs))]
-              .map((id) => sealById.get(id))
-              .filter((s) => s && (s.completed_jobs || 0) < (s.total_jobs || 0));
-            // seal runs are shared with other runs and keep jobs open on dependency
-            // cycles, so only one still finishing seal jobs holds this run up; the
-            // one with the most left is the bottleneck
-            const busy = seals.filter((s) =>
-              s.updated_at && Date.now() - Date.parse(s.updated_at) < 15 * 60000);
-            if (!phase && busy.length) {
-              const left = (s) => (s.total_jobs || 0) - (s.completed_jobs || 0);
-              const s = busy.reduce((a, b) => (left(b) > left(a) ? b : a));
-              phase = `<span title="shared precompilation (seal) jobs; a package's test starts once its seal is done">precompiling ${fmtNum(s.completed_jobs || 0)} of ${fmtNum(s.total_jobs || 0)}</span>`;
-            }
-            // seal completions are progress: fold them into the activity
-            // clock, which otherwise reads idle through the whole phase
-            for (const s of seals)
-              if (s.updated_at && (!tick || s.updated_at > tick)) tick = s.updated_at;
-          }
-          const ago = tick
-            ? Math.round((Date.now() - Date.parse(tick)) / 60000) : null;
-          // the bot's hourly estimate, left out once it is more than 90 minutes
-          // old (the bot is behind) or already past
-          let eta = "";
-          const etaAt = r.eta_at ? Date.parse(r.eta_at) : NaN;
-          const etaFrom = r.status_commented_at ? Date.parse(r.status_commented_at) : NaN;
-          if (!phase && etaAt > Date.now() && Date.now() - etaFrom < 90 * 60000) {
-            const mins = Math.round((etaAt - Date.now()) / 60000);
-            const left = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h ${mins % 60}m`
-              : `${Math.floor(mins / 1440)}d ${Math.floor(mins % 1440 / 60)}h`;
-            eta = ` · about ${left} left`;
-          }
-          gauge = `<span class="n" title="${eta ? "estimated finish " + esc(fmtLocal(new Date(etaAt))) : ""}">${fmtNum(done)} of ${fmtNum(total)} jobs${
-              phase ? " · " + phase : ""}${esc(eta)}${esc(
-              ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
-            }</span><span class="bar"><i style="width:${
-              Math.min(100, Math.round(done / total * 100))}%"></i></span>`;
-        } else {
-          chip = ["q", "queued"];
-          gauge = `<span class="n">${buildWait ||
-            "waiting for a worker to expand the run"}</span>`;
-        }
+        const { chip, gauge } = runGauge(r, sealById);
         active.push(row(r, chip,
           bits.join(" · ") + ` · <span class="runidx-prog">${gauge}</span>`));
       }
@@ -1792,6 +1748,83 @@ async function dashboard(params) {
   $("loadstate").hidden = true;
   $("runindex").hidden = false;
   keepFresh(scan, 60_000);
+}
+
+// The progress gauge of an expanding or active run, as a status chip and the
+// gauge's HTML. `sealById` holds the seal-* run items the run's sealing phase
+// is tracked on.
+function runGauge(r, sealById) {
+  const esc = escHtml;
+  // say what a run without visible progress is actually doing, so it
+  // doesn't read as hung: waiting on CI Julia builds (the workers stamp
+  // `waiting` per config — both sides of a comparison can need one —
+  // with the Buildkite URLs once known)…
+  const w = r.waiting;
+  const builds = w ? Object.keys(w)
+    .sort((a, b) => (a === "primary" ? -1 : b === "primary" ? 1 : a < b ? -1 : 1))
+    .map((c) => {
+      const b = w[c] || {};
+      const sha = esc((b.sha || "").slice(0, 10));
+      const link = b.url
+        ? `<a class="mono" href="${esc(b.url)}">${sha} ↗</a>`
+        : `<span class="mono">${sha}</span>`;
+      const label = [...(c === "?" ? [] : [esc(c)]),   // "?": config unknown
+                     ...(b.variant && b.variant !== "linux" ? [esc(b.variant)] : [])]
+        .join(", ");
+      return link + (label ? ` (${label})` : "");
+    }) : [];
+  const buildWait = builds.length
+    ? "waiting for CI to build Julia " + builds.join(" and ") : null;
+  let gauge, chip;
+  if (r.status === "active" && r.total_jobs > 0) {
+    chip = ["run", "running"];
+    const { done, total } = jobCounts(r);
+    // …or the shared precompile (seal) phase its test jobs are gated
+    // on, whose progress lives on the referenced seal-* run items
+    let phase = buildWait, tick = r.updated_at;
+    if (r.seal_runs) {
+      const seals = [...new Set(Object.values(r.seal_runs))]
+        .map((id) => sealById.get(id))
+        .filter((s) => s && (s.completed_jobs || 0) < (s.total_jobs || 0));
+      // seal runs are shared with other runs and keep jobs open on dependency
+      // cycles, so only one still finishing seal jobs holds this run up; the
+      // one with the most left is the bottleneck
+      const busy = seals.filter((s) =>
+        s.updated_at && Date.now() - Date.parse(s.updated_at) < 15 * 60000);
+      if (!phase && busy.length) {
+        const left = (s) => (s.total_jobs || 0) - (s.completed_jobs || 0);
+        const s = busy.reduce((a, b) => (left(b) > left(a) ? b : a));
+        phase = `<span title="shared precompilation (seal) jobs; a package's test starts once its seal is done">precompiling ${fmtNum(s.completed_jobs || 0)} of ${fmtNum(s.total_jobs || 0)}</span>`;
+      }
+      // seal completions are progress: fold them into the activity
+      // clock, which otherwise reads idle through the whole phase
+      for (const s of seals)
+        if (s.updated_at && (!tick || s.updated_at > tick)) tick = s.updated_at;
+    }
+    const ago = tick
+      ? Math.round((Date.now() - Date.parse(tick)) / 60000) : null;
+    // the bot's hourly estimate, left out once it is more than 90 minutes
+    // old (the bot is behind) or already past
+    let eta = "";
+    const etaAt = r.eta_at ? Date.parse(r.eta_at) : NaN;
+    const etaFrom = r.status_commented_at ? Date.parse(r.status_commented_at) : NaN;
+    if (!phase && etaAt > Date.now() && Date.now() - etaFrom < 90 * 60000) {
+      const mins = Math.round((etaAt - Date.now()) / 60000);
+      const left = mins < 60 ? `${mins}m` : mins < 1440 ? `${Math.floor(mins / 60)}h ${mins % 60}m`
+        : `${Math.floor(mins / 1440)}d ${Math.floor(mins % 1440 / 60)}h`;
+      eta = ` · about ${left} left`;
+    }
+    gauge = `<span class="n" title="${eta ? "estimated finish " + esc(fmtLocal(new Date(etaAt))) : ""}">${fmtNum(done)} of ${fmtNum(total)} jobs${
+        phase ? " · " + phase : ""}${esc(eta)}${esc(
+        ago === null ? "" : ago < 1 ? " · active now" : ` · last activity ${ago}m ago`)
+      }</span><span class="bar"><i style="width:${
+        Math.min(100, Math.round(done / total * 100))}%"></i></span>`;
+  } else {
+    chip = ["q", "queued"];
+    gauge = `<span class="n">${buildWait ||
+      "waiting for a worker to expand the run"}</span>`;
+  }
+  return { chip, gauge };
 }
 
 // Reused baseline results are complete from the start, so progress leaves them out.
