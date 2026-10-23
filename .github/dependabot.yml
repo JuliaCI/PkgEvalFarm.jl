@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "julia"
+    directories:
+      - "/"
+      - "/bot"
+      - "/broker"
+      - "/buildreq"
+      - "/daily"
+      - "/lite/juliac"
+      - "/sysimage"
+    schedule:
+      interval: "weekly"
+    groups:
+      julia:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "opentofu"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+    groups:
+      opentofu:
+        patterns:
+          - "*"
