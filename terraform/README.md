@@ -195,7 +195,7 @@ itself would still be a welcome belt-and-braces improvement.
 | `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
 | `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
 | `ec2_worker_farm_repo` / `_ref` | no | JuliaCI repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |
-| `ec2_worker_julia_channel` | no | `"1.12"` | juliaup channel installed on EC2 workers. |
+| `ec2_worker_julia_channel` | no | `"1.13"` | juliaup channel installed on EC2 workers. |
 
 ## Deploying
 

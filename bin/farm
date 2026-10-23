@@ -1,7 +1,7 @@
 #!/bin/sh
 # Convenience wrapper for running the CLI straight from a checkout, equivalent to
 # the `farm` app installed by `Pkg.Apps` (see `[apps]` in Project.toml). Set
-# JULIA to pick a specific julia, e.g. JULIA="julia +1.12".
+# JULIA to pick a specific julia, e.g. JULIA="julia +1.13".
 #
 # PKGEVAL_SYSIMAGE points at a sysimage holding the worker and its dependencies
 # (built by sysimage/build.jl, fetched at boot by EC2 workers). Ignored if the

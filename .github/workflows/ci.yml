@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        julia: ['1.12']
+        julia: ['1.13']
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
@@ -119,7 +119,7 @@ jobs:
       - uses: julia-actions/setup-julia@v2
         with:
           # must match ec2_worker_julia_channel in terraform/variables.tf
-          version: '1.12'
+          version: '1.13'
       - uses: julia-actions/cache@v2
       - name: Add swap
         # emitting and linking a ~700MB image spikes past the hosted runner's
