@@ -42,12 +42,14 @@ export handle_event
 const ALLOWED_REPO = "JuliaLang/julia"
 
 # Build-state lifecycle bounds. A claim still lacking an artifact after
-# MAX_BUILD_AGE is treated as failed whatever Buildkite says (the backstop for
-# builds stuck queued forever, an unreachable API, or claims that predate
-# build numbers being recorded). A *failed* claim older than FAILED_RETRY_AGE
-# may be re-claimed and re-triggered, so a transient Buildkite failure costs a
-# day, not the sha forever.
+# MAX_BUILD_AGE is treated as failed (the backstop for builds stuck queued
+# forever, an unreachable API, or claims that predate build numbers being
+# recorded), unless Buildkite says the build is running: assert builds can
+# take over 4h. MAX_RUNNING_BUILD_AGE caps those too. A *failed* claim older
+# than FAILED_RETRY_AGE may be re-claimed and re-triggered, so a transient
+# Buildkite failure costs a day, not the sha forever.
 const MAX_BUILD_AGE = 3 * 60 * 60
+const MAX_RUNNING_BUILD_AGE = 8 * 60 * 60
 const FAILED_RETRY_AGE = 24 * 60 * 60
 
 # When upstream CI (julia-pr/julia-ci) is already building a commit, we wait on
@@ -498,11 +500,12 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
     str(c, "status", "") == "failed" && return failed_response(url)
     str(c, "status", "") == "upstream" && return poll_upstream(ctx, table, key, c, url)
     asked = parse_isodate(str(c, "requested_at", ""))
-    expired = asked !== nothing &&
-              Dates.now(UTC) - something(asked) >= Dates.Second(MAX_BUILD_AGE)
-    failed = expired
+    older(limit) = asked !== nothing &&
+                   Dates.now(UTC) - something(asked) >= Dates.Second(limit)
+    failed = older(MAX_RUNNING_BUILD_AGE)
     if !failed
         number = int(c, "build_number", -1)
+        state = nothing
         if number >= 0
             state = try
                 build_state(ctx, number)
@@ -512,9 +515,10 @@ function poll_claim(ctx::LiteCtx, table::String, key::String)
                 println(Core.stderr, "buildkite state query failed for " * key * ": " * msg)
                 nothing
             end
-            failed = state !== nothing &&
-                     something(state) in ("failed", "canceled", "skipped", "not_run")
         end
+        failed = (state !== nothing &&
+                  something(state) in ("failed", "canceled", "skipped", "not_run")) ||
+                 (older(MAX_BUILD_AGE) && state != "running")
     end
     failed || return pending_response(200, "already-requested", url)
     try

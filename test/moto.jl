@@ -1809,8 +1809,22 @@ try
                 claim = BuildRequest.get_claim(lctx, "pkgeval-builds", key2)
                 @test FL.str(something(claim), "status", "") == "requested"
 
-                # age backstop: no artifact after MAX_BUILD_AGE means failed,
-                # whatever Buildkite says about the build
+                # a build Buildkite reports running outlives MAX_BUILD_AGE...
+                setat(key2, Dates.now(UTC) - Dates.Hour(4))
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("already-requested", resp)
+
+                # ...but not MAX_RUNNING_BUILD_AGE
+                setat(key2, Dates.now(UTC) - Dates.Hour(9))
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("build-failed", resp)
+
+                # age backstop: a build that never started running is failed
+                # after MAX_BUILD_AGE
+                setat(key2, Dates.now(UTC) - Dates.Hour(25))
+                resp = BuildRequest.handle_event(ask, lctx)
+                @test occursin("\"statusCode\":202", resp)
+                bk_state[] = "scheduled"
                 setat(key2, Dates.now(UTC) - Dates.Hour(4))
                 resp = BuildRequest.handle_event(ask, lctx)
                 @test occursin("build-failed", resp)
