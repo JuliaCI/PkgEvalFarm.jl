@@ -31,14 +31,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        julia: ['1.12']
+        julia: ['1.13']
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.julia }}
-      - uses: julia-actions/cache@v2
-      - uses: actions/setup-python@v5
+      - uses: julia-actions/cache@v3
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install test services
@@ -58,8 +58,8 @@ jobs:
       run:
         working-directory: terraform
     steps:
-      - uses: actions/checkout@v4
-      - uses: opentofu/setup-opentofu@v1
+      - uses: actions/checkout@v7
+      - uses: opentofu/setup-opentofu@v2
         with:
           # no wrapper: check_userdata_size.sh captures raw `tofu console` output
           tofu_wrapper: false
@@ -73,14 +73,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           # the trim-compatible build needs 1.13 newer than rc1: trimmed images
           # built before JuliaLang/julia#62009 lose GC write-barrier edges on
           # image objects and segfault at runtime
           version: '1.13'
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       - name: Build broker
         run: julia --project=broker broker/build/build.jl
       - name: Build bot
@@ -97,7 +97,7 @@ jobs:
             echo "$app: $count AVX-512 instructions"
             [ "$count" -eq 0 ] || { echo "::error::$app bundle is not portable"; exit 1; }
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lambda-bundles
           path: |
@@ -115,12 +115,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           # must match ec2_worker_julia_channel in terraform/variables.tf
-          version: '1.12'
-      - uses: julia-actions/cache@v2
+          version: '1.13'
+      - uses: julia-actions/cache@v3
       - name: Add swap
         # emitting and linking a ~700MB image spikes past the hosted runner's
         # RAM often enough to kill it outright ("the hosted runner lost
@@ -156,7 +156,7 @@ jobs:
                 Base.in_sysimage(Base.PkgId(m)) ||
                     error("$m is not in the sysimage; workers would precompile it anyway")
             end'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: worker-sysimage
           path: sysimage/build/*.so
@@ -177,14 +177,14 @@ jobs:
       contents: read
       id-token: write        # required to mint the OIDC token
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: lambda-bundles
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: worker-sysimage
           path: sysimage
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ env.AWS_DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}

@@ -171,7 +171,7 @@ variable "ec2_worker_farm_ref" {
 variable "ec2_worker_julia_channel" {
   description = "juliaup channel installed on EC2 workers."
   type        = string
-  default     = "1.12"
+  default     = "1.13"
 }
 
 variable "bot_submitter_team" {
