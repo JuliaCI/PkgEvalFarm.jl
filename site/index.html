@@ -27,6 +27,9 @@
         precompile, derivation and run-setup jobs and the number of
         instances reporting them, then queued and held messages per
         queue); -1 marks a missing value
+    daily/cpu_speed.json              test time on each worker CPU type relative
+        to the fastest, fitted from the last two weeks of dailies (next to
+        this page; daily/analyze.jl derives it)
 
   The landing page (no ?run=) lists runs from the DynamoDB table
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
@@ -640,7 +643,7 @@
       <div class="runidx-rows" id="runidx-active-rows"></div>
     </section>
     <details class="block load-block" id="load-block" hidden>
-      <summary>Fleet load <span class="n" id="load-sum"></span></summary>
+      <summary>Fleet info <span class="n" id="load-sum"></span></summary>
       <p class="lede">Job slots in use by kind of job, and vCPUs in use going by the workers' CPU
         use, against the fleet's capacity (one slot per vCPU, plus extra precompile slots).
         Sampled every 5 minutes; hover the chart to read an earlier sample.</p>
@@ -649,6 +652,13 @@
         <button type="button" data-days="14" aria-pressed="false">14 days</button>
       </div>
       <figure class="dchart" id="load-chart" aria-label="Job slots and vCPUs in use against fleet capacity over time"></figure>
+      <div id="speed-wrap" hidden>
+        <h3 class="subhead">Test time by CPU type <span class="n" id="speed-n"></span></h3>
+        <p class="lede">How long the same package's tests take on each worker CPU type, relative to the
+          fastest type, from the passing tests of the last two weeks of dailies. The whisker spans the
+          middle half of the tests; the share killed counts every test run on that type.</p>
+        <figure class="dchart" id="speed-chart" aria-label="Test time on each worker CPU type relative to the fastest"></figure>
+      </div>
     </details>
     <section class="block">
       <h2>Recent runs <span class="n" id="runidx-n"></span></h2>
@@ -1304,6 +1314,41 @@ function loadSummary(L) {
   return busy + (queued ? ` · ${fmt(queued)} jobs queued` : "");
 }
 
+// Test time per worker CPU type relative to the fastest, from daily/cpu_speed.json:
+// a bar per type at its fitted factor, a whisker over the middle half of its tests,
+// and the share of its tests that were killed on the time limit.
+function speedChart(el, S) {
+  const esc = escHtml;
+  const types = S.types;
+  const full = Math.round(el.clientWidth || 760);
+  const label = 112, note = full > 560 ? 190 : 0;
+  const W = Math.max(300, full), rowH = 24, T = 6, B = 22;
+  const H = T + B + rowH * types.length;
+  const L0 = label, R = note + 12;
+  const hi = Math.max(1.5, ...types.map((t) => t.p75)) * 1.05;
+  const x = (v) => L0 + (W - L0 - R) * v / hi;
+  let grid = "";
+  const step = niceStep(hi / 4);
+  for (let v = 0; v <= hi + 1e-9; v += step) {
+    grid += `<line class="grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/>` +
+      `<text class="axis" x="${x(v)}" y="${H - 6}" text-anchor="middle">${+v.toFixed(2)}×</text>`;
+  }
+  const fmt = (n) => n.toLocaleString("en-US");
+  let marks = "";
+  types.forEach((t, k) => {
+    const yc = T + rowH * k + rowH / 2;
+    const killed = t.jobs ? (100 * t.kills / t.jobs).toFixed(1) : "–";
+    marks += `<text class="axis" x="${L0 - 8}" y="${yc + 4}" text-anchor="end">${esc(t.cpu)}</text>` +
+      `<rect x="${x(0)}" y="${yc - 7}" width="${x(t.factor) - x(0)}" height="14" rx="2" fill="var(--qviz-1)" fill-opacity="0.8"/>` +
+      `<line class="cross" x1="${x(t.p25)}" x2="${x(t.p75)}" y1="${yc}" y2="${yc}"/>` +
+      `<line class="cross" x1="${x(t.p25)}" x2="${x(t.p25)}" y1="${yc - 4}" y2="${yc + 4}"/>` +
+      `<line class="cross" x1="${x(t.p75)}" x2="${x(t.p75)}" y1="${yc - 4}" y2="${yc + 4}"/>` +
+      `<text class="axis" x="${x(Math.max(t.factor, t.p75)) + 6}" y="${yc + 4}">${t.factor.toFixed(2)}×</text>` +
+      (note ? `<text class="axis" x="${W - note}" y="${yc + 4}">${fmt(t.samples)} tests · ${killed}% killed</text>` : "");
+  });
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${marks}</svg>`;
+}
+
 // The fleet load chart. `L` is fleet/load.json (field names plus rows of
 // integers, time first, -1 for a missing value); `runs` are the runs-table
 // items. Job slots in use are stacked by kind of job, from the counts each
@@ -1707,6 +1752,20 @@ async function dashboard(params) {
     if (!$("load-block").open) return;
     loadWidth = $("load-chart").clientWidth;
     loadChart($("load-chart"), load, all, loadDays);
+    drawSpeed();
+  };
+  // the Pages build rewrites daily/cpu_speed.json every few hours; it is fetched
+  // once, when the section is first opened, and left out if it can't be read
+  let speed = null, speedTried = false;
+  const drawSpeed = async () => {
+    if (!speedTried) {
+      speedTried = true;
+      try { speed = await fetchJson("daily/cpu_speed.json"); } catch { /* the chart stays hidden */ }
+    }
+    if (!speed || !speed.types || !speed.types.length) return;
+    $("speed-wrap").hidden = false;
+    $("speed-n").textContent = `${speed.runs.length} dailies`;
+    speedChart($("speed-chart"), speed);
   };
   $("load-block").addEventListener("toggle", drawLoad);
   const refreshLoad = async () => {

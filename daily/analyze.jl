@@ -10,6 +10,8 @@
 #   performance.json  package test time per daily relative to the newest, computed the two
 #                     ways Nanosoldier's charts did
 #   unreliable.json   packages that fail too often to be worth testing on PR runs
+#   cpu_speed.json    test time on each worker CPU type relative to the fastest, from the
+#                     passing tests of the last two weeks of dailies
 #
 # This ports NanosoldierReports' tools/pkgeval_analysis, which did the same for
 # Nanosoldier's dailies. Summaries are immutable once published, so they are cached.
@@ -220,6 +222,95 @@ function unreliable_packages(dailies; window=Day(30), min_tests=5, min_failure_r
     return sort!(unreliable)
 end
 
+# The report of each of the last `days` dailies, which unlike the summary records the
+# worker CPU type of both sides of every test.
+function load_reports(dailies, cache; days=14)
+    reports = Dict{String,Any}[]
+    for daily in dailies[max(1, end - days + 1):end]
+        file = joinpath(cache, "$(daily.run)-report.json")
+        if !isfile(file)
+            text = fetch_text("$FARM/runs/$(daily.run)/report/report.json")
+            text === nothing && continue
+            report = JSON.parse(text; dicttype=Dict{String,Any})
+            # an hourly snapshot of a run in progress changes, so it isn't cached
+            get(report["run"], "in_progress", false) === true || write(file, text)
+        else
+            report = JSON.parsefile(file; dicttype=Dict{String,Any})
+        end
+        push!(reports, report)
+    end
+    return reports
+end
+
+median(xs) = (s = sort(xs); n = length(s); isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
+quantile(xs, q) = (s = sort(xs); s[clamp(round(Int, q * (length(s) - 1)) + 1, 1, length(s))])
+
+# How long tests take on each CPU type relative to the fastest. Every passing test of a
+# package version is a sample, whichever side and daily it ran on; median polish fits
+# log(duration) as a package version effect plus a CPU type effect, so packages tested on
+# several CPU types compare them, and outliers (a busy host) don't move the fit. Short
+# tests are left out, as their time is mostly fixed setup, and so are package versions
+# tested on one CPU type only. The spread is the middle half of the CPU type's samples,
+# each relative to its package version's fitted time on the fastest type.
+function cpu_speed(reports; min_duration=60, iterations=20)
+    samples = Tuple{Tuple{String,String},String,Float64}[]
+    jobs = Dict{String,Int}()
+    kills = Dict{String,Int}()
+    for report in reports
+        # reports from before the farm recorded CPU types have none
+        cpus = get(report, "cpus", nothing)
+        cpus === nothing && continue
+        for row in report["pkgs"]
+            name, version = row[1], row[2]
+            against_version = row[9] isa AbstractString ? row[9] : version
+            for (status, duration, cpu, v) in ((row[3], row[5], row[12], version),
+                                               (row[6], row[8], row[13], against_version))
+                (cpu isa Integer && cpu >= 0 && status != "s") || continue
+                type = String(cpus[cpu + 1])
+                jobs[type] = get(jobs, type, 0) + 1
+                status == "k" && (kills[type] = get(kills, type, 0) + 1)
+                status in ("t", "l") && duration isa Real && duration >= min_duration &&
+                    push!(samples, ((name, String(v)), type, log(duration)))
+            end
+        end
+    end
+    # a package version tested on one CPU type says nothing about the others
+    types_of = Dict{Tuple{String,String},Set{String}}()
+    for (p, type, _) in samples
+        push!(get!(types_of, p, Set{String}()), type)
+    end
+    filter!(((p, _, _),) -> length(types_of[p]) > 1, samples)
+    isempty(samples) && return Dict{String,Any}[]
+    pkg = Dict{Tuple{String,String},Float64}()
+    cpu = Dict{String,Float64}(type => 0.0 for (_, type, _) in samples)
+    for _ in 1:iterations
+        by_pkg = Dict{Tuple{String,String},Vector{Float64}}()
+        for (p, type, d) in samples
+            push!(get!(by_pkg, p, Float64[]), d - cpu[type])
+        end
+        for (p, ds) in by_pkg
+            pkg[p] = median(ds)
+        end
+        by_cpu = Dict{String,Vector{Float64}}()
+        for (p, type, d) in samples
+            push!(get!(by_cpu, type, Float64[]), d - pkg[p])
+        end
+        for (type, ds) in by_cpu
+            cpu[type] = median(ds)
+        end
+    end
+    fastest = minimum(values(cpu))
+    residuals = Dict{String,Vector{Float64}}()
+    for (p, type, d) in samples
+        push!(get!(residuals, type, Float64[]), d - pkg[p] - fastest)
+    end
+    return sort!([Dict("cpu" => type, "factor" => exp(cpu[type] - fastest),
+                       "p25" => exp(quantile(rs, 0.25)), "p75" => exp(quantile(rs, 0.75)),
+                       "samples" => length(rs), "jobs" => get(jobs, type, 0),
+                       "kills" => get(kills, type, 0))
+                  for (type, rs) in residuals]; by=t -> t["factor"])
+end
+
 function main(out, cache=joinpath(@__DIR__, ".cache"))
     mkpath(out)
     dailies = load_dailies(cache)
@@ -231,6 +322,10 @@ function main(out, cache=joinpath(@__DIR__, ".cache"))
     write(joinpath(out, "unreliable.json"), JSON.json(Dict(
         "generated" => string(now(UTC)), "window_days" => 30, "min_tests" => 5,
         "min_failure_ratio" => 0.75, "unreliable" => unreliable_packages(dailies))))
+    reports = load_reports(dailies, cache)
+    write(joinpath(out, "cpu_speed.json"), JSON.json(Dict(
+        "generated" => string(now(UTC)), "runs" => [r["run"]["id"] for r in reports],
+        "types" => cpu_speed(reports))))
     @info "analyzed daily runs" n=length(dailies)
 end
 
