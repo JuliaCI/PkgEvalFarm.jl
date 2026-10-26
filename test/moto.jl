@@ -1041,7 +1041,8 @@ try
         # Skips for having no tests predate that, so they are not reused.
         julia = "JuliaLang/julia#" * "d"^40
         for (pkg, status, reason) in (("Loaded", "load", nothing), ("NoTests", "load", nothing),
-                                      ("OldSkip", "skip", "untestable"), ("Tested", "test", nothing))
+                                      ("OldSkip", "skip", "untestable"), ("Tested", "test", nothing),
+                                      ("SkipListed", "skip", "blacklisted"))
             Dynamodb.put_item(PEF.ddb_item(Dict(
                 "run_id" => "load-donor", "job_key" => "primary#$pkg", "config" => "primary",
                 "package" => pkg, "status" => status, "duration" => 1.0,
@@ -1057,6 +1058,15 @@ try
         _, _, results = PEF.baseline_reuse_plan(ctx, run, ["Loaded", "NoTests", "OldSkip", "Tested"],
                                                 [("2026-03-01T00:00:00Z", "load-donor", donor_cfg, 4)])
         @test sort!(collect(keys(results))) == ["NoTests", "Tested"]
+        # skip-list skips are reused, except by a run that names its packages, which tests them
+        pkgs = ["NoTests", "SkipListed"]
+        _, _, results = PEF.baseline_reuse_plan(ctx, run, pkgs,
+                                                [("2026-03-01T00:00:00Z", "load-donor", donor_cfg, 5)])
+        @test sort!(collect(keys(results))) == pkgs
+        named = merge(run, Dict{String,Any}("packages" => pkgs))
+        _, _, results = PEF.baseline_reuse_plan(ctx, named, pkgs,
+                                                [("2026-03-01T00:00:00Z", "load-donor", donor_cfg, 5)])
+        @test collect(keys(results)) == ["NoTests"]
     end
 
     @testset "submitter requirement parsing" begin

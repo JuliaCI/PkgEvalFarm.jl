@@ -1843,6 +1843,14 @@ function generate_report(ctx::LiteCtx, run_id::String; run::Item=get_run(ctx, ru
     nretry == 0 ||
         println(io, "- ", nretry, " primary failure", nretry == 1 ? "" : "s",
                 " re-run because the baseline passed")
+    skip_listed = Set{String}()
+    for j in jobs
+        haskey(j, "skip_listed") && j["skip_listed"].BOOL === true &&
+            push!(skip_listed, str(j, "package"))
+    end
+    isempty(skip_listed) ||
+        println(io, "- tested although on PkgEval's skip list, because the run named them: ",
+                join(map(p -> "`$p`", sort!(collect(skip_listed))), ", "))
     nskipped = int(run, "rechecks_skipped", 0)
     nskipped == 0 ||
         println(io, "- ", nskipped, " more baseline", nskipped == 1 ? " was" : "s were",
