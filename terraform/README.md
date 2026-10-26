@@ -55,8 +55,9 @@ The config can run self-enrolling EC2 workers as a spot-first auto-scaling
 group **that scales itself off the job queue**:
 
 Capacity is denominated in **job slots** (= vCPUs): the mixed-instances
-overrides are weighted by vCPU count, so the fleet may mix instance sizes and
-the spot allocator compares pools by price *per slot*.
+overrides are weighted by vCPU count, so the fleet may mix instance sizes. The
+spot allocator takes the types in list order, skipping pools that are short
+of capacity.
 
 ```sh
 tofu apply -var ec2_worker_max=384  # enable, with a hard slot ceiling
@@ -82,11 +83,12 @@ not to overshoot:
 All-spot by default (`ec2_worker_on_demand_percent = 0`): spot interruption is
 harmless — the killed worker's jobs stop being heartbeated and SQS redelivers
 them — and the ASG replaces interrupted instances automatically
-(`price-capacity-optimized` across `ec2_worker_instance_types`, default M
-types from 8xlarge to 24xlarge, all 4 GB/vCPU for heavy package tests; with
-vCPU weights the allocator lands on a large size exactly when it is cheaper
-per slot, and larger instances also amortize the per-machine Julia build and
-caches better).
+(`capacity-optimized-prioritized` across `ec2_worker_instance_types`, all
+4 GB/vCPU or more for heavy package tests). The list is ordered for few
+time-limit kills and fast runs at a similar cost per unit of work: znver4
+(m7a, r7a) first; then znver3 (m6a, r6a), about as cheap per unit of work but
+about 1.6x slower with twice the kill rate; then icelake; and sapphirerapids
+(m7i) last, fast but the dearest per unit of work.
 
 Being inside AWS they skip GitHub enrollment entirely — an instance profile
 carries the same worker policy the broker would vend, and cloud-init installs
@@ -191,7 +193,7 @@ itself would still be a welcome belt-and-braces improvement.
 | `ec2_worker_min` | no | `0` | EC2 worker floor in slots (= max to pin capacity). |
 | `ec2_worker_backlog_target` | no | `12.5` | Visible jobs per slot (vCPU) the scaler aims for. |
 | `ec2_worker_idle_minutes` | no | `15` | Full queue idle time before scaling to the floor. |
-| `ec2_worker_instance_types` | no | eleven M types, 8–24xlarge | Spot pools; sizes mix freely (vCPU-weighted, allocator picks by price/slot). |
+| `ec2_worker_instance_types` | no | znver4 first, then znver3, icelake, sapphirerapids | Spot pools in order of preference; sizes mix freely (vCPU-weighted). |
 | `ec2_worker_on_demand_percent` | no | `0` | Share of capacity on-demand instead of spot. |
 | `ec2_worker_disk_gb` | no | `200` | Worker root volume (GB). |
 | `ec2_worker_farm_repo` / `_ref` | no | JuliaCI repo, `master` | Where EC2 workers clone PkgEvalFarm.jl from. |

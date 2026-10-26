@@ -15,7 +15,7 @@
 #   * the CPU target — the trap that broke the Lambdas. Sysimages *can* be
 #     multiversioned (juliac's could not), so use the same target string the
 #     official Julia binaries ship with: portable down to a generic baseline,
-#     fast on the m5a/m6a/m7a mix the ASG launches.
+#     fast on the m6a/m7a/m7i mix the ASG launches.
 
 # PackageCompiler lives in its own environment (sysimage/Project.toml) so that
 # the *active* project stays the farm itself -- create_sysimage bakes the active
