@@ -2791,8 +2791,11 @@ try
                 # in-flight derivations make the proxy HOLD a matching GET
                 # until the artifact lands (dataflow ordering by blocking);
                 # a donor is summoned for the held slot's capacity
+                # on the held sandbox's CPUs
                 donations = Ref(0)
-                PEF.SEAL_DONOR[] = _ -> (donations[] += 1)
+                donated_cpus = Vector{Int}[]
+                PEF.SEAL_DONOR[] = (_, cpus) -> (donations[] += 1; push!(donated_cpus, cpus))
+                PEF.register_held!("heldjob"; cpus=[3])
                 want_uuid = "aaaaaaaa-0000-0000-0000-000000000003"
                 held_key = c3.job.package     # its item is `running` right now
                 ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$("66"^32)";
@@ -2805,12 +2808,15 @@ try
                 end
                 t0 = time()
                 resp = ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$held_key";
+                                     headers=["X-PkgEval-Job" => "heldjob"],
                                      status_exception=false)
                 wait(publisher)
                 @test resp.status == 200
                 @test String(resp.body) == "HELD-FRAME"
                 @test time() - t0 >= 4.0          # it actually held
                 @test donations[] >= 1
+                @test all(==([3]), donated_cpus)
+                PEF.forget_held!("heldjob")
                 PEF.SEAL_DONOR[] = nothing
                 PEF.record_result(sctx, c3, PEF.JobResult(; status="sealed", duration=0.1))
 
@@ -2818,7 +2824,8 @@ try
                 # derivation itself, rather than waiting for its message to be
                 # passed around to such a host
                 wants = Any[]
-                PEF.SEAL_DONOR[] = want -> push!(wants, want)
+                wants_cpus = Vector{Int}[]   # no X-PkgEval-Job: the sandbox is unknown
+                PEF.SEAL_DONOR[] = (want, cpus) -> (push!(wants_cpus, cpus); push!(wants, want))
                 pre_cpu(cpu) = join(["v2", "julia=1.99.0+abc", "name=JSON", "uuid=$want_uuid",
                                      "version=1.3.0", "tree=$("44"^20)", "flags=163",
                                      "prefs=0", "cpu=$cpu:0123456789ab"], "\n")
@@ -2835,6 +2842,7 @@ try
                     ProxyHTTP.get("$base/cache/v1/otherns/$want_uuid/$mine";
                                   headers=short_hold, status_exception=false)
                     @test any(w -> w isa PEF.JobRef && w.package == mine, wants)
+                    @test all(isempty, wants_cpus)
 
                     direct = PEF.claim_derivation(sctx, deriv_job(mine))
                     @test direct isa PEF.ClaimedJob && !PEF.has_message(direct)

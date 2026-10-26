@@ -201,6 +201,50 @@ end
         @test PEF.reason_message("build_failed") == "a package build step failed"
     end
 
+    @testset "seal overcommit stays off CPUs running tests" begin
+        load = PEF.CpuLoad(4)
+        PEF.occupy!(load, [0, 1], :test)
+        PEF.occupy!(load, [2], :seal)
+        # spill goes to a CPU with no test, the one with least seal work first
+        @test PEF.quiet_cpu!(load) == 3
+        @test PEF.quiet_cpu!(load) in (2, 3)
+        @test load.tests == [1, 1, 0, 0] && sum(load.seal) == 3
+        # with a test on every CPU it still runs, on the least loaded one
+        PEF.occupy!(load, [2, 3], :test)
+        @test PEF.quiet_cpu!(load) in (0, 1)
+        # expansions run no sandbox and count nowhere
+        PEF.occupy!(load, [0], :expand)
+        @test load.tests == [1, 1, 1, 1]
+        # a donor for a known held sandbox runs on its CPU
+        before = copy(load.seal)
+        @test PEF.donor_cpu!(load, [2]) == 2
+        @test load.seal == before .+ [0, 0, 1, 0]
+        PEF.vacate!(load, [2], :seal)
+        @test load.seal == before
+        # an unknown sandbox's donor is placed like spill
+        quiet = PEF.CpuLoad(2)
+        PEF.occupy!(quiet, [0], :test)
+        @test PEF.donor_cpu!(quiet, Int[]) == 1
+
+        # a test swaps its CPU for a free one without seal work
+        load = PEF.CpuLoad(4)
+        PEF.occupy!(load, [0], :seal)
+        PEF.occupy!(load, [1], :seal)
+        free = Channel{Int}(4)
+        foreach(c -> put!(free, c), [1, 3])
+        @test PEF.prefer_quiet_cpus!(free, [0], load) == [3]
+        @test sort!([take!(free) for _ in 1:2]) == [0, 1]
+        # ties keep the CPU already taken; an empty pool changes nothing
+        put!(free, 2)
+        @test PEF.prefer_quiet_cpus!(free, [3], load) == [3]
+        @test take!(free) == 2
+        @test PEF.prefer_quiet_cpus!(free, [0], load) == [0]
+        # a wide test takes the quietest set
+        foreach(c -> put!(free, c), [2, 3])
+        @test sort!(PEF.prefer_quiet_cpus!(free, [0, 1], load)) == [2, 3]
+        @test sort!([take!(free) for _ in 1:2]) == [0, 1]
+    end
+
     @testset "held fetch time is accounted per evaluation" begin
         # overlapping holds of one evaluation count once
         PEF.register_held!("job1")
@@ -229,6 +273,12 @@ end
         @test PEF.held_seconds("job2") == 0.0
         PEF.forget_held!("job1")
         @test PEF.held_seconds("job1") == 0.0
+        # an evaluation's CPUs are known while it is registered
+        PEF.register_held!("job3"; cpus=[2, 5])
+        @test PEF.held_cpus("job3") == [2, 5]
+        @test PEF.held_cpus("other") == Int[]
+        PEF.forget_held!("job3")
+        @test PEF.held_cpus("job3") == Int[]
         # the client's deadline bounds the hold
         req(h...) = PEF.HTTP.Request("POST", "/ensure/v2/x", collect(h))
         @test PEF.client_hold_limit(req("X-PkgEval-Deadline" => "600.0")) == 600.0

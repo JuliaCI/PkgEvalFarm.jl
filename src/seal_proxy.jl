@@ -119,16 +119,23 @@ const ACTIVE_HOLDS = Threads.Atomic{Int}(0)
 # test's time limit can leave out the time its fetches were kept waiting.
 # Concurrent holds for one evaluation count once. Only names the worker
 # registered are counted, so a sandbox cannot grow this table.
+# The evaluation's CPUs are kept too, so a donor for its hold can run there.
 mutable struct HeldClock
     total::Float64
     active::Int
     since::Float64
+    cpus::Vector{Int}
 end
 const HELD = Dict{String,HeldClock}()
 const HELD_LOCK = ReentrantLock()
 
-register_held!(job::AbstractString) =
-    lock(() -> (HELD[String(job)] = HeldClock(0.0, 0, 0.0); nothing), HELD_LOCK)
+register_held!(job::AbstractString; cpus::Vector{Int}=Int[]) =
+    lock(() -> (HELD[String(job)] = HeldClock(0.0, 0, 0.0, cpus); nothing), HELD_LOCK)
+
+"The CPUs of the evaluation named `job`, or none when it is not registered."
+held_cpus(job::AbstractString) =
+    lock(() -> (clock = get(HELD, job, nothing); clock === nothing ? Int[] : clock.cpus),
+         HELD_LOCK)
 
 function with_held(f, job::AbstractString)
     counted = lock(HELD_LOCK) do
@@ -169,9 +176,10 @@ function client_hold_limit(req::HTTP.Request)
     return limit === nothing ? hold_limit() : limit
 end
 
-# a derivation passed in is claimed directly, before any queued work
-maybe_donate!(want::Union{JobRef,Nothing}=nothing) =
-    ((donor = SEAL_DONOR[]) === nothing || donor(want); nothing)
+# a derivation passed in is claimed directly, before any queued work; `cpus`
+# are the held sandbox's, which sit idle while it waits
+maybe_donate!(want::Union{JobRef,Nothing}=nothing, cpus::Vector{Int}=Int[]) =
+    ((donor = SEAL_DONOR[]) === nothing || donor(want, cpus); nothing)
 
 """
 Whether a held host may run the derivation behind a hold itself: it is still
@@ -208,7 +216,8 @@ Underivable wants never reach here (see `want_derivable`): a hold is only
 ever taken for a key some derivation can actually produce.
 """
 function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractString,
-                             key::AbstractString; limit::Float64=hold_limit())
+                             key::AbstractString; limit::Float64=hold_limit(),
+                             held_by::AbstractString="")
     job = JobRef(deriv_run_id(ns), "deriv", key)
     item = get_seal_item(ctx, job)
     item === nothing && return nothing
@@ -228,7 +237,7 @@ function hold_for_derivation(ctx::FarmCtx, ns::AbstractString, uuid::AbstractStr
             # re-offer every iteration (the donor cap makes it idempotent —
             # measured live: one-shot donation left slots idle for the
             # remaining ~18 minutes of a capped hold, fleet at 30% CPU)
-            maybe_donate!(directly_claimable(item) ? job : nothing)
+            maybe_donate!(directly_claimable(item) ? job : nothing, held_cpus(held_by))
             sleep(3)
             body = get_kv(ctx, ns, uuid, key)
             body === nothing || return body
@@ -279,8 +288,9 @@ function start_seal_proxy!(ctx::FarmCtx)
         if req.method == "GET" && (m = match(PROXY_PATH_RE, target)) !== nothing
             ns, uuid, key = String(m[1]), String(m[2]), String(m[3])
             body = fetch_kv(ns, uuid, key)
-            body === nothing && (body = with_held(HTTP.header(req, "X-PkgEval-Job", "")) do
-                hold_for_derivation(ctx, ns, uuid, key; limit=client_hold_limit(req))
+            held_by = HTTP.header(req, "X-PkgEval-Job", "")
+            body === nothing && (body = with_held(held_by) do
+                hold_for_derivation(ctx, ns, uuid, key; limit=client_hold_limit(req), held_by)
             end)
             body === nothing && return HTTP.Response(404)
             return HTTP.Response(200, body)
@@ -323,9 +333,10 @@ function start_seal_proxy!(ctx::FarmCtx)
                     catch err
                         @warn "ensure ingestion failed" err
                     end
-                    body = with_held(HTTP.header(req, "X-PkgEval-Job", "")) do
+                    held_by = HTTP.header(req, "X-PkgEval-Job", "")
+                    body = with_held(held_by) do
                         hold_for_derivation(ctx, ns, want.uuid, key;
-                                            limit=client_hold_limit(req))
+                                            limit=client_hold_limit(req), held_by)
                     end
                 end
             end
