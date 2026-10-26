@@ -654,13 +654,13 @@
       </div>
       <figure class="dchart" id="load-chart" aria-label="Job slots and vCPUs in use against fleet capacity over time"></figure>
       <div id="speed-wrap" hidden>
-        <h3 class="subhead">Test time and cost by CPU type <span class="n" id="speed-n"></span></h3>
-        <p class="lede" id="speed-lede"></p>
-        <div class="load-range" id="speed-mode" role="group" aria-label="Measure">
-          <button type="button" data-mode="time" aria-pressed="true">Test time</button>
-          <button type="button" data-mode="cost" aria-pressed="false">Cost of the work</button>
-        </div>
-        <figure class="dchart" id="speed-chart" aria-label="Test time on each worker CPU type relative to the fastest"></figure>
+        <h3 class="subhead">Speed and price by CPU type <span class="n" id="speed-n"></span></h3>
+        <p class="lede">Each worker CPU type by how long the same package's tests take there, relative
+          to the fastest type (from the passing tests of the last two weeks of dailies), and what a
+          slot-hour costs (spot prices on the last three dailies). Their product is what the same work
+          costs: types on one dashed curve cost the same per hour of the fastest type's work (labelled on the right). Point size is
+          the number of tests run on the type; hover a point for its numbers.</p>
+        <figure class="dchart" id="speed-chart" aria-label="Test time against slot price for each worker CPU type"></figure>
       </div>
     </details>
     <section class="block">
@@ -1317,74 +1317,64 @@ function loadSummary(L) {
   return busy + (queued ? ` · ${fmt(queued)} jobs queued` : "");
 }
 
-// Test time per worker CPU type relative to the fastest, from daily/cpu_speed.json:
-// a bar per type at its fitted factor, a whisker over the middle half of its tests,
-// and the share of its tests that were killed on the time limit. In the cost view
-// the bar is the slot price times that factor: what the same work costs on each type.
-function speedChart(el, S, mode) {
-  if (mode === "cost") return costChart(el, S);
+// Worker CPU types from daily/cpu_speed.json: test time relative to the fastest type
+// against the price of a slot-hour, with curves of equal cost for the same work
+// (time factor times price), and point area by the number of tests run on the type.
+function speedChart(el, S) {
   const esc = escHtml;
-  const types = S.types;
+  const types = S.types.filter((t) => t.slot_rate != null);
+  const unpriced = S.types.filter((t) => t.slot_rate == null).map((t) => t.cpu);
   const full = Math.round(el.clientWidth || 760);
-  const label = 112, note = full > 560 ? 190 : 0;
-  const W = Math.max(300, full), rowH = 24, T = 6, B = 22;
-  const H = T + B + rowH * types.length;
-  const L0 = label, R = note + 12;
-  const hi = Math.max(1.5, ...types.map((t) => t.p75)) * 1.05;
-  const x = (v) => L0 + (W - L0 - R) * v / hi;
+  const W = Math.max(300, full), H = 300, L0 = 64, R = 16, T = 12, B = 34;
+  const xlo = 0.8, xhi = Math.max(1.5, ...types.map((t) => t.factor)) * 1.1;
+  const yhi = Math.max(0.01, ...types.map((t) => t.slot_rate)) * 1.15;
+  const x = (v) => L0 + (W - L0 - R) * (v - xlo) / (xhi - xlo);
+  const y = (v) => T + (H - T - B) * (1 - v / yhi);
+  const money = (v, d) => "$" + v.toFixed(d);
   let grid = "";
-  const step = niceStep(hi / 4);
-  for (let v = 0; v <= hi + 1e-9; v += step) {
-    grid += `<line class="grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/>` +
-      `<text class="axis" x="${x(v)}" y="${H - 6}" text-anchor="middle">${+v.toFixed(2)}×</text>`;
+  const ys = niceStep(yhi / 4);
+  for (let v = 0; v <= yhi + 1e-9; v += ys) {
+    grid += `<line class="grid" x1="${L0}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+      `<text class="axis" x="${L0 - 8}" y="${y(v) + 4}" text-anchor="end">${money(v, 3)}</text>`;
   }
-  const fmt = (n) => n.toLocaleString("en-US");
-  let marks = "";
-  types.forEach((t, k) => {
-    const yc = T + rowH * k + rowH / 2;
-    const killed = t.jobs ? (100 * t.kills / t.jobs).toFixed(1) : "–";
-    marks += `<text class="axis" x="${L0 - 8}" y="${yc + 4}" text-anchor="end">${esc(t.cpu)}</text>` +
-      `<rect x="${x(0)}" y="${yc - 7}" width="${x(t.factor) - x(0)}" height="14" rx="2" fill="var(--qviz-1)" fill-opacity="0.8"/>` +
-      `<line class="cross" x1="${x(t.p25)}" x2="${x(t.p75)}" y1="${yc}" y2="${yc}"/>` +
-      `<line class="cross" x1="${x(t.p25)}" x2="${x(t.p25)}" y1="${yc - 4}" y2="${yc + 4}"/>` +
-      `<line class="cross" x1="${x(t.p75)}" x2="${x(t.p75)}" y1="${yc - 4}" y2="${yc + 4}"/>` +
-      `<text class="axis" x="${x(Math.max(t.factor, t.p75)) + 6}" y="${yc + 4}">${t.factor.toFixed(2)}×</text>` +
-      (note ? `<text class="axis" x="${W - note}" y="${yc + 4}">${fmt(t.samples)} tests · ${killed}% killed</text>` : "");
-  });
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${marks}</svg>`;
-}
-
-function costChart(el, S) {
-  const esc = escHtml;
-  const types = S.types.slice().sort((a, b) =>
-    (a.work_cost ?? Infinity) - (b.work_cost ?? Infinity));
-  const full = Math.round(el.clientWidth || 760);
-  const label = 112, note = full > 560 ? 190 : 0;
-  const W = Math.max(300, full), rowH = 24, T = 6, B = 22;
-  const H = T + B + rowH * types.length;
-  const L0 = label, R = note + 12;
-  const hi = Math.max(0.001, ...types.map((t) => t.work_cost ?? 0)) * 1.12;
-  const x = (v) => L0 + (W - L0 - R) * v / hi;
-  const money = (v, d = 3) => "$" + v.toFixed(d);
-  let grid = "";
-  const step = niceStep(hi / 4);
-  for (let v = 0; v <= hi + 1e-9; v += step) {
+  const xs = niceStep((xhi - xlo) / 5);
+  for (let v = Math.ceil(xlo / xs) * xs; v <= xhi + 1e-9; v += xs) {
     grid += `<line class="grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/>` +
-      `<text class="axis" x="${x(v)}" y="${H - 6}" text-anchor="middle">${money(v, 2)}</text>`;
+      `<text class="axis" x="${x(v)}" y="${H - B + 16}" text-anchor="middle">${+v.toFixed(2)}×</text>`;
   }
-  let marks = "";
-  types.forEach((t, k) => {
-    const yc = T + rowH * k + rowH / 2;
-    marks += `<text class="axis" x="${L0 - 8}" y="${yc + 4}" text-anchor="end">${esc(t.cpu)}</text>`;
-    if (t.work_cost == null) {
-      marks += `<text class="axis" x="${x(0) + 4}" y="${yc + 4}">no recent price</text>`;
-      return;
+  grid += `<text class="axis" x="${(L0 + W - R) / 2}" y="${H - 2}" text-anchor="middle">test time relative to the fastest type</text>` +
+    `<text class="axis" x="12" y="${(T + H - B) / 2}" text-anchor="middle" transform="rotate(-90 12 ${(T + H - B) / 2})">price per slot-hour</text>`;
+  // curves of equal cost per hour of the fastest type's work, at round values
+  const costs = types.map((t) => t.work_cost);
+  // start at the cheapest type's round value, and space the curves so their labels,
+  // which converge on the right, stay apart
+  const half = niceStep((Math.max(...costs) - Math.min(...costs)) / 5 || 0.005);
+  let curves = "";
+  for (let c = Math.ceil(Math.min(...costs) / half) * half; c <= Math.max(...costs) + half; c += 2 * half) {
+    const pts = [];
+    for (let k = 0; k <= 60; k++) {
+      const f = xlo + (xhi - xlo) * k / 60, p = c / f;
+      if (p <= yhi) pts.push(`${x(f).toFixed(1)},${y(p).toFixed(1)}`);
     }
-    marks += `<rect x="${x(0)}" y="${yc - 7}" width="${x(t.work_cost) - x(0)}" height="14" rx="2" fill="var(--qviz-2)" fill-opacity="0.8"/>` +
-      `<text class="axis" x="${x(t.work_cost) + 6}" y="${yc + 4}">${money(t.work_cost, 4)}</text>` +
-      (note ? `<text class="axis" x="${W - note}" y="${yc + 4}">${money(t.slot_rate, 4)}/slot-h × ${t.factor.toFixed(2)}</text>` : "");
-  });
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${marks}</svg>`;
+    if (pts.length < 2) continue;
+    curves += `<polyline class="base" points="${pts.join(" ")}" fill="none"/>`;
+    curves += `<text class="axis" x="${W - R}" y="${y(c / xhi) - 4}" text-anchor="end">${money(c, 3)}</text>`;
+  }
+  const maxJobs = Math.max(1, ...types.map((t) => t.jobs));
+  let marks = "";
+  for (const t of types) {
+    const r = 4 + 10 * Math.sqrt(t.jobs / maxJobs);
+    const killed = t.jobs ? (100 * t.kills / t.jobs).toFixed(1) : "–";
+    const cx = x(t.factor), cy = y(t.slot_rate);
+    const left = cx > (L0 + W - R) / 2;
+    marks += `<g><title>${esc(t.cpu)}: ${t.factor.toFixed(2)}× test time, ${money(t.slot_rate, 4)}/slot-h, ` +
+      `${money(t.work_cost, 4)} per hour of work; ${t.jobs.toLocaleString("en-US")} tests, ${killed}% killed</title>` +
+      `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--qviz-1)" fill-opacity="0.75" stroke="var(--surface)"/>` +
+      `<text class="axis" x="${left ? cx - r - 4 : cx + r + 4}" y="${cy + 4}" text-anchor="${left ? "end" : "start"}"` +
+      ` style="fill: var(--ink-2)">${esc(t.cpu)}</text></g>`;
+  }
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${curves}${marks}</svg>` +
+    (unpriced.length ? `<p style="margin: 4px 0 0; color: var(--ink-3); font-size: 12.5px">No recent price for ${unpriced.map(esc).join(", ")}.</p>` : "");
 }
 
 // The fleet load chart. `L` is fleet/load.json (field names plus rows of
@@ -1794,21 +1784,7 @@ async function dashboard(params) {
   };
   // the Pages build rewrites daily/cpu_speed.json every few hours; it is fetched
   // once, when the section is first opened, and left out if it can't be read
-  let speed = null, speedTried = false, speedMode = "time";
-  const speedLede = {
-    time: "How long the same package's tests take on each worker CPU type, relative to the fastest " +
-      "type, from the passing tests of the last two weeks of dailies. The whisker spans the middle " +
-      "half of the tests; the share killed counts every test run on that type.",
-    cost: "What an hour of the fastest type's test work costs on each CPU type: the spot price of a " +
-      "slot-hour on the last three dailies, times how much longer the same tests take there.",
-  };
-  for (const b of $("speed-mode").querySelectorAll("button")) {
-    b.addEventListener("click", () => {
-      speedMode = b.dataset.mode;
-      for (const o of $("speed-mode").querySelectorAll("button")) o.setAttribute("aria-pressed", String(o === b));
-      drawSpeed();
-    });
-  }
+  let speed = null, speedTried = false;
   const drawSpeed = async () => {
     if (!speedTried) {
       speedTried = true;
@@ -1817,8 +1793,7 @@ async function dashboard(params) {
     if (!speed || !speed.types || !speed.types.length) return;
     $("speed-wrap").hidden = false;
     $("speed-n").textContent = `${speed.runs.length} dailies`;
-    $("speed-lede").textContent = speedLede[speedMode];
-    speedChart($("speed-chart"), speed, speedMode);
+    speedChart($("speed-chart"), speed);
   };
   $("load-block").addEventListener("toggle", drawLoad);
   const refreshLoad = async () => {
