@@ -657,9 +657,8 @@
         <h3 class="subhead">Speed and price by CPU type <span class="n" id="speed-n"></span></h3>
         <p class="lede">Each worker CPU type by how long the same package's tests take there, relative
           to the fastest type (from the passing tests of the last two weeks of dailies), and what a
-          slot-hour costs (spot prices on the last three dailies). Their product is what the same work
-          costs: types on one dashed curve cost the same per hour of the fastest type's work (labelled on the right). Point size is
-          the number of tests run on the type; hover a point for its numbers.</p>
+          slot-hour costs (spot prices on the last three dailies). Point size is the number of tests run
+          on the type; hover a point for its numbers.</p>
         <figure class="dchart" id="speed-chart" aria-label="Test time against slot price for each worker CPU type"></figure>
       </div>
     </details>
@@ -1373,7 +1372,13 @@ function speedChart(el, S) {
       `<text class="axis" x="${left ? cx - r - 4 : cx + r + 4}" y="${cy + 4}" text-anchor="${left ? "end" : "start"}"` +
       ` style="fill: var(--ink-2)">${esc(t.cpu)}</text></g>`;
   }
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${curves}${marks}</svg>` +
+  // how to read it, in the corners the points leave free
+  const notes = `<text class="axis" x="${W - R - 4}" y="${T + 12}" text-anchor="end" style="fill: var(--ink-2)">` +
+      (W > 640 ? `Along a dashed curve the same work costs the same; labels give $ per hour of the fastest type's work`
+               : `Dashed: equal cost for the same work`) + `</text>` +
+    `<text class="axis" x="${L0 + 6}" y="${H - B - 8}" style="fill: var(--ink-2)">` +
+      `↙ toward this corner: faster and cheaper</text>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${curves}${notes}${marks}</svg>` +
     (unpriced.length ? `<p style="margin: 4px 0 0; color: var(--ink-3); font-size: 12.5px">No recent price for ${unpriced.map(esc).join(", ")}.</p>` : "");
 }
 
