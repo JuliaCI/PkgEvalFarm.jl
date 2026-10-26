@@ -27,6 +27,10 @@
         precompile, derivation and run-setup jobs and the number of
         instances reporting them, then queued and held messages per
         queue); -1 marks a missing value
+    daily/cpu_speed.json              test time on each worker CPU type relative
+        to the fastest, fitted from the last two weeks of dailies, with the
+        recent spot cost of a slot-hour of each type and of an hour of the
+        fastest type's work (next to this page; daily/analyze.jl derives it)
 
   The landing page (no ?run=) lists runs from the DynamoDB table
   `pkgeval-runs` (us-east-2), which is anonymously readable: mint
@@ -640,7 +644,7 @@
       <div class="runidx-rows" id="runidx-active-rows"></div>
     </section>
     <details class="block load-block" id="load-block" hidden>
-      <summary>Fleet load <span class="n" id="load-sum"></span></summary>
+      <summary>Fleet info <span class="n" id="load-sum"></span></summary>
       <p class="lede">Job slots in use by kind of job, and vCPUs in use going by the workers' CPU
         use, against the fleet's capacity (one slot per vCPU, plus extra precompile slots).
         Sampled every 5 minutes; hover the chart to read an earlier sample.</p>
@@ -649,6 +653,14 @@
         <button type="button" data-days="14" aria-pressed="false">14 days</button>
       </div>
       <figure class="dchart" id="load-chart" aria-label="Job slots and vCPUs in use against fleet capacity over time"></figure>
+      <div id="speed-wrap" hidden>
+        <h3 class="subhead">Speed and price by CPU type <span class="n" id="speed-n"></span></h3>
+        <p class="lede">Each worker CPU type by how long the same package's tests take there, relative
+          to the fastest type (from the passing tests of the last two weeks of dailies), and what a
+          slot-hour costs (spot prices on the last three dailies). Point size is the number of tests run
+          on the type; hover a point for its numbers.</p>
+        <figure class="dchart" id="speed-chart" aria-label="Test time against slot price for each worker CPU type"></figure>
+      </div>
     </details>
     <section class="block">
       <h2>Recent runs <span class="n" id="runidx-n"></span></h2>
@@ -1304,6 +1316,72 @@ function loadSummary(L) {
   return busy + (queued ? ` · ${fmt(queued)} jobs queued` : "");
 }
 
+// Worker CPU types from daily/cpu_speed.json: test time relative to the fastest type
+// against the price of a slot-hour, with curves of equal cost for the same work
+// (time factor times price), and point area by the number of tests run on the type.
+function speedChart(el, S) {
+  const esc = escHtml;
+  const types = S.types.filter((t) => t.slot_rate != null);
+  const unpriced = S.types.filter((t) => t.slot_rate == null).map((t) => t.cpu);
+  const full = Math.round(el.clientWidth || 760);
+  const W = Math.max(300, full), H = 300, L0 = 64, R = 16, T = 12, B = 34;
+  const xlo = 0.8, xhi = Math.max(1.5, ...types.map((t) => t.factor)) * 1.1;
+  const yhi = Math.max(0.01, ...types.map((t) => t.slot_rate)) * 1.15;
+  const x = (v) => L0 + (W - L0 - R) * (v - xlo) / (xhi - xlo);
+  const y = (v) => T + (H - T - B) * (1 - v / yhi);
+  const money = (v, d) => "$" + v.toFixed(d);
+  let grid = "";
+  const ys = niceStep(yhi / 4);
+  for (let v = 0; v <= yhi + 1e-9; v += ys) {
+    grid += `<line class="grid" x1="${L0}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+      `<text class="axis" x="${L0 - 8}" y="${y(v) + 4}" text-anchor="end">${money(v, 3)}</text>`;
+  }
+  const xs = niceStep((xhi - xlo) / 5);
+  for (let v = Math.ceil(xlo / xs) * xs; v <= xhi + 1e-9; v += xs) {
+    grid += `<line class="grid" x1="${x(v)}" x2="${x(v)}" y1="${T}" y2="${H - B}"/>` +
+      `<text class="axis" x="${x(v)}" y="${H - B + 16}" text-anchor="middle">${+v.toFixed(2)}×</text>`;
+  }
+  grid += `<text class="axis" x="${(L0 + W - R) / 2}" y="${H - 2}" text-anchor="middle">test time relative to the fastest type</text>` +
+    `<text class="axis" x="12" y="${(T + H - B) / 2}" text-anchor="middle" transform="rotate(-90 12 ${(T + H - B) / 2})">price per slot-hour</text>`;
+  // curves of equal cost per hour of the fastest type's work, at round values
+  const costs = types.map((t) => t.work_cost);
+  // start at the cheapest type's round value, and space the curves so their labels,
+  // which converge on the right, stay apart
+  const half = niceStep((Math.max(...costs) - Math.min(...costs)) / 5 || 0.005);
+  let curves = "";
+  for (let c = Math.ceil(Math.min(...costs) / half) * half; c <= Math.max(...costs) + half; c += 2 * half) {
+    const pts = [];
+    for (let k = 0; k <= 60; k++) {
+      const f = xlo + (xhi - xlo) * k / 60, p = c / f;
+      if (p <= yhi) pts.push(`${x(f).toFixed(1)},${y(p).toFixed(1)}`);
+    }
+    if (pts.length < 2) continue;
+    curves += `<polyline class="base" points="${pts.join(" ")}" fill="none"/>`;
+    curves += `<text class="axis" x="${W - R}" y="${y(c / xhi) - 4}" text-anchor="end">${money(c, 3)}</text>`;
+  }
+  const maxJobs = Math.max(1, ...types.map((t) => t.jobs));
+  let marks = "";
+  for (const t of types) {
+    const r = 4 + 10 * Math.sqrt(t.jobs / maxJobs);
+    const killed = t.jobs ? (100 * t.kills / t.jobs).toFixed(1) : "–";
+    const cx = x(t.factor), cy = y(t.slot_rate);
+    const left = cx > (L0 + W - R) / 2;
+    marks += `<g><title>${esc(t.cpu)}: ${t.factor.toFixed(2)}× test time, ${money(t.slot_rate, 4)}/slot-h, ` +
+      `${money(t.work_cost, 4)} per hour of work; ${t.jobs.toLocaleString("en-US")} tests, ${killed}% killed</title>` +
+      `<circle cx="${cx}" cy="${cy}" r="${r}" fill="var(--qviz-1)" fill-opacity="0.75" stroke="var(--surface)"/>` +
+      `<text class="axis" x="${left ? cx - r - 4 : cx + r + 4}" y="${cy + 4}" text-anchor="${left ? "end" : "start"}"` +
+      ` style="fill: var(--ink-2)">${esc(t.cpu)}</text></g>`;
+  }
+  // how to read it, in the corners the points leave free
+  const notes = `<text class="axis" x="${W - R - 4}" y="${T + 12}" text-anchor="end" style="fill: var(--ink-2)">` +
+      (W > 640 ? `Along a dashed curve the same work costs the same; labels give $ per hour of the fastest type's work`
+               : `Dashed: equal cost for the same work`) + `</text>` +
+    `<text class="axis" x="${L0 + 6}" y="${H - B - 8}" style="fill: var(--ink-2)">` +
+      `↙ toward this corner: faster and cheaper</text>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img">${grid}${curves}${notes}${marks}</svg>` +
+    (unpriced.length ? `<p style="margin: 4px 0 0; color: var(--ink-3); font-size: 12.5px">No recent price for ${unpriced.map(esc).join(", ")}.</p>` : "");
+}
+
 // The fleet load chart. `L` is fleet/load.json (field names plus rows of
 // integers, time first, -1 for a missing value); `runs` are the runs-table
 // items. Job slots in use are stacked by kind of job, from the counts each
@@ -1707,6 +1785,20 @@ async function dashboard(params) {
     if (!$("load-block").open) return;
     loadWidth = $("load-chart").clientWidth;
     loadChart($("load-chart"), load, all, loadDays);
+    drawSpeed();
+  };
+  // the Pages build rewrites daily/cpu_speed.json every few hours; it is fetched
+  // once, when the section is first opened, and left out if it can't be read
+  let speed = null, speedTried = false;
+  const drawSpeed = async () => {
+    if (!speedTried) {
+      speedTried = true;
+      try { speed = await fetchJson("daily/cpu_speed.json"); } catch { /* the chart stays hidden */ }
+    }
+    if (!speed || !speed.types || !speed.types.length) return;
+    $("speed-wrap").hidden = false;
+    $("speed-n").textContent = `${speed.runs.length} dailies`;
+    speedChart($("speed-chart"), speed);
   };
   $("load-block").addEventListener("toggle", drawLoad);
   const refreshLoad = async () => {
