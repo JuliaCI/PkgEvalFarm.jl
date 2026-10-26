@@ -102,7 +102,7 @@ aws = MotoConfig("http://127.0.0.1:$port", "us-east-1",
         done = Ref(false)
         donors = Threads.Atomic{Int}(0)
         donations = Threads.Atomic{Int}(0)
-        PEF.SEAL_DONOR[] = function (want=nothing)
+        PEF.SEAL_DONOR[] = function (want=nothing, _=Int[])
             donors[] >= 8 && return
             Threads.atomic_add!(donors, 1)
             Threads.atomic_add!(donations, 1)

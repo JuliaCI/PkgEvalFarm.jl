@@ -116,10 +116,12 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # donor that runs one piece of seal-queue work, typically the very
     # derivation being waited on. That derivation is claimed directly when it
     # is still unclaimed, since its message may wait minutes for a host of its
-    # CPU type. CPU pinning is shared with a blocked process, so
-    # oversubscription is nominal.
+    # CPU type. The donor runs on the held sandbox's CPU, which that sandbox
+    # leaves idle, so the oversubscription is nominal. A hold whose sandbox is
+    # unknown donates to a CPU running no test, like spill.
+    load = CpuLoad(max(ninstances, 1))
     donors = Threads.Atomic{Int}(0)
-    SEAL_DONOR[] = function (want=nothing)
+    SEAL_DONOR[] = function (want=nothing, held_cpus=Int[])
         # The budget must count PARKED donors against something: a donated job
         # that itself holds keeps its donor slot for the whole hold, and with
         # a flat ninstances cap a few waves of chained holds consume the
@@ -134,9 +136,14 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
         errormonitor(@async try
             donated = want === nothing ? nothing : claim_derivation(ctx, want)
             donated === nothing && (donated = claim_seal_job(ctx))
-            donated isa ClaimedJob &&
-                process_job(ctx, donated, rand(0:max(ninstances - 1, 0)),
-                            run_cache, run_cache_lock)
+            if donated isa ClaimedJob
+                cpu = donor_cpu!(load, held_cpus)
+                try
+                    process_job(ctx, donated, cpu, run_cache, run_cache_lock)
+                finally
+                    vacate!(load, [cpu], :seal)
+                end
+            end
         catch err
             @warn "donor slot failed" err
         finally
@@ -159,14 +166,14 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # which caps utilization near 60% at one job per core. Spill tokens let
     # extra seal-queue jobs overlap those latency phases. Test jobs never run
     # on spill (their durations feed estimates and time limits, so they keep
-    # exclusive cores); CPU pinning collides nominally, exactly like the
-    # donor path below. The spill count is memory-bounded, not just CPU-bounded
-    # — see default_seal_spill.
+    # exclusive cores), and spill work is pinned to a CPU running no test
+    # while there is one. The spill count is memory-bounded, not just
+    # CPU-bounded — see default_seal_spill.
     nspill = sealing_enabled(ctx.cfg) && pkgeval_supports_seal() ?
              something(tryparse(Int, get(ENV, "PKGEVAL_SEAL_OVERCOMMIT", "")),
                        default_seal_spill(ninstances)) : 0
-    spill_cpus = Channel{Int}(max(nspill, 1))
-    foreach(c -> put!(spill_cpus, c % max(ninstances, 1)), 0:nspill-1)
+    spill_tokens = Channel{Nothing}(max(nspill, 1))
+    foreach(_ -> put!(spill_tokens, nothing), 1:nspill)
     busy = Threads.Atomic{Int}(0)         # running jobs (for drain/protection)
     fleet = fleet_drain_init(ninstances)  # nothing outside an EC2 ASG
     use = SlotUse()                       # vCPUs held, by kind of job
@@ -209,6 +216,8 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
             for (claimed, cpus, spill) in work
                 held = slot_counter(use, claimed)
                 Threads.atomic_add!(held, length(cpus))
+                kind = cpu_kind(claimed)
+                spill || occupy!(load, cpus, kind)   # spill CPUs are taken when picked
                 try
                     if claimed isa ClaimedExpand
                         process_expand(ctx, claimed)
@@ -218,11 +227,12 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                     end
                 finally
                     Threads.atomic_sub!(held, length(cpus))
+                    vacate!(load, cpus, kind)
                     lock(claims_lock) do
                         delete!(active_claims, claimed.receipt_handle)
                     end
                     Threads.atomic_sub!(busy, 1)
-                    foreach(c -> put!(spill ? spill_cpus : free_cpus, c), cpus)
+                    spill ? put!(spill_tokens, nothing) : foreach(c -> put!(free_cpus, c), cpus)
                 end
             end
         end)
@@ -268,6 +278,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                         stop_hb()
                     end
                 end
+                cpu_kind(claimed) === :test && (cpus = prefer_quiet_cpus!(free_cpus, cpus, load))
                 Threads.atomic_add!(busy, 1)
                 lock(claims_lock) do
                     active_claims[claimed.receipt_handle] = claimed
@@ -283,7 +294,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # so overcommit can never bleed into test/expand claims. Dies with `work`.
     spill_receiver = errormonitor(@async begin
         while nspill > 0 && !draining[] && isopen(work)
-            cpu = take!(spill_cpus)
+            take!(spill_tokens)
             claimed = try
                 draining[] ? nothing : claim_seal_job(ctx)
             catch err
@@ -292,10 +303,11 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                 nothing
             end
             if claimed === nothing
-                put!(spill_cpus, cpu)
+                put!(spill_tokens, nothing)
                 sleep(3)   # claim_seal_job long-polls 1s; don't hammer an empty queue
                 continue
             end
+            cpu = quiet_cpu!(load)
             Threads.atomic_add!(busy, 1)
             lock(claims_lock) do
                 active_claims[claimed.receipt_handle] = claimed
@@ -306,6 +318,7 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
                 # the main receiver closed `work` while we were claiming:
                 # hand the message straight back and stop
                 err isa InvalidStateException || rethrow()
+                vacate!(load, [cpu], :seal)
                 Threads.atomic_sub!(busy, 1)
                 lock(() -> delete!(active_claims, claimed.receipt_handle), claims_lock)
                 release_job(ctx, claimed; delay=0)
@@ -593,6 +606,69 @@ function slot_counter(use::SlotUse, claimed)
     return use.test
 end
 
+"Jobs running on each CPU, with tests counted apart from seal-queue work."
+struct CpuLoad
+    tests::Vector{Int}
+    seal::Vector{Int}
+    lock::ReentrantLock
+end
+CpuLoad(n::Int) = CpuLoad(zeros(Int, n), zeros(Int, n), ReentrantLock())
+
+cpu_kind(claimed) =
+    claimed isa ClaimedExpand ? :expand :
+    is_seal_job(claimed.job) || is_derivation_job(claimed.job) ? :seal : :test
+
+function occupy!(load::CpuLoad, cpus, kind::Symbol, by::Int=1)
+    kind === :expand && return   # an expansion runs no sandbox
+    counts = kind === :test ? load.tests : load.seal
+    lock(() -> foreach(c -> counts[c+1] += by, cpus), load.lock)
+    return
+end
+vacate!(load::CpuLoad, cpus, kind::Symbol) = occupy!(load, cpus, kind, -1)
+
+"""
+Pick and occupy a CPU for seal-queue work that has no core of its own (spill,
+and donors for a hold whose sandbox is unknown). Test durations feed estimates
+and time limits, so this takes the CPU with the least seal work among those
+running no test. Only when every CPU runs a test does it share one, the least
+loaded.
+"""
+function quiet_cpu!(load::CpuLoad)
+    c = lock(load.lock) do
+        all_cpus = eachindex(load.tests)
+        idle = filter(c -> load.tests[c] == 0, all_cpus)
+        pool = isempty(idle) ? all_cpus : idle
+        argmin(c -> load.tests[c] + load.seal[c], pool) - 1
+    end
+    occupy!(load, (c,), :seal)
+    return c
+end
+
+"The CPU for a donor: one of the held sandbox's when known, else a quiet one."
+function donor_cpu!(load::CpuLoad, held_cpus::Vector{Int})
+    isempty(held_cpus) && return quiet_cpu!(load)
+    c = rand(held_cpus)
+    occupy!(load, (c,), :seal)
+    return c
+end
+
+"""
+Swap a test job's CPUs for free ones carrying less seal work, so a test does
+not start where spill or donor jobs already run. The receiver is the only one
+taking from `free`, so emptying it here races with nothing.
+"""
+function prefer_quiet_cpus!(free::Channel{Int}, cpus::Vector{Int}, load::CpuLoad)
+    isready(free) || return cpus
+    pool = copy(cpus)
+    while isready(free)
+        push!(pool, take!(free))
+    end
+    seal = lock(() -> copy(load.seal), load.lock)
+    sort!(pool; by=c -> seal[c+1])   # stable: ties keep the CPUs already taken
+    foreach(c -> put!(free, c), pool[length(cpus)+1:end])
+    return pool[1:length(cpus)]
+end
+
 # jobs-table partition holding one slot-use record per EC2 instance
 const SLOT_USE_RUN = "_fleet"
 
@@ -863,7 +939,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
     stop_heartbeat = start_heartbeat(ctx, claimed, job.package)
     # names this evaluation to the cache proxy, which accounts its held fetches
     held_job = string(rand(UInt64); base=16)
-    register_held!(held_job)
+    register_held!(held_job; cpus=something(cpus, [cpu]))
 
     result = try
         config = job_config(ctx, job, run_cache, run_cache_lock)
