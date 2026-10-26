@@ -927,6 +927,9 @@ job_width(job::JobRef, ninstances::Int) =
     is_seal_job(job) || is_derivation_job(job) ? 1 :
     min(get(WIDE_PACKAGES, job.package, 1), ninstances)
 
+pkgeval_supports_skip_list_override() =
+    any(m -> :use_skip_list in Base.kwarg_decl(m), methods(PkgEval.evaluate_job))
+
 function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                      run_cache, run_cache_lock;
                      cpus::Union{Nothing,Vector{Int}}=nothing)
@@ -949,6 +952,11 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         if job.package in job_run(ctx, job, run_cache, run_cache_lock)["unreliable"]
             config = PkgEval.Configuration(config; goal=:load)
         end
+        # a run that names its packages tests them even if they are on PkgEval's skip list
+        named = !isempty(job_run(ctx, job, run_cache, run_cache_lock)["packages"]) &&
+                pkgeval_supports_skip_list_override()
+        skip_listed = named && job.package in PkgEval.skip_list &&
+                      !(job.package in PkgEval.important_list)
         # a retry after an errored attempt skips the package cache: cache interactions
         # are the most likely source of irreproducible failures (mirrors evaluate()'s
         # retry behavior). The seal gate and cache protocol are skipped too, for the
@@ -988,8 +996,13 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
         held_kwargs = holds && pkgeval_supports_held_time() ?
             (; held_time=() -> held_seconds(held_job), max_held_time=held_time_cap()) : (;)
         r = PkgEval.evaluate_job(config, PkgEval.Package(; name=job.package);
-                                 use_cache, sealed_kwargs..., held_kwargs...)
+                                 use_cache, sealed_kwargs..., held_kwargs...,
+                                 (named ? (; use_skip_list=false) : (;))...)
         logtext = r.log === missing ? nothing : String(r.log)
+        if skip_listed && logtext !== nothing
+            logtext *= "\n[pkgeval-farm] this package is on PkgEval's skip list; " *
+                       "it was tested because the run named it\n"
+        end
         held = holds ? held_seconds(held_job) : nothing
         if held !== nothing && held >= 1 && logtext !== nothing
             logtext *= "\n[pkgeval-farm] cache fetches were held for $(round(Int, held)) s" *
@@ -1020,7 +1033,7 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
                   slots=cpus === nothing ? 1 : length(something(cpus)),
                   # haskey: tolerate a PkgEval pinned before peak_rss existed
                   peak_rss=haskey(r, :peak_rss) && r.peak_rss > 0 ? Int(r.peak_rss) : nothing,
-                  held, log=logtext)
+                  held, skip_listed, log=logtext)
     catch err
         if err isa PkgEval.MissingStagedBuild
             # not a job failure: the Julia under test needs building. Ask CI

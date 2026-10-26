@@ -236,6 +236,8 @@ Base.@kwdef struct JobResult
     # seconds the proxy held the evaluation's cache fetches; nothing when the
     # evaluation did not use the cache protocol
     held::Union{Float64,Nothing} = nothing
+    # on PkgEval's skip list, but tested because the run named the package
+    skip_listed::Bool = false
     log::Union{String,Nothing} = nothing  # uploaded to S3, not stored in DynamoDB
 end
 

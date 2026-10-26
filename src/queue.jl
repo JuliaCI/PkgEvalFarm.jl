@@ -194,7 +194,8 @@ are never reused, nor are the loads of a donor's unreliable packages, which
 can't stand in for a test. Any other load is a package without tests, which
 loading evaluates fully, so it is reused like real results (fail/crash/kill
 included). Skips for having no tests predate such packages being loaded, so
-they are not reused either.
+they are not reused either. Nor are skip-list skips when the run names its
+packages, since those runs test skip-listed packages.
 """
 function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{String},
                              completed::Vector{<:Tuple}=completed_runs(ctx);
@@ -218,6 +219,7 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
     isempty(donors) && return none
 
     wanted = Set(packages)
+    named = !isempty(get(run, "packages", []))
     results = Dict{String,Dict{String,Any}}()
     used = String[]
     # each donor read fetches all of its jobs, so bound how far back we look
@@ -232,6 +234,7 @@ function baseline_reuse_plan(ctx::FarmCtx, run::AbstractDict, packages::Vector{S
             status in TERMINAL_STATUSES && status != "error" || continue
             status == "load" && pkg in donor_unreliable && continue
             status == "skip" && get(job, "reason", "") == "untestable" && continue
+            status == "skip" && get(job, "reason", "") == "blacklisted" && named && continue
             results[pkg] = job
             found = true
         end
@@ -931,7 +934,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                        "cpu = :cpu" *
                                        (line === nothing ? "" : ", error_line = :error_line") *
                                        (lines === nothing ? "" : ", error_lines = :error_lines") *
-                                       (pass_sigs === nothing ? "" : ", pass_sigs = :pass_sigs"),
+                                       (pass_sigs === nothing ? "" : ", pass_sigs = :pass_sigs") *
+                                       (result.skip_listed ? ", skip_listed = :skip_listed" : ""),
                  "ExpressionAttributeNames" => Dict("#s" => "status", "#d" => "duration"),
                  "ExpressionAttributeValues" => ddb_item(Dict(
                      ":running" => "running", ":status" => result.status,
@@ -956,7 +960,8 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                      ":log_key" => key,
                      (line === nothing ? () : ((":error_line" => line),))...,
                      (lines === nothing ? () : ((":error_lines" => lines),))...,
-                     (pass_sigs === nothing ? () : ((":pass_sigs" => pass_sigs),))...)))),
+                     (pass_sigs === nothing ? () : ((":pass_sigs" => pass_sigs),))...,
+                     (result.skip_listed ? ((":skip_listed" => true),) : ())...)))),
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,
                  "Key" => ddb_item(Dict("run_id" => job.run_id)),
