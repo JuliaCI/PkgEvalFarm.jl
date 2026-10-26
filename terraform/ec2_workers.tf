@@ -1,8 +1,9 @@
 # Optional EC2 worker capacity (testing and burst), as a spot-first auto-scaling
 # group that scales itself off the job queue. Capacity is denominated in job
 # slots (= vCPUs; the mixed-instances overrides are weighted accordingly), so
-# the fleet may mix instance sizes and the spot allocator picks pools by price
-# per slot. Enable by setting the slot ceiling (`ec2_worker_max = 128`);
+# the fleet may mix instance sizes. The spot allocator takes the instance types
+# in the order they are listed, skipping pools short of capacity. Enable by
+# setting the slot ceiling (`ec2_worker_max = 128`);
 # scaling within [ec2_worker_min, max] is then automatic:
 #
 #   - scale-out is proportional to the queue backlog per in-service slot
@@ -303,7 +304,7 @@ resource "aws_autoscaling_group" "ec2_worker" {
   }
   # capacity is denominated in job slots (= vCPUs), not instances: every
   # override below carries its vCPU count as its weight, so the group may mix
-  # sizes and the allocator compares pools by price *per slot*
+  # sizes
   min_size            = var.ec2_worker_min
   max_size            = var.ec2_worker_max
   desired_capacity    = var.ec2_worker_min
@@ -325,10 +326,13 @@ resource "aws_autoscaling_group" "ec2_worker" {
   protect_from_scale_in = true
 
   mixed_instances_policy {
+    # Take the types in list order, which favors few time-limit kills and fast
+    # runs over the lowest price. Capacity still comes first: a pool short of
+    # room is skipped.
     instances_distribution {
       on_demand_base_capacity                  = 0
       on_demand_percentage_above_base_capacity = var.ec2_worker_on_demand_percent
-      spot_allocation_strategy                 = "price-capacity-optimized"
+      spot_allocation_strategy                 = "capacity-optimized-prioritized"
     }
     launch_template {
       launch_template_specification {
@@ -339,9 +343,8 @@ resource "aws_autoscaling_group" "ec2_worker" {
         for_each = var.ec2_worker_instance_types
         content {
           instance_type = override.value
-          # weight = vCPUs: capacity units become job slots, and the spot
-          # allocator normalizes pool prices to price-per-slot, so it picks a
-          # 24xlarge over an 8xlarge exactly when it is cheaper per vCPU
+          # weight = vCPUs: capacity units become job slots. Don't encode
+          # preference here; the worker reads the weight as its slot count.
           weighted_capacity = tostring(data.aws_ec2_instance_type.worker[override.value].default_vcpus)
           # classified from the instance-type data, never a hand-kept list:
           # types with local disks boot the variant without provisioned gp3

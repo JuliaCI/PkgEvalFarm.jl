@@ -119,28 +119,28 @@ variable "ec2_worker_idle_minutes" {
 }
 
 variable "ec2_worker_instance_types" {
-  description = "Instance types the spot fleet may use; sizes may be mixed freely (the ASG weights each by its vCPUs, and the scheduler is size-aware). 4 GB/vCPU recommended (heavy package tests) and x86 only (the sysimage and result comparability assume it). More entries = deeper spot pools; the allocator picks by price-per-slot among well-capacitized pools, so cheap large sizes are used exactly when they are actually cheaper."
+  description = "Instance types the spot fleet may use, in order of preference (the allocator is capacity-optimized-prioritized). Sizes may be mixed freely (the ASG weights each by its vCPUs, and the scheduler is size-aware). 4 GB/vCPU or more (heavy package tests) and x86 only (the sysimage and result comparability assume it). The order aims for few time-limit kills and fast runs at a similar cost per unit of work: test time per slot differs up to about 3x across CPU generations."
   type        = list(string)
   default = [
-    # every variant family (d/n/dn/ad, id/in) is a *separate* spot pool with
-    # identical compute — free depth against regional capacity crunches
-    # (observed live: UnfulfillableCapacity across the narrower list while a
-    # 24k-job backlog waited). r-types trade a higher price for 8 GB/vCPU and
-    # yet more pools; 4xlarge sizes let the allocator scrounge partial
-    # capacity when no full 8xlarge pool has room.
-    "m6a.8xlarge", "m6i.8xlarge", "m5a.8xlarge", "m7a.8xlarge", "m7i.8xlarge", "m5.8xlarge",
-    "m5d.8xlarge", "m5n.8xlarge", "m5dn.8xlarge", "m5ad.8xlarge",
-    "m6id.8xlarge", "m6in.8xlarge", "m6idn.8xlarge",
-    "r6a.8xlarge", "r5.8xlarge", "r6i.8xlarge", "r5a.8xlarge",
-    "m6a.4xlarge", "m6i.4xlarge", "m5.4xlarge", "m7a.4xlarge",
-    "m6a.12xlarge", "m7a.12xlarge", "m5ad.12xlarge", "r6a.12xlarge",
-    "m6a.16xlarge", "m7a.16xlarge", "m5a.16xlarge", "m5dn.16xlarge", "r6a.16xlarge",
-    "m6a.24xlarge", "m7a.24xlarge", "m5a.24xlarge", "m5ad.24xlarge", "m5dn.24xlarge", "r6a.24xlarge",
-    "m6a.32xlarge", "m7a.32xlarge",
-    "m6a.48xlarge", "m7a.48xlarge",
-    # deliberately absent: m4/r4 (older cores make the sticker discount a
-    # mirage per unit of work), .metal (boot quirks, no price edge), and the
-    # pricier r5d/r5n/r5dn sizes — the ASG caps overrides at 40, so triage
+    # m7a (znver4) runs tests fastest and has the fewest time-limit kills.
+    # r7a is the same CPU with 8 GB/vCPU: dearer, but more pools of it.
+    # m6a/r6a (znver3) cost about as much per unit of work, sometimes less,
+    # but take about 1.6x as long and have about twice the kill rate.
+    # icelake (m6i/r6i) is about as slow. m7i (sapphirerapids) is fast but
+    # the dearest per unit of work, so it comes last.
+    # Each size and variant (d/n/dn) is a separate spot pool, which helps in a
+    # regional capacity crunch (UnfulfillableCapacity has been seen live).
+    "m7a.8xlarge", "m7a.12xlarge", "m7a.16xlarge", "m7a.24xlarge", "m7a.32xlarge", "m7a.48xlarge", "m7a.4xlarge",
+    "r7a.8xlarge", "r7a.12xlarge", "r7a.16xlarge", "r7a.24xlarge",
+    "m6a.8xlarge", "m6a.12xlarge", "m6a.16xlarge", "m6a.24xlarge", "m6a.32xlarge", "m6a.48xlarge", "m6a.4xlarge",
+    "r6a.8xlarge", "r6a.12xlarge", "r6a.16xlarge", "r6a.24xlarge",
+    "m6i.8xlarge", "m6id.8xlarge", "m6in.8xlarge", "m6idn.8xlarge", "m6i.4xlarge",
+    "r6i.8xlarge",
+    "m7i.8xlarge", "m7i.12xlarge", "m7i.16xlarge", "m7i.24xlarge", "m7i.48xlarge", "m7i.4xlarge",
+    # deliberately absent: m5/r5 and their d/n/dn variants (skylake and
+    # cascadelake, tests take about 2x as long as on znver4), m5a/r5a/m5ad
+    # (znver1, about 2.9x and the most time-limit kills), m4/r4, and .metal
+    # (boot quirks, no price edge). The ASG caps overrides at 40.
   ]
 }
 
