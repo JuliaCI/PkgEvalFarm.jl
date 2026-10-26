@@ -11,7 +11,8 @@
 #                     ways Nanosoldier's charts did
 #   unreliable.json   packages that fail too often to be worth testing on PR runs
 #   cpu_speed.json    test time on each worker CPU type relative to the fastest, from the
-#                     passing tests of the last two weeks of dailies
+#                     passing tests of the last two weeks of dailies, and what a slot-hour
+#                     of each type cost on the last few
 #
 # This ports NanosoldierReports' tools/pkgeval_analysis, which did the same for
 # Nanosoldier's dailies. Summaries are immutable once published, so they are cached.
@@ -311,6 +312,26 @@ function cpu_speed(reports; min_duration=60, iterations=20)
                   for (type, rs) in residuals]; by=t -> t["factor"])
 end
 
+# What a slot-hour cost on each CPU type, from the per-job records of the last `days`
+# dailies. A worker prices its slots at the spot price it started at, and a job's cost
+# is its wall time at that rate; reused baselines carry no cost and are skipped.
+function slot_rates(dailies, cache; days=3)
+    rates = Dict{String,Vector{Float64}}()
+    for daily in dailies[max(1, end - days + 1):end]
+        file = joinpath(cache, "$(daily.run)-db.json")
+        text = isfile(file) ? read(file, String) : fetch_text("$FARM/runs/$(daily.run)/report/db.json")
+        text === nothing && continue
+        db = JSON.parse(text; dicttype=Dict{String,Any})
+        get(db["run"], "in_progress", false) === true || isfile(file) || write(file, text)
+        for job in db["jobs"]
+            cost, wall, cpu = get(job, "cost", nothing), get(job, "wall", nothing), get(job, "cpu", nothing)
+            (cost isa Real && wall isa Real && wall > 30 && cpu isa AbstractString) || continue
+            push!(get!(rates, String(cpu), Float64[]), cost * 3600 / wall)
+        end
+    end
+    return Dict(cpu => median(rs) for (cpu, rs) in rates)
+end
+
 function main(out, cache=joinpath(@__DIR__, ".cache"))
     mkpath(out)
     dailies = load_dailies(cache)
@@ -323,9 +344,17 @@ function main(out, cache=joinpath(@__DIR__, ".cache"))
         "generated" => string(now(UTC)), "window_days" => 30, "min_tests" => 5,
         "min_failure_ratio" => 0.75, "unreliable" => unreliable_packages(dailies))))
     reports = load_reports(dailies, cache)
+    types = cpu_speed(reports)
+    rates = slot_rates(dailies, cache)
+    for t in types
+        rate = get(rates, t["cpu"], nothing)
+        t["slot_rate"] = rate
+        # dollars for an hour of test work on the fastest type
+        t["work_cost"] = rate === nothing ? nothing : rate * t["factor"]
+    end
     write(joinpath(out, "cpu_speed.json"), JSON.json(Dict(
         "generated" => string(now(UTC)), "runs" => [r["run"]["id"] for r in reports],
-        "types" => cpu_speed(reports))))
+        "types" => types)))
     @info "analyzed daily runs" n=length(dailies)
 end
 
