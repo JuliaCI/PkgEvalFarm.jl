@@ -1156,7 +1156,9 @@ try
             for attempt in 1:10   # random ports collide occasionally; retry
                 p = rand(30001:40000)
                 try
-                    srv = TestHTTP.serve!(router, "127.0.0.1", p)
+                    # some routes are registered after the server starts; HTTP 2
+                    # would call them from an older world age without this
+                    srv = TestHTTP.serve!(req -> Base.invokelatest(router, req), "127.0.0.1", p)
                     break
                 catch err
                     attempt == 10 && rethrow()
