@@ -618,7 +618,8 @@ nanosoldier_status(status::String) =
 # The daily's shared failure signatures, over all its hard failures rather than only
 # the new ones: `hard` failures in all, `lines` of them with a signature line, and the
 # clusters of more than one package, most common first, each listing its packages
-# and their log keys.
+# and their log keys. A cluster's `key` is its normalized line, which stays the same
+# from day to day while the first raw line seen can differ.
 function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,String}},
                                 logs::Vector{String})
     labels, counts, members = cluster_signatures(lines)
@@ -627,7 +628,8 @@ function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,St
     for i in eachindex(labels)
         counts[i] > 1 || break
         i == 1 || print(io, ",")
-        print(io, "{\"label\":", JSON.json(labels[i]), ",\"n\":", string(counts[i]),
+        print(io, "{\"label\":", JSON.json(labels[i]), ",\"key\":", JSON.json(signature_key(labels[i])),
+              ",\"n\":", string(counts[i]),
               ",\"packages\":[")
         first_pkg = true
         for (j, (pkg, _)) in enumerate(lines)

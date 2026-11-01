@@ -421,6 +421,7 @@ end
     ds = JSON.parse("{" * String(take!(io))[2:end] * "}")["signatures"]
     @test ds["hard"] == 5 && ds["lines"] == 3
     @test only(ds["clusters"])["n"] == 2  # the single-package one is left out
+    @test only(ds["clusters"])["key"] == "ERROR: UndefVarError: `x` not defined"
     @test only(ds["clusters"])["packages"] ==
           [Dict("name" => "A", "log" => "runs/R/logs/primary/A.log"),
            Dict("name" => "C", "log" => "runs/R/logs/primary/C.2.log")]
