@@ -408,6 +408,20 @@
   }
   .sigrow .sg { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
   .sigrow.rest .sg { font-family: inherit; font-style: italic; }
+  .sigd { border-top: 1px solid var(--hairline); }
+  .sigd:first-child { border-top: none; }
+  .sigd > summary { display: flex; align-items: baseline; gap: 12px; padding: 7px 16px;
+    cursor: pointer; font-size: 13px; list-style: none; }
+  .sigd > summary::-webkit-details-marker { display: none; }
+  .sigd > summary:hover { background: var(--surface-2); }
+  .sigd .cnt { flex: none; min-width: 34px; text-align: right; font-weight: 700;
+    font-variant-numeric: tabular-nums; color: var(--ink); }
+  .sigd .sg { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--ink-2);
+    overflow-wrap: anywhere; min-width: 0; }
+  .sigd .pk { padding: 2px 16px 10px 62px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+  .sigd .pk a { margin-right: 10px; }
+  .sigmore { display: block; width: 100%; padding: 8px 16px; border: none; border-top: 1px solid var(--hairline);
+    background: none; color: var(--accent); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 
   .triagebar {
     display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
@@ -697,11 +711,16 @@
         daily tested; <b>all versions</b> also chains in versions tested on earlier dailies.</p>
       <figure class="dchart" id="daily-time" aria-label="Relative package test time per daily run"></figure>
     </section>
-    <section class="block">
-      <h2>Unreliable packages <span class="n" id="daily-unrel-n"></span></h2>
+    <section class="block" id="daily-sigs" hidden>
+      <h2>Common failure signatures <span class="n" id="daily-sigs-n"></span></h2>
+      <p class="lede" id="daily-sigs-lede"></p>
+      <div class="sigpanel" id="daily-sigs-list"></div>
+    </section>
+    <details class="block load-block">
+      <summary>Unreliable packages <span class="n" id="daily-unrel-n"></span></summary>
       <p class="lede" id="daily-unrel-lede"></p>
       <ul class="unrel mono" id="daily-unrel"></ul>
-    </section>
+    </details>
     <details class="block">
       <summary>Data table</summary>
       <div class="dtable-wrap" id="daily-table"></div>
@@ -1115,6 +1134,9 @@ async function dailyView(params) {
     return r ? ` The run <a class="mono" href="?run=${encodeURIComponent(r.run_id)}" target="_self">` +
       `${esc(r.run_id)}</a> is in progress${jobsDone(r)}.` : "";
   });
+  // the newest daily's failure signatures are optional: older builds of the
+  // site data don't have them, and the rest of the page doesn't need them
+  const sigsP = fetchJson("daily/signatures.json").catch(() => null);
   let index, perf, unrel;
   try {
     [index, perf, unrel] = await Promise.all(
@@ -1183,6 +1205,33 @@ async function dailyView(params) {
     `of at least ${unrel.min_tests} dailies in the last ${unrel.window_days} days. ` +
     `PR runs only install and load these, since their failures say little about the change being tested.`;
   $("daily-unrel").innerHTML = unrel.unreliable.map((p) => `<li>${esc(p)}</li>`).join("");
+
+  const sigs = await sigsP;
+  if (sigs && sigs.clusters && sigs.clusters.length) {
+    const bucket = bucketUrl(params);
+    const shared = sigs.clusters.reduce((t, c) => t + c.n, 0);
+    const SHOWN = 25;
+    $("daily-sigs").hidden = false;
+    $("daily-sigs-n").textContent = fmtN(sigs.clusters.length);
+    $("daily-sigs-lede").innerHTML =
+      `The first meaningful error line of each failing package in the ` +
+      `<a href="?run=${encodeURIComponent(sigs.run)}" target="_self">${esc(sigs.date)} daily</a>, ` +
+      `grouped when packages share it. ${fmtN(shared)} of its ${fmtN(sigs.hard)} failures and crashes ` +
+      `fall in these groups; ${fmtN(sigs.lines - shared)} have an error line of their own, and ` +
+      `${fmtN(sigs.hard - sigs.lines)} have none recorded. Click a line to list its packages.`;
+    const row = (c) => `<details class="sigd"><summary><span class="cnt">${fmtN(c.n)}</span>` +
+      `<span class="sg">${esc(c.label)}</span></summary><div class="pk mono">${
+        c.packages.map((p) => p.log ? `<a href="${esc(bucket + "/" + p.log)}">${esc(p.name)}</a>`
+                                    : `<span>${esc(p.name)}</span>`).join(" ")}</div></details>`;
+    const list = $("daily-sigs-list");
+    list.innerHTML = sigs.clusters.slice(0, SHOWN).map(row).join("") +
+      (sigs.clusters.length > SHOWN ? `<button class="sigmore" type="button">` +
+        `Show all ${fmtN(sigs.clusters.length)} signatures</button>` : "");
+    list.querySelector(".sigmore")?.addEventListener("click", (e) => {
+      e.currentTarget.insertAdjacentHTML("beforebegin", sigs.clusters.slice(SHOWN).map(row).join(""));
+      e.currentTarget.remove();
+    });
+  }
 
   const perfBy = new Map(perf.map((p) => [p.date, p]));
   const ratio = (x) => x === null || x === undefined ? "" : x.toFixed(3);
@@ -2379,7 +2428,8 @@ function main(D) {
   // log-tail drawer: fetched on demand from the bucket (same origin)
   const ANSI = /\x1b\[[0-9;]*[A-Za-z]|\r/g;
   const GENERIC = ["Some tests did not pass", "errored during testing", "/proc/self/stat",
-                   "failed process", "Test run finished", "ProcessExited"];
+                   "failed process", "Test run finished", "ProcessExited",
+                   "There was an error during testing"];
   // the full (cleaned) tail plus the index of the first line worth jumping to
   const analyzeTail = (text) => {
     const lines = text.replace(ANSI, "").split("\n");
@@ -2397,6 +2447,7 @@ function main(D) {
             !GENERIC.some((gskip) => l.includes(gskip))) { hit = i; break; }
       }
     }
+    if (hit < 0) hit = lines.findIndex((l) => l.includes("Error During Test at"));
     if (hit < 0) hit = lines.findIndex((l) => l.includes("Test Failed at"));
     return { lines, hit };
   };

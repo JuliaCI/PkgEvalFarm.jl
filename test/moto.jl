@@ -1498,12 +1498,16 @@ try
             # a finished daily publishes its primary results in Nanosoldier's db.json shape
             for (config, pkg, status, reason, version) in
                     (("primary", "Good", "test", nothing, "1.2.3"), ("primary", "Loads", "load", nothing, "0.1.0"),
-                     ("primary", "Broken", "error", "worker_exception", nothing), ("against", "Good", "fail", "test_failures", "1.2.3"))
+                     ("primary", "Broken", "error", "worker_exception", nothing), ("against", "Good", "fail", "test_failures", "1.2.3"),
+                     ("primary", "Bad", "fail", "test_errors", "2.0.0"), ("primary", "Worse", "fail", "test_errors", "2.0.0"))
                 Dynamodb.put_item(PEF.ddb_item(Dict{String,Any}(
                         "run_id" => "daily-2026-01-01", "job_key" => "$config#$pkg", "config" => config,
                         "package" => pkg, "status" => status, "duration" => 12.5,
                         (reason === nothing ? () : ("reason" => reason,))...,
-                        (version === nothing ? () : ("version" => version,))...)),
+                        (version === nothing ? () : ("version" => version,))...,
+                        (config == "primary" && status == "fail" ?
+                         ("error_line" => "KeyError: key 1 not found",
+                          "log_key" => "runs/daily-2026-01-01/logs/primary/$pkg.log") : ())...)),
                     cfg.jobs_table; aws_config=aws)
             end
             PEF.FarmBot.publish_daily_summary(lite, something(PEF.FarmBot.find_run(lite, "daily-2026-01-01")))
@@ -1511,12 +1515,18 @@ try
                 PEF.report_key("daily-2026-01-01", "daily.json"), Dict("return_raw" => true); aws_config=aws))))
             @test summary["date"] == "2026-01-01"
             @test summary["build"]["sha"] == "1" ^ 40 && summary["build"]["repo"] == "JuliaLang/julia"
-            @test sort(collect(keys(summary["tests"]))) == ["Broken", "Good", "Loads"]  # primary only
+            @test sort(collect(keys(summary["tests"]))) == ["Bad", "Broken", "Good", "Loads", "Worse"]  # primary only
             @test summary["tests"]["Good"] == Dict("status" => "test", "reason" => nothing,
                                                    "duration" => 12.5, "version" => "1.2.3")
             @test summary["tests"]["Loads"]["status"] == "test"
             @test summary["tests"]["Broken"]["status"] == "fail"
             @test summary["tests"]["Broken"]["reason"] == "worker_exception"
+            # failures carry their error line, and shared ones are grouped
+            @test summary["tests"]["Bad"]["error"] == "KeyError: key 1 not found"
+            @test !haskey(summary["tests"]["Broken"], "error")
+            @test summary["signatures"]["hard"] == 2 && summary["signatures"]["lines"] == 2
+            @test only(summary["signatures"]["clusters"])["packages"] ==
+                  [Dict("name" => p, "log" => "runs/daily-2026-01-01/logs/primary/$p.log") for p in ("Bad", "Worse")]
             @test PEF.get_run(ctx, "daily-2026-01-01")["daily_published"] == true
             # a finished daily whose summary wasn't published is caught up by the hourly poll
             Dynamodb.update_item(PEF.ddb_item(Dict("run_id" => "daily-2026-01-03")), cfg.runs_table,

@@ -25,7 +25,7 @@ end
     day(i, statuses) = DA.Daily(Date(2026, 10, 1) + Day(i), "daily-$i", "sha$i", "1.14.0-DEV",
         Dict{String,Any}(pkg => Dict{String,Any}("status" => st, "version" => "1.0.0",
                                                  "duration" => 1.0)
-                         for (pkg, st) in statuses))
+                         for (pkg, st) in statuses), nothing)
     normal(i) = day(i, [["P$k" => "test" for k in 1:10]; "Bad" => "fail"; "Skipped" => "skip"])
 
     @testset "fluke days" begin
@@ -135,6 +135,25 @@ end
         @test length(elc(join(["ERROR: e$i" for i in 1:10], '\n'); limit=4)) == 4
         # error_line stays the first candidate
         @test el("ERROR: a\nERROR: b\n") == "ERROR: a"
+        # a test that threw is known by its exception's message, past the
+        # tested expression; other test errors keep their location line
+        @test el("""
+                 printf: Error During Test at /pkg/test/runtests.jl:11
+                   Test threw exception
+                   Expression: f(x) == 1
+                   UndefVarError: `artifact_dir` not defined in `Clang_jll`
+                   Stacktrace:
+                 ERROR: LoadError: Some tests did not pass: 0 passed, 0 failed, 1 errored
+                 """) == "UndefVarError: `artifact_dir` not defined in `Clang_jll`"
+        @test el("x: Error During Test at /pkg/test/a.jl:2\n  Got exception outside of a @test\n" *
+                 "  no clipboard command found\n  Stacktrace:\n") == "no clipboard command found"
+        @test el("x: Error During Test at /pkg/test/a.jl:2\n Unexpected Pass\n Expression: f()\n") ==
+              "x: Error During Test at /pkg/test/a.jl:2"
+        # an exception outranks a plain failure, and the generic rethrow is skipped
+        @test elc("a: Test Failed at /p/t.jl:1\nb: Error During Test at /p/t.jl:2\n" *
+                  "  Test threw exception\n  KeyError: key 1 not found\n" *
+                  "ERROR: LoadError: There was an error during testing\n"; limit=4) ==
+              ["KeyError: key 1 not found", "a: Test Failed at /p/t.jl:1"]
 
         # pass-side noise hashes: one per distinct error-shaped line, empty for
         # a clean log (=> the attribute is omitted entirely)
@@ -380,6 +399,32 @@ end
                                               job("against", "A", "test")],
                                    configs, 0.0, false))
     @test !haskey(d0, "sigs") && !haskey(d0, "nfsig")
+
+    # one error in a dependency matches across the copies packages resolved,
+    # but test failures in different packages' own files stay apart
+    key = FB.signature_key
+    @test key("ERROR: LoadError: syntax: bad around /home/pkgeval/.julia/packages/Interpolations/y3k1Z/src/a.jl:3") ==
+          key("ERROR: syntax: bad around /home/pkgeval/.julia/packages/Interpolations/nM8Ab/src/a.jl:4")
+    @test key("julia: /cache/build/builder-amdci5-8/julia/src/subtype.c:4085: Assertion `x' failed") ==
+          key("julia: /cache/build/builder-amdci4-2/julia/src/subtype.c:4085: Assertion `x' failed")
+    @test key("Test Failed at /home/pkgeval/.julia/packages/A/aaaaa/test/runtests.jl:3") !=
+          key("Test Failed at /home/pkgeval/.julia/packages/B/bbbbb/test/runtests.jl:3")
+    @test key("Piracy: Test Failed at /home/pkgeval/.julia/packages/Aqua/aaaaa/src/piracy.jl:206") ==
+          key("Piracy: Test Failed at /home/pkgeval/.julia/packages/Aqua/bbbbb/src/piracy.jl:206")
+
+    # the daily summary clusters every hard failure, listing packages and logs
+    io = IOBuffer()
+    FB.print_daily_signatures(io, 5,
+        [("A", "ERROR: UndefVarError: `x` not defined"), ("B", "ERROR: other"),
+         ("C", "ERROR: LoadError: UndefVarError: `x` not defined")],
+        ["runs/R/logs/primary/A.log", "runs/R/logs/primary/B.log", "runs/R/logs/primary/C.2.log"])
+    ds = JSON.parse("{" * String(take!(io))[2:end] * "}")["signatures"]
+    @test ds["hard"] == 5 && ds["lines"] == 3
+    @test only(ds["clusters"])["n"] == 2  # the single-package one is left out
+    @test only(ds["clusters"])["key"] == "ERROR: UndefVarError: `x` not defined"
+    @test only(ds["clusters"])["packages"] ==
+          [Dict("name" => "A", "log" => "runs/R/logs/primary/A.log"),
+           Dict("name" => "C", "log" => "runs/R/logs/primary/C.2.log")]
 
     # a retry's non-canonical log key is listed whole; canonical ones by dir
     logged(it, key) = (it["log_key"] = attr(key); it)
