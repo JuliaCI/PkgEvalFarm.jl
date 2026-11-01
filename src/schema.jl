@@ -300,7 +300,7 @@ const ERROR_LINE_PRIORITY = (r"Assertion .* failed", r"Internal error:",
 # ERROR: lines that only restate that testing failed, never why
 const ERROR_LINE_GENERIC = ("Some tests did not pass", "errored during testing",
                             "/proc/self/stat", "failed process", "Test run finished",
-                            "ProcessExited")
+                            "ProcessExited", "There was an error during testing")
 const ANSI_OR_CR = r"\e\[[0-9;]*[A-Za-z]|\r"
 
 # how many candidate lines a failing job stores (error_lines) and how many
@@ -313,7 +313,8 @@ const PASS_SIGS_STORED = 16
     error_line_candidates(log; limit) -> Vector{String}
 
 The meaningful error lines of a job's log, best-first — crash-class markers,
-then `ERROR:` lines, then plain test-failure locations — clipped, and
+then `ERROR:` lines, then the messages of exceptions tests threw, then plain
+test-failure locations — clipped, and
 deduplicated by their normalized form (`FarmBot.normalize_error_line`).
 Failing jobs store up to `ERROR_LINES_STORED` of these so the report can skip
 signature lines that the baseline's passing log shares (its tests print them
@@ -342,10 +343,32 @@ function error_line_candidates(log::AbstractString; limit::Int)
             consider(line) && return out
         end
     end
+    for (i, line) in enumerate(lines)
+        occursin("Error During Test at", line) || continue
+        msg = test_exception_message(lines, i)
+        consider(something(msg, line)) && return out
+    end
     for line in lines
         occursin("Test Failed at", line) && consider(line) && return out
     end
     return out
+end
+
+# A test that threw prints its location, a line saying so, maybe the tested
+# expression, and then the exception's message. The message is what the same
+# failure in different packages has in common, so it is the better signature.
+function test_exception_message(lines, at::Int)
+    i = at + 1
+    i <= length(lines) || return nothing
+    l = strip(lines[i])
+    l == "Test threw exception" || l == "Got exception outside of a @test" || return nothing
+    for j in i+1:min(i + 4, length(lines))
+        m = strip(lines[j])
+        (isempty(m) || startswith(m, "Expression:")) && continue
+        startswith(m, "Stacktrace:") && return nothing
+        return String(m)
+    end
+    return nothing
 end
 
 """

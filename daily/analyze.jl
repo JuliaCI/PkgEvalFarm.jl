@@ -10,6 +10,8 @@
 #   performance.json  package test time per daily relative to the newest, computed the two
 #                     ways Nanosoldier's charts did
 #   unreliable.json   packages that fail too often to be worth testing on PR runs
+#   signatures.json   the newest daily's failure signatures shared by several packages,
+#                     most common first (null before the bot published any)
 #   cpu_speed.json    test time on each worker CPU type relative to the fastest, from the
 #                     passing tests of the last two weeks of dailies, and what a slot-hour
 #                     of each type cost on the last few
@@ -29,6 +31,7 @@ struct Daily
     sha::String
     version::String
     tests::Dict{String,Any}
+    signatures::Union{Nothing,Dict{String,Any}}
 end
 
 # the body, or `nothing` when the object doesn't exist (S3 answers 403 for missing keys
@@ -66,7 +69,8 @@ function load_dailies(cache)
             text = fetch_text("https://raw.githubusercontent.com/JuliaLang/julia/$sha/VERSION")
             text === nothing || (version = versions[sha] = String(strip(text)))
         end
-        push!(dailies, Daily(date, run, sha, version, summary["tests"]))
+        push!(dailies, Daily(date, run, sha, version, summary["tests"],
+                             get(summary, "signatures", nothing)))
     end
     write(versions_file, JSON.json(versions))
     return dailies
@@ -332,6 +336,14 @@ function slot_rates(dailies, cache; days=3)
     return Dict(cpu => median(rs) for (cpu, rs) in rates)
 end
 
+# the newest daily's signature clusters with its date and run, for the Daily page
+function newest_signatures(dailies)
+    i = findlast(d -> d.signatures !== nothing, dailies)
+    i === nothing && return nothing
+    d = dailies[i]
+    return merge(Dict{String,Any}("date" => string(d.date), "run" => d.run), d.signatures)
+end
+
 function main(out, cache=joinpath(@__DIR__, ".cache"))
     mkpath(out)
     dailies = load_dailies(cache)
@@ -343,6 +355,7 @@ function main(out, cache=joinpath(@__DIR__, ".cache"))
     write(joinpath(out, "unreliable.json"), JSON.json(Dict(
         "generated" => string(now(UTC)), "window_days" => 30, "min_tests" => 5,
         "min_failure_ratio" => 0.75, "unreliable" => unreliable_packages(dailies))))
+    write(joinpath(out, "signatures.json"), JSON.json(newest_signatures(dailies)))
     reports = load_reports(dailies, cache)
     types = cpu_speed(reports)
     rates = slot_rates(dailies, cache)

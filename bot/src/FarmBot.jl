@@ -615,10 +615,36 @@ end
 nanosoldier_status(status::String) =
     status == "load" ? "test" : status == "error" ? "fail" : status
 
+# The daily's shared failure signatures, over all its hard failures rather than only
+# the new ones: `hard` failures in all, `lines` of them with a signature line, and the
+# clusters of more than one package, most common first, each listing its packages
+# and their log keys.
+function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,String}},
+                                logs::Vector{String})
+    labels, counts, members = cluster_signatures(lines)
+    print(io, ",\"signatures\":{\"hard\":", string(hard), ",\"lines\":", string(length(lines)),
+          ",\"clusters\":[")
+    for i in eachindex(labels)
+        counts[i] > 1 || break
+        i == 1 || print(io, ",")
+        print(io, "{\"label\":", JSON.json(labels[i]), ",\"n\":", string(counts[i]),
+              ",\"packages\":[")
+        first_pkg = true
+        for (j, (pkg, _)) in enumerate(lines)
+            members[j] == i || continue
+            first_pkg || print(io, ",")
+            first_pkg = false
+            print(io, "{\"name\":", JSON.json(pkg), ",\"log\":", JSON.json(logs[j]), "}")
+        end
+        print(io, "]}")
+    end
+    print(io, "]}")
+end
+
 """
 Publish a finished daily's primary results as `daily.json` next to its report, in the
 shape of the `db.json` Nanosoldier wrote for its dailies: `date`, `build` and per-package
-`tests`. The Julia version is left to the readers, which can look it up by commit. The
+`tests`, plus the run's shared failure `signatures`. The Julia version is left to the readers, which can look it up by commit. The
 run is then marked, so the hourly poll can publish summaries that failed here.
 """
 function publish_daily_summary(ctx::LiteCtx, run::Item;
@@ -631,11 +657,27 @@ function publish_daily_summary(ctx::LiteCtx, run::Item;
           ",\"run\":", JSON.json(run_id),
           ",\"build\":{\"repo\":", JSON.json(repo), ",\"sha\":", JSON.json(sha), ",\"version\":null}",
           ",\"tests\":{")
+    against = Dict{String,Item}()
+    for job in jobs
+        str(job, "config", "") == "against" && (against[str(job, "package")] = job)
+    end
     first_entry = true
+    hard = 0
+    sig_lines = Tuple{String,String}[]
+    sig_logs = String[]
     for job in jobs
         str(job, "config", "") == "primary" || continue
         status = str(job, "status", "")
         status in TERMINAL_STATUSES || continue
+        if status == "fail" || status == "crash"
+            hard += 1
+            pkg = str(job, "package")
+            line = signature_line(job, get(against, pkg, nothing))
+            if line !== nothing
+                push!(sig_lines, (pkg, something(line)))
+                push!(sig_logs, str(job, "log_key", ""))
+            end
+        end
         first_entry || print(io, ",")
         first_entry = false
         reason = opt_str(job, "reason")
@@ -645,7 +687,9 @@ function publish_daily_summary(ctx::LiteCtx, run::Item;
               ",\"duration\":", string(flt(job, "duration", 0.0)),
               ",\"version\":", version === nothing ? "null" : JSON.json(something(version)), "}")
     end
-    print(io, "}}")
+    print(io, "}")
+    print_daily_signatures(io, hard, sig_lines, sig_logs)
+    print(io, "}")
     s3_put(ctx, report_key(run_id, "daily.json"), String(take!(io)); content_type="application/json")
     mark = "{\"TableName\":" * JSON.json(ctx.runs_table) * "," *
            "\"Key\":{\"run_id\":{\"S\":" * JSON.json(run_id) * "}}," *
@@ -2055,6 +2099,74 @@ function normalize_error_line(line::String)
     return String(strip(s))
 end
 
+# cluster key for a signature line. It is stricter than the noise key above in
+# one way: a test failure keeps its file and line, so unrelated failures in
+# different packages' tests don't merge into one cluster. It is looser in
+# another: install paths, build hosts and other line numbers are dropped, so
+# one error in a shared dependency still matches when packages resolved
+# different versions of it.
+function signature_key(line::String)
+    s = replace(line, r"0x[0-9a-f]+" => "0xADDR")
+    s = replace(s, r"[^ ]*/\.julia/" => "~/.julia/")
+    s = replace(s, r"/packages/[^/ ]+/\K[^/ ]+/" => "")
+    s = replace(s, r"/artifacts/[0-9a-f]+/" => "/artifacts/HASH/")
+    s = replace(s, r"/cache/build/[^/ ]+/" => "/cache/build/HOST/")
+    if !occursin("Test Failed at", s) && !occursin("Error During Test at", s)
+        s = replace(s, r" at [^ ]+\.jl:\d+" => " at LOC")
+        s = replace(s, r"\.jl:\d+" => ".jl")
+    end
+    s = replace(s, "LoadError: " => "")
+    return String(strip(s))
+end
+
+# The line a hard failure is clustered by: its first stored candidate
+# (error_lines, falling back to error_line) that the baseline's passing log
+# doesn't share. A line that also shows up when tests pass is noise the tests
+# print, not the failure, so a package whose every candidate is shared stays
+# unclustered. pass_sigs is comma-joined fixed-width hex, so plain substring
+# search is exact membership (an unaligned 16-char window always straddles a
+# comma). Old records carry a single error_line and no pass_sigs.
+function signature_line(p::Item, a)
+    els = opt_str(p, "error_lines")
+    els === nothing && (els = opt_str(p, "error_line"))
+    els === nothing && return nothing
+    noise = a === nothing ? nothing : opt_str(something(a), "pass_sigs")
+    for cand in split(something(els), '\n')
+        line = String(cand)
+        if noise === nothing ||
+           !occursin(sig_hash(normalize_error_line(line)), something(noise))
+            return line
+        end
+    end
+    return nothing
+end
+
+# Clusters (package, line) pairs by signature_key, most common first, with ties
+# in first-seen order. Returns each cluster's label (its first raw line) and
+# size, and each pair's cluster index.
+function cluster_signatures(lines::Vector{Tuple{String,String}})
+    ids = Dict{String,Int}()
+    labels = String[]
+    counts = Int[]
+    first_idx = Int[]
+    for (_, line) in lines
+        idx = get!(ids, signature_key(line)) do
+            push!(labels, line)
+            push!(counts, 0)
+            length(labels)
+        end
+        counts[idx] += 1
+        push!(first_idx, idx)
+    end
+    # plain sortperm: the keyword-sorting paths don't survive the trim verifier
+    perm = sortperm([(-counts[i], i) for i in eachindex(counts)])
+    rank = Vector{Int}(undef, length(perm))
+    for (newi, oldi) in enumerate(perm)
+        rank[oldi] = newi
+    end
+    return labels[perm], counts[perm], [rank[i] for i in first_idx]
+end
+
 # stable 64-bit FNV-1a of a normalized error line, as fixed-width hex. Workers
 # store these for the error-shaped lines of *passing* logs (pass_sigs), and the
 # report hashes a failure's candidates to match against them — so it must not
@@ -2231,26 +2343,8 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
         if (pst == "fail" || pst == "crash") &&
            (against_name === nothing ||
             (a !== nothing && issuccess(str(something(a), "status"))))
-            # signature: the first stored candidate line the baseline's passing
-            # log doesn't share — a line that also shows up when tests pass is
-            # noise the tests print, not the failure. pass_sigs is comma-joined
-            # fixed-width hex, so plain substring search is exact membership
-            # (an unaligned 16-char window always straddles a comma). Old
-            # records carry a single error_line and no pass_sigs: first
-            # candidate wins unconditionally, as before
-            els = opt_str(p, "error_lines")
-            els === nothing && (els = opt_str(p, "error_line"))
-            noise = a === nothing ? nothing : opt_str(something(a), "pass_sigs")
-            if els !== nothing
-                for cand in split(something(els), '\n')
-                    line = String(cand)
-                    if noise === nothing ||
-                       !occursin(sig_hash(normalize_error_line(line)), something(noise))
-                        push!(nf_lines, (pkg, line))
-                        break
-                    end
-                end
-            end
+            line = signature_line(p, a)
+            line === nothing || push!(nf_lines, (pkg, something(line)))
         end
         pver = opt_str(p, "version")
         aver = a === nothing ? nothing : opt_str(something(a), "version")
@@ -2276,40 +2370,19 @@ function report_json(ctx::LiteCtx, run::Item, jobs::Vector{Item},
     end
     print(io, "]")
 
-    # shared failure signatures: cluster the collected error lines by their
-    # normalized form; the page renders multi-package clusters as filters
-    sig_ids = Dict{String,Int}()
-    sig_labels = String[]
-    sig_counts = Int[]
-    assigned = Tuple{String,Int}[]
-    for (pkg, line) in nf_lines
-        key = normalize_error_line(line)
-        idx = get!(sig_ids, key) do
-            push!(sig_labels, line)
-            push!(sig_counts, 0)
-            length(sig_labels) - 1
-        end
-        sig_counts[idx + 1] += 1
-        push!(assigned, (pkg, idx))
-    end
+    # shared failure signatures; the page renders multi-package clusters as filters
+    sig_labels, sig_counts, members = cluster_signatures(nf_lines)
     if !isempty(sig_labels)
-        # most common first; ties keep first-seen order (plain sortperm — the
-        # keyword-sorting paths don't survive the trim verifier)
-        perm = sortperm([(-sig_counts[i], i) for i in 1:length(sig_counts)])
-        remap = Vector{Int}(undef, length(perm))
-        for (newi, oldi) in enumerate(perm)
-            remap[oldi] = newi - 1
-        end
         print(io, ",\"sigs\":[")
-        for (i, oldi) in enumerate(perm)
+        for i in eachindex(sig_labels)
             i == 1 || print(io, ",")
-            print(io, "{\"label\":", JSON.json(sig_labels[oldi]),
-                  ",\"n\":", string(sig_counts[oldi]), "}")
+            print(io, "{\"label\":", JSON.json(sig_labels[i]),
+                  ",\"n\":", string(sig_counts[i]), "}")
         end
         print(io, "],\"nfsig\":{")
-        for (i, (pkg, idx)) in enumerate(assigned)
+        for (i, (pkg, _)) in enumerate(nf_lines)
             i == 1 || print(io, ",")
-            print(io, JSON.json(pkg), ":", string(remap[idx + 1]))
+            print(io, JSON.json(pkg), ":", string(members[i] - 1))
         end
         print(io, "}")
     end
