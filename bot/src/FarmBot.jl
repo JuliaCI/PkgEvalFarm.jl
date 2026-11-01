@@ -644,7 +644,8 @@ end
 """
 Publish a finished daily's primary results as `daily.json` next to its report, in the
 shape of the `db.json` Nanosoldier wrote for its dailies: `date`, `build` and per-package
-`tests`, plus the run's shared failure `signatures`. The Julia version is left to the readers, which can look it up by commit. The
+`tests`, plus the run's shared failure `signatures`. A failure or crash with a recorded
+error line also carries it, as its test's `error`. The Julia version is left to the readers, which can look it up by commit. The
 run is then marked, so the hourly poll can publish summaries that failed here.
 """
 function publish_daily_summary(ctx::LiteCtx, run::Item;
@@ -669,6 +670,7 @@ function publish_daily_summary(ctx::LiteCtx, run::Item;
         str(job, "config", "") == "primary" || continue
         status = str(job, "status", "")
         status in TERMINAL_STATUSES || continue
+        line = nothing
         if status == "fail" || status == "crash"
             hard += 1
             pkg = str(job, "package")
@@ -685,7 +687,9 @@ function publish_daily_summary(ctx::LiteCtx, run::Item;
         print(io, JSON.json(str(job, "package")), ":{\"status\":", JSON.json(nanosoldier_status(status)),
               ",\"reason\":", reason === nothing ? "null" : JSON.json(something(reason)),
               ",\"duration\":", string(flt(job, "duration", 0.0)),
-              ",\"version\":", version === nothing ? "null" : JSON.json(something(version)), "}")
+              ",\"version\":", version === nothing ? "null" : JSON.json(something(version)))
+        line === nothing || print(io, ",\"error\":", JSON.json(something(line)))
+        print(io, "}")
     end
     print(io, "}")
     print_daily_signatures(io, hard, sig_lines, sig_logs)
