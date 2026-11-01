@@ -1195,6 +1195,10 @@ try
                     "generated" => "2026-10-05T00:00:00", "unreliable" => ["Flaky", "Flakier"]))))
             withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/daily/unreliable.json") do
                 @test PEF.FarmBot.fetch_unreliable() == ["Flaky", "Flakier"]
+                @test PEF.FarmBot.pr_unreliable(String[], "master") == ["Flaky", "Flakier"]
+                # the dailies run on master, so their list says little about a release branch
+                @test PEF.FarmBot.pr_unreliable(String[], "release-1.12") == String[]
+                @test PEF.FarmBot.pr_unreliable(["Flaky"], "master") == String[]
             end
             withenv("PKGEVAL_UNRELIABLE_URL" => gh_base[] * "/no/such/list.json") do
                 @test PEF.FarmBot.fetch_unreliable() == String[]

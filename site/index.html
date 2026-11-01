@@ -1181,7 +1181,7 @@ async function dailyView(params) {
   $("daily-unrel-lede").innerHTML =
     `Packages whose latest version failed at least ${Math.round(100 * unrel.min_failure_ratio)}% ` +
     `of at least ${unrel.min_tests} dailies in the last ${unrel.window_days} days. ` +
-    `PR runs only install and load these, since their failures say little about the change being tested.`;
+    `Runs on PRs against master only install and load these, since their failures say little about the change being tested.`;
   $("daily-unrel").innerHTML = unrel.unreliable.map((p) => `<li>${esc(p)}</li>`).join("");
 
   const perfBy = new Map(perf.map((p) => [p.date, p]));

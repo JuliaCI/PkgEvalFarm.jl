@@ -404,7 +404,8 @@ end
 # PR runs only install and load packages that the daily runs show failing most of the
 # time, since their failures say little about the change being tested. The site
 # publishes the list (daily/analyze.jl), and each run keeps the list it was submitted
-# with, so its workers all agree.
+# with, so its workers all agree. The dailies run on master, so the list only applies
+# to PRs against master.
 
 unreliable_url() = get(ENV, "PKGEVAL_UNRELIABLE_URL",
                        "https://pkgeval-reports.julialang.org/daily/unreliable.json")
@@ -435,6 +436,14 @@ function fetch_unreliable()
         return String[]
     end
 end
+
+"""
+The unreliable list for a PR run. An explicit package list asks for exactly those tests,
+as with Nanosoldier. Other branches get none: a package master broke may still pass there,
+and a backport could break it in the same way.
+"""
+pr_unreliable(packages, base) =
+    isempty(packages) && base == "master" ? fetch_unreliable() : String[]
 
 """
     create_run(ctx; run_id, ...) -> created::Bool
@@ -845,12 +854,12 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     (pr.head === nothing || something(pr.head).sha === nothing) && error("PR without head sha")
     head_sha = something(something(pr.head).sha)
     primary = "$repo#$head_sha"
+    base = pr.base === nothing ? nothing : something(pr.base).ref
+    base === nothing && error("PR without base ref")
     against_note = ""
     against = if command.vs !== nothing
         resolve_vs(something(command.vs), repo)
     else
-        base = pr.base === nothing ? nothing : something(pr.base).ref
-        base === nothing && error("PR without base ref")
         base_sha = something(pr.base).sha
         merge_base = find_merge_base(gh, repo, something(base_sha, something(base)), head_sha)
         if merge_base === nothing
@@ -874,8 +883,7 @@ function handle_command(ctx::LiteCtx, gh::GitHubCtx, name::String, repo::String,
     # the fallback poll rediscovering the same mention, and webhook+poll overlap
     # all collapse into one run (kicking off a run is expensive)
     run_id = comment_id === nothing ? new_run_id() : "gh-$(something(comment_id))"
-    # an explicit package list asks for exactly those tests, as with Nanosoldier
-    unreliable = isempty(command.packages) ? fetch_unreliable() : String[]
+    unreliable = pr_unreliable(command.packages, something(base))
     created = create_run(ctx; run_id, configs_json, packages=command.packages,
                          context_json, submitter="$requester via @$name",
                          reuse=!command.fresh_baseline, unreliable)
