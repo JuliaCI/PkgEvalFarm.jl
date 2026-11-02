@@ -35,7 +35,7 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: '1.13'
-      # published daily summaries never change, so only new days are downloaded
+      # published daily summaries rarely change, so only new days and the last two are downloaded
       - uses: actions/cache@v6
         with:
           path: daily/.cache

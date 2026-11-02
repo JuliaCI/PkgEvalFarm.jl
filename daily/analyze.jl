@@ -18,7 +18,7 @@
 #                     of each type cost on the last few
 #
 # This ports NanosoldierReports' tools/pkgeval_analysis, which did the same for
-# Nanosoldier's dailies. Summaries are immutable once published, so they are cached.
+# Nanosoldier's dailies. Summaries rarely change once published, so they are cached.
 
 using Dates, Downloads, JSON
 
@@ -57,10 +57,15 @@ function load_dailies(cache)
     for date in FIRST_DAILY:Day(1):Date(now(UTC))
         run = "daily-" * Dates.format(date, dateformat"yyyy-mm-dd")
         file = joinpath(cache, "$run.json")
-        if !isfile(file)
+        # the last two days are fetched again, so a summary rewritten by hand
+        # soon after it was published still reaches the page
+        if !isfile(file) || date >= Date(now(UTC)) - Day(1)
             text = fetch_text("$FARM/runs/$run/report/daily.json")
-            text === nothing && continue
-            write(file, text)
+            if text !== nothing
+                write(file, text)
+            elseif !isfile(file)
+                continue
+            end
         end
         summary = JSON.parsefile(file; dicttype=Dict{String,Any})
         sha = String(summary["build"]["sha"])
