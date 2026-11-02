@@ -1507,7 +1507,8 @@ try
                         (version === nothing ? () : ("version" => version,))...,
                         (config == "primary" && status == "fail" ?
                          ("error_line" => "KeyError: key 1 not found",
-                          "log_key" => "runs/daily-2026-01-01/logs/primary/$pkg.log") : ())...)),
+                          "log_key" => "runs/daily-2026-01-01/logs/primary/$pkg" *
+                                       (pkg == "Worse" ? ".2.log" : ".log")) : ())...)),
                     cfg.jobs_table; aws_config=aws)
             end
             PEF.FarmBot.publish_daily_summary(lite, something(PEF.FarmBot.find_run(lite, "daily-2026-01-01")))
@@ -1517,7 +1518,8 @@ try
             @test summary["build"]["sha"] == "1" ^ 40 && summary["build"]["repo"] == "JuliaLang/julia"
             @test sort(collect(keys(summary["tests"]))) == ["Bad", "Broken", "Good", "Loads", "Worse"]  # primary only
             @test summary["tests"]["Good"] == Dict("status" => "test", "reason" => nothing,
-                                                   "duration" => 12.5, "version" => "1.2.3")
+                                                   "duration" => 12.5, "version" => "1.2.3",
+                                                   "log" => nothing)  # no log recorded
             @test summary["tests"]["Loads"]["status"] == "test"
             @test summary["tests"]["Broken"]["status"] == "fail"
             @test summary["tests"]["Broken"]["reason"] == "worker_exception"
@@ -1525,8 +1527,12 @@ try
             @test summary["tests"]["Bad"]["error"] == "KeyError: key 1 not found"
             @test !haskey(summary["tests"]["Broken"], "error")
             @test summary["signatures"]["hard"] == 2 && summary["signatures"]["lines"] == 2
-            @test only(summary["signatures"]["clusters"])["packages"] ==
-                  [Dict("name" => p, "log" => "runs/daily-2026-01-01/logs/primary/$p.log") for p in ("Bad", "Worse")]
+            @test only(summary["signatures"]["clusters"])["packages"] == ["Bad", "Worse"]
+            # logs are named only when they aren't <logs><package>.log
+            @test endswith(summary["logs"], "/runs/daily-2026-01-01/logs/primary/")
+            @test !haskey(summary["tests"]["Bad"], "log")
+            @test summary["tests"]["Worse"]["log"] == "Worse.2.log"
+            @test summary["tests"]["Good"]["log"] === nothing
             @test PEF.get_run(ctx, "daily-2026-01-01")["daily_published"] == true
             # a finished daily whose summary wasn't published is caught up by the hourly poll
             Dynamodb.update_item(PEF.ddb_item(Dict("run_id" => "daily-2026-01-03")), cfg.runs_table,
