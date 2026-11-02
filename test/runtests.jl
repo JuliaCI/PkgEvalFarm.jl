@@ -54,6 +54,18 @@ end
         # outside the window nothing counts
         @test isempty(DA.unreliable_packages(dailies; today=Date(2026, 12, 1)))
     end
+
+    @testset "signature log links" begin
+        logs = "https://b/runs/d/logs/primary/"
+        tests = Dict{String,Any}("A" => Dict{String,Any}(), "B" => Dict{String,Any}("log" => "B.2.log"),
+                                 "C" => Dict{String,Any}("log" => nothing),
+                                 "D" => Dict{String,Any}("log" => "https://b/runs/x/logs/primary/D.log"))
+        sigs = Dict{String,Any}("clusters" => [Dict{String,Any}("n" => 4, "packages" => ["A", "B", "C", "D"])])
+        pkgs = only(DA.with_logs(sigs, logs, tests)["clusters"])["packages"]
+        @test [p["log"] for p in pkgs] == [logs * "A.log", logs * "B.2.log", nothing,
+                                          "https://b/runs/x/logs/primary/D.log"]
+        @test DA.log_url(nothing, "A", Dict()) === nothing
+    end
 end
 
 @testset "schema" begin
@@ -412,19 +424,16 @@ end
     @test key("Piracy: Test Failed at /home/pkgeval/.julia/packages/Aqua/aaaaa/src/piracy.jl:206") ==
           key("Piracy: Test Failed at /home/pkgeval/.julia/packages/Aqua/bbbbb/src/piracy.jl:206")
 
-    # the daily summary clusters every hard failure, listing packages and logs
+    # the daily summary clusters every hard failure, naming the packages
     io = IOBuffer()
     FB.print_daily_signatures(io, 5,
         [("A", "ERROR: UndefVarError: `x` not defined"), ("B", "ERROR: other"),
-         ("C", "ERROR: LoadError: UndefVarError: `x` not defined")],
-        ["runs/R/logs/primary/A.log", "runs/R/logs/primary/B.log", "runs/R/logs/primary/C.2.log"])
+         ("C", "ERROR: LoadError: UndefVarError: `x` not defined")])
     ds = JSON.parse("{" * String(take!(io))[2:end] * "}")["signatures"]
     @test ds["hard"] == 5 && ds["lines"] == 3
     @test only(ds["clusters"])["n"] == 2  # the single-package one is left out
     @test only(ds["clusters"])["key"] == "ERROR: UndefVarError: `x` not defined"
-    @test only(ds["clusters"])["packages"] ==
-          [Dict("name" => "A", "log" => "runs/R/logs/primary/A.log"),
-           Dict("name" => "C", "log" => "runs/R/logs/primary/C.2.log")]
+    @test only(ds["clusters"])["packages"] == ["A", "C"]
 
     # a retry's non-canonical log key is listed whole; canonical ones by dir
     logged(it, key) = (it["log_key"] = attr(key); it)

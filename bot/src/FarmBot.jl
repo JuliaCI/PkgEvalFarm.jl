@@ -617,11 +617,10 @@ nanosoldier_status(status::String) =
 
 # The daily's shared failure signatures, over all its hard failures rather than only
 # the new ones: `hard` failures in all, `lines` of them with a signature line, and the
-# clusters of more than one package, most common first, each listing its packages
-# and their log keys. A cluster's `key` is its normalized line, which stays the same
-# from day to day while the first raw line seen can differ.
-function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,String}},
-                                logs::Vector{String})
+# clusters of more than one package, most common first, each naming its packages. A
+# cluster's `key` is its normalized line, which stays the same from day to day while
+# the first raw line seen can differ.
+function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,String}})
     labels, counts, members = cluster_signatures(lines)
     print(io, ",\"signatures\":{\"hard\":", string(hard), ",\"lines\":", string(length(lines)),
           ",\"clusters\":[")
@@ -629,14 +628,13 @@ function print_daily_signatures(io::IO, hard::Int, lines::Vector{Tuple{String,St
         counts[i] > 1 || break
         i == 1 || print(io, ",")
         print(io, "{\"label\":", JSON.json(labels[i]), ",\"key\":", JSON.json(signature_key(labels[i])),
-              ",\"n\":", string(counts[i]),
-              ",\"packages\":[")
+              ",\"n\":", string(counts[i]), ",\"packages\":[")
         first_pkg = true
         for (j, (pkg, _)) in enumerate(lines)
             members[j] == i || continue
             first_pkg || print(io, ",")
             first_pkg = false
-            print(io, "{\"name\":", JSON.json(pkg), ",\"log\":", JSON.json(logs[j]), "}")
+            print(io, JSON.json(pkg))
         end
         print(io, "]}")
     end
@@ -646,19 +644,25 @@ end
 """
 Publish a finished daily's primary results as `daily.json` next to its report, in the
 shape of the `db.json` Nanosoldier wrote for its dailies: `date`, `build` and per-package
-`tests`, plus the run's shared failure `signatures`. A failure or crash with a recorded
-error line also carries it, as its test's `error`. The Julia version is left to the readers, which can look it up by commit. The
+`tests`. The Julia version is left to the readers, which can look it up by commit. The
 run is then marked, so the hourly poll can publish summaries that failed here.
+
+Beyond Nanosoldier's shape, a failure or crash with a recorded error line carries it as
+its test's `error`, and `signatures` groups the failures that share one. `logs` is the
+URL of the folder holding each package's log, `<package>.log`. A test whose log is
+elsewhere has `log`: a file name in that folder, a full URL, or null when it has none.
 """
 function publish_daily_summary(ctx::LiteCtx, run::Item;
                                jobs::Vector{Item}=run_jobs(ctx, str(run, "run_id")))
     run_id = str(run, "run_id")
     julia = something(primary_julia(run), "#")
     repo, sha = String(split(julia, '#')[1]), String(split(julia, '#')[end])
+    logdir = "runs/$run_id/logs/primary/"
     io = IOBuffer()
     print(io, "{\"date\":", JSON.json(String(chop(run_id; head=length("daily-"), tail=0))),
           ",\"run\":", JSON.json(run_id),
           ",\"build\":{\"repo\":", JSON.json(repo), ",\"sha\":", JSON.json(sha), ",\"version\":null}",
+          ",\"logs\":", JSON.json(s3_public_url(ctx, logdir)),
           ",\"tests\":{")
     against = Dict{String,Item}()
     for job in jobs
@@ -667,34 +671,38 @@ function publish_daily_summary(ctx::LiteCtx, run::Item;
     first_entry = true
     hard = 0
     sig_lines = Tuple{String,String}[]
-    sig_logs = String[]
     for job in jobs
         str(job, "config", "") == "primary" || continue
         status = str(job, "status", "")
         status in TERMINAL_STATUSES || continue
+        pkg = str(job, "package")
         line = nothing
         if status == "fail" || status == "crash"
             hard += 1
-            pkg = str(job, "package")
             line = signature_line(job, get(against, pkg, nothing))
-            if line !== nothing
-                push!(sig_lines, (pkg, something(line)))
-                push!(sig_logs, str(job, "log_key", ""))
-            end
+            line === nothing || push!(sig_lines, (pkg, something(line)))
         end
         first_entry || print(io, ",")
         first_entry = false
         reason = opt_str(job, "reason")
         version = opt_str(job, "version")
-        print(io, JSON.json(str(job, "package")), ":{\"status\":", JSON.json(nanosoldier_status(status)),
+        print(io, JSON.json(pkg), ":{\"status\":", JSON.json(nanosoldier_status(status)),
               ",\"reason\":", reason === nothing ? "null" : JSON.json(something(reason)),
               ",\"duration\":", string(flt(job, "duration", 0.0)),
               ",\"version\":", version === nothing ? "null" : JSON.json(something(version)))
         line === nothing || print(io, ",\"error\":", JSON.json(something(line)))
+        log = opt_str(job, "log_key")
+        if log === nothing
+            print(io, ",\"log\":null")
+        elseif something(log) != logdir * pkg * ".log"
+            l = something(log)
+            print(io, ",\"log\":", JSON.json(startswith(l, logdir) ? l[length(logdir)+1:end] :
+                                                s3_public_url(ctx, l)))
+        end
         print(io, "}")
     end
     print(io, "}")
-    print_daily_signatures(io, hard, sig_lines, sig_logs)
+    print_daily_signatures(io, hard, sig_lines)
     print(io, "}")
     s3_put(ctx, report_key(run_id, "daily.json"), String(take!(io)); content_type="application/json")
     mark = "{\"TableName\":" * JSON.json(ctx.runs_table) * "," *

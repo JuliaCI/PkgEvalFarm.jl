@@ -11,7 +11,8 @@
 #                     ways Nanosoldier's charts did
 #   unreliable.json   packages that fail too often to be worth testing on PR runs
 #   signatures.json   the newest daily's failure signatures shared by several packages,
-#                     most common first (null before the bot published any)
+#                     most common first, each package with its log URL (null before the
+#                     bot published any)
 #   cpu_speed.json    test time on each worker CPU type relative to the fastest, from the
 #                     passing tests of the last two weeks of dailies, and what a slot-hour
 #                     of each type cost on the last few
@@ -69,8 +70,9 @@ function load_dailies(cache)
             text = fetch_text("https://raw.githubusercontent.com/JuliaLang/julia/$sha/VERSION")
             text === nothing || (version = versions[sha] = String(strip(text)))
         end
-        push!(dailies, Daily(date, run, sha, version, summary["tests"],
-                             get(summary, "signatures", nothing)))
+        sigs = get(summary, "signatures", nothing)
+        sigs === nothing || (sigs = with_logs(sigs, get(summary, "logs", nothing), summary["tests"]))
+        push!(dailies, Daily(date, run, sha, version, summary["tests"], sigs))
     end
     write(versions_file, JSON.json(versions))
     return dailies
@@ -334,6 +336,26 @@ function slot_rates(dailies, cache; days=3)
         end
     end
     return Dict(cpu => median(rs) for (cpu, rs) in rates)
+end
+
+# The log URL of a package in a daily summary: `<package>.log` in the summary's log
+# folder, unless the test names another file, a full URL, or no log at all.
+function log_url(logs, pkg, test)
+    logs === nothing && return nothing
+    haskey(test, "log") || return logs * pkg * ".log"
+    log = test["log"]
+    log === nothing && return nothing
+    return startswith(log, "https://") ? log : logs * log
+end
+
+# The summary's clusters name their packages; the page also wants each one's log.
+function with_logs(sigs, logs, tests)
+    sigs = copy(sigs)
+    sigs["clusters"] = [merge(c, Dict{String,Any}("packages" =>
+                            [Dict{String,Any}("name" => p, "log" => log_url(logs, p, get(tests, p, Dict())))
+                             for p in c["packages"]]))
+                        for c in sigs["clusters"]]
+    return sigs
 end
 
 # the newest daily's signature clusters with its date and run, for the Daily page

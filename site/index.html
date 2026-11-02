@@ -20,6 +20,18 @@
         `logdirs` (reused baseline results keep their donor run's prefix,
         so it is not always this run's prefix); an entry ending in ".log"
         is already the full key (a retry's <Package>.<n>.log)
+    runs/daily-<date>/report/daily.json  a daily's results in Nanosoldier's
+        db.json shape (`tests`: name => status, reason, duration,
+        version), plus: `error`, a failure's first meaningful error line
+        (search the log for it rather than reading the whole log);
+        `logs`, the folder URL of the logs, each at `<logs><name>.log`
+        unless the test has `log` (a file name in that folder, a full
+        URL, or null for none); and `signatures`, the failures and
+        crashes (`hard`, `lines` of them with an error line) grouped by
+        a shared line in `clusters` of `label`, `key` (the normalized
+        line, stable across days), `n` and `packages` (names), most
+        common first. The newest daily's groups, with log URLs, are
+        also at https://pkgeval-reports.julialang.org/daily/signatures.json
     fleet/load.json                   two weeks of fleet load in 5-minute
         samples: `fields` names the columns of each `rows` entry (unix
         time, in-service capacity in vCPUs, desired and max capacity,
@@ -1208,7 +1220,6 @@ async function dailyView(params) {
 
   const sigs = await sigsP;
   if (sigs && sigs.clusters && sigs.clusters.length) {
-    const bucket = bucketUrl(params);
     const shared = sigs.clusters.reduce((t, c) => t + c.n, 0);
     const SHOWN = 25;
     $("daily-sigs").hidden = false;
@@ -1221,7 +1232,7 @@ async function dailyView(params) {
       `${fmtN(sigs.hard - sigs.lines)} have none recorded. Click a line to list its packages.`;
     const row = (c) => `<details class="sigd"><summary><span class="cnt">${fmtN(c.n)}</span>` +
       `<span class="sg">${esc(c.label)}</span></summary><div class="pk mono">${
-        c.packages.map((p) => p.log ? `<a href="${esc(bucket + "/" + p.log)}">${esc(p.name)}</a>`
+        c.packages.map((p) => p.log ? `<a href="${esc(p.log)}">${esc(p.name)}</a>`
                                     : `<span>${esc(p.name)}</span>`).join(" ")}</div></details>`;
     const list = $("daily-sigs-list");
     list.innerHTML = sigs.clusters.slice(0, SHOWN).map(row).join("") +
