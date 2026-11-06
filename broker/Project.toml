@@ -1,4 +1,4 @@
-name = "FarmBroker"
+name = "FarmBrokerApp"
 uuid = "3e9d1c84-7a55-4f21-b0c9-8f4a6d2e5b17"
 authors = ["Keno Fischer <keno@juliahub.com>"]
 version = "0.1.0"
