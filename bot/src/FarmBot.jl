@@ -23,6 +23,8 @@ include(joinpath(@__DIR__, "..", "..", "lite", "src", "FarmLite.jl"))
 using .FarmLite
 using .FarmLite: Attr, Item, attr, str, int, flt, opt_str, json_item, ddb, sqs_send_message,
                  s3_put, is_conditional_failure, GitHubCtx, github_request, urlencode,
+                 GhCommit, ItemResp, pin_commit, isodate, new_run_id, config_json,
+                 create_run, get_run,
                  error_message, lambda_loop, ctx_from_env, ssm_parameter, parse_isodate,
                  LazyVal, parse_json, json_string, json_bool, json_int,
                  json_string_vector, jsontype, isnullval, json_expected
@@ -113,32 +115,6 @@ function resolve_vs(vs::AbstractString, repo::AbstractString)
     return String(vs)
 end
 
-"""
-Pin a `repo#ref` spec to the exact commit the ref names right now. Two reasons:
-every worker then evaluates the same Julia even if the branch moves mid-run,
-and baseline reuse (expand_run) only matches immutable specs, so an unpinned
-`#master` baseline could never be reused. Non-repo specs (`nightly`) and
-already-pinned shas pass through; so does anything the API cannot resolve —
-the workers' own resolution is the fallback, as before. Version refs try the
-tag's "v" spelling too, so `vs = "#1.12.6"` pins to the v1.12.6 tag commit.
-"""
-function pin_commit(gh::GitHubCtx, spec::String)
-    m = match(r"^([^#]+)#(.+)$", spec)
-    m === nothing && return spec
-    repo, ref = String(something(m.captures[1])), String(something(m.captures[2]))
-    occursin(r"^[0-9a-f]{40}$", ref) && return spec
-    # bare version numbers name release tags, which carry a "v" prefix in the
-    # julia repo ("1.12.6" -> tag "v1.12.6"); try both spellings
-    candidates = occursin(r"^\d+(\.\d+)+$", ref) ? [ref, "v" * ref] : [ref]
-    for candidate in candidates
-        resp = github_request(gh, "GET", "/repos/$repo/commits/$(urlencode(candidate))")
-        resp.status == 200 || continue
-        sha = parse_json(resp.body, GhCommit).sha
-        sha === nothing && continue
-        return "$repo#$(something(sha))"
-    end
-    return spec
-end
 
 
 ## GitHub response shapes (concrete structs; unknown JSON fields are skipped)
@@ -168,10 +144,6 @@ struct GhIssue
     number::Union{Nothing,Int}
     repository_url::Union{Nothing,String}
     pull_request::Union{Nothing,GhPrRef}
-end
-struct GhCommit
-    sha::Union{Nothing,String}
-    ref::Union{Nothing,String}
 end
 struct GhPr
     head::Union{Nothing,GhCommit}
@@ -292,20 +264,6 @@ function json_make(::Type{GhIssue}, x::LazyVal)
     return GhIssue(number[], repository_url[], pull_request[]), pos::Int
 end
 
-function json_make(::Type{GhCommit}, x::LazyVal)
-    sha = Ref{Union{Nothing,String}}(nothing)
-    ref = Ref{Union{Nothing,String}}(nothing)
-    pos = JSON.applyobject(x) do k, v
-        isnullval(v) && return nothing
-        if k == "sha"
-            s, p = json_string(v); sha[] = s; return p
-        elseif k == "ref"
-            s, p = json_string(v); ref[] = s; return p
-        end
-        return nothing
-    end
-    return GhCommit(sha[], ref[]), pos::Int
-end
 
 function json_make(::Type{GhPr}, x::LazyVal)
     head = Ref{Union{Nothing,GhCommit}}(nothing)
@@ -341,9 +299,6 @@ struct ItemsResp                       # Scan / Query
     Items::Union{Nothing,Vector{Item}}
     LastEvaluatedKey::Union{Nothing,Item}
 end
-struct ItemResp                        # GetItem
-    Item::Union{Nothing,Item}
-end
 
 function json_make(::Type{ItemsResp}, x::LazyVal)
     items = Ref{Union{Nothing,Vector{Item}}}(nothing)
@@ -369,35 +324,10 @@ function json_make(::Type{ItemsResp}, x::LazyVal)
     return ItemsResp(items[], last_key[]), pos::Int
 end
 
-function json_make(::Type{ItemResp}, x::LazyVal)
-    item = Ref{Union{Nothing,Item}}(nothing)
-    pos = JSON.applyobject(x) do k, v
-        isnullval(v) && return nothing
-        if k == "Item"
-            i, p = json_make(Item, v); item[] = i; return p
-        end
-        return nothing
-    end
-    return ItemResp(item[]), pos::Int
-end
 
 
-## run submission (mirrors PkgEvalFarm.create_run: one PutItem + one expand message)
+## run submission: config_json / create_run live in FarmLite (shared with the broker)
 
-isodate(t::DateTime=Dates.now(UTC)) = Dates.format(t, dateformat"yyyy-mm-dd\THH:MM:SS\Z")
-
-function new_run_id()
-    suffix = join(rand("0123456789abcdef", 6))
-    # a dateformat"" literal: `format` with a format *string* builds the DateFormat
-    # dynamically, which `juliac --trim` cannot resolve
-    Dates.format(Dates.now(UTC), dateformat"yyyymmdd-HHMMSS") * "-" * suffix
-end
-
-"Serialized `Configuration` the workers will reconstruct (modified settings only)."
-function config_json(name::String, julia::String; assertions::Bool)
-    flags = assertions ? "[\"LLVM_ASSERTIONS=1\",\"FORCE_ASSERTIONS=1\"]" : "[]"
-    "{\"name\":$(JSON.json(name)),\"julia\":$(JSON.json(julia)),\"buildflags\":$flags}"
-end
 
 ## unreliable packages
 #
@@ -445,50 +375,6 @@ and a backport could break it in the same way.
 pr_unreliable(packages, base) =
     isempty(packages) && base == "master" ? fetch_unreliable() : String[]
 
-"""
-    create_run(ctx; run_id, ...) -> created::Bool
-
-Create the run (single conditional `PutItem`) and enqueue its expand message.
-With a deterministic `run_id` (e.g. derived from the triggering comment id) the
-conditional put doubles as an idempotency gate: `false` means this run was
-already submitted by an earlier delivery of the same command. The expand message
-is (re-)sent either way — duplicates are harmless by design, and skipping it
-could strand a run whose first submission crashed between put and send.
-"""
-function create_run(ctx::LiteCtx; run_id::String=new_run_id(), configs_json::String,
-                    packages::Vector{String}, context_json::String, submitter::String,
-                    reuse::Bool=true, unreliable::Vector{String}=String[])
-    item = Item(
-        "run_id" => attr(run_id),
-        "created_at" => attr(isodate()),
-        "submitter" => attr(submitter),
-        "status" => attr("expanding"),
-        "configs" => attr(configs_json),
-        "packages" => attr(JSON.json(packages)),
-        "context" => attr(context_json),
-        "total_jobs" => attr(0),
-        "completed_jobs" => attr(0),
-        "reuse" => attr(reuse))
-    isempty(unreliable) || (item["unreliable"] = attr(JSON.json(unreliable)))
-    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-              "\"Item\":$(json_item(item))," *
-              "\"ConditionExpression\":\"attribute_not_exists(run_id)\"}"
-    created = try
-        ddb(ctx, "PutItem", payload)
-        true
-    catch err
-        is_conditional_failure(err) || rethrow()
-        false
-    end
-    if !created
-        # only rescue runs whose first submission crashed before the send; a
-        # run already past expansion doesn't need (churn-y) extra messages
-        str(get_run(ctx, run_id), "status") == "expanding" || return false
-    end
-    sqs_send_message(ctx, "{\"run_id\":$(JSON.json(run_id)),\"expand\":true}";
-                     queue_url=FarmLite.slow_queue(ctx))
-    return created
-end
 
 
 ## daily runs
@@ -1699,13 +1585,6 @@ function run_jobs(ctx::LiteCtx, run_id::String; slim::Bool=false)
     return jobs
 end
 
-function get_run(ctx::LiteCtx, run_id::String)
-    payload = "{\"TableName\":$(JSON.json(ctx.runs_table))," *
-              "\"Key\":{\"run_id\":{\"S\":$(JSON.json(run_id))}}}"
-    resp = parse_json(ddb(ctx, "GetItem", payload), ItemResp)
-    resp.Item === nothing && error("no such run: $run_id")
-    return something(resp.Item)
-end
 
 struct ConfigInfo
     name::Union{Nothing,String}

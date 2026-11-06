@@ -7,9 +7,13 @@ user token for short-lived, least-privilege AWS credentials:
     GET  /info   -> public config (OAuth client id, org/team names) for the CLI
     POST /creds  {"role": "worker"|"submitter"}, Authorization: Bearer <github token>
                  -> STS credentials + farm resource locations
+    GET  /submit?..., /submit/callback, /submit/review; POST /submit
+                 -> web submission: a person signs in with GitHub in the browser and
+                    confirms a run (websubmit.jl)
 
-Authorization is GitHub membership (checked with the caller's own token, so the
-broker itself holds no GitHub secrets), configured via `GITHUB_ORG`, `WORKER_TEAM`
+Authorization is GitHub membership (checked with the caller's own token; the
+broker's one GitHub secret is the OAuth app's client secret, which only the web
+flow uses), configured via `GITHUB_ORG`, `WORKER_TEAM`
 and `SUBMITTER_TEAM` and mapping to the IAM roles `WORKER_ROLE_ARN` /
 `SUBMITTER_ROLE_ARN`. A team spec is `"TEAM"` (a team in `GITHUB_ORG`),
 `"ORG/TEAM"` (a team in another org — the roles need not gate on the same org),
@@ -152,8 +156,11 @@ end
 
 ## GitHub
 
+# GITHUB_API overrides the base for tests (like STS_ENDPOINT)
+github_api() = get(ENV, "GITHUB_API", "https://api.github.com")::String
+
 function github_get(path::AbstractString, token::AbstractString)
-    http_request("GET", "https://api.github.com" * path;
+    http_request("GET", github_api() * path;
                  headers=["Authorization" => "Bearer $token",
                           "Accept" => "application/vnd.github+json",
                           "User-Agent" => "PkgEvalFarm-broker"])
@@ -458,13 +465,17 @@ struct FunctionUrlResponse
     statusCode::Int
     headers::Dict{String,String}
     body::String
+    cookies::Vector{String}  # Set-Cookie values (payload format 2.0 keeps them apart)
 end
+FunctionUrlResponse(statusCode::Int, headers::Dict{String,String}, body::String) =
+    FunctionUrlResponse(statusCode, headers, body, String[])
 
 # dict-style access, so callers (and the unit tests) can treat it like the JSON object
 function Base.getindex(r::FunctionUrlResponse, key::String)
     key == "statusCode" && return r.statusCode
     key == "headers" && return r.headers
     key == "body" && return r.body
+    key == "cookies" && return r.cookies
     throw(KeyError(key))
 end
 
@@ -501,8 +512,10 @@ struct EventRequestContext
 end
 struct LambdaEvent
     rawPath::Union{Nothing,String}
+    rawQueryString::Union{Nothing,String}
     requestContext::Union{Nothing,EventRequestContext}
     headers::Union{Nothing,Dict{String,String}}
+    cookies::Union{Nothing,Vector{String}}
     body::Union{Nothing,String}
     isBase64Encoded::Union{Nothing,Bool}
 end
@@ -531,8 +544,21 @@ function json_make(::Type{EventRequestContext}, x::LazyVal)
     return EventRequestContext(http[]), pos::Int
 end
 
+function json_string_vector(v::LazyVal)
+    jsontype(v) == JSON.JSONTypes.ARRAY || json_expected("array of strings")
+    out = String[]
+    pos = JSON.applyarray(v) do i, val
+        s, p = json_string(val)
+        push!(out, s)
+        return p
+    end
+    return out, pos::Int
+end
+
 function json_make(::Type{LambdaEvent}, x::LazyVal)
     rawPath = Ref{Union{Nothing,String}}(nothing)
+    rawQueryString = Ref{Union{Nothing,String}}(nothing)
+    cookies = Ref{Union{Nothing,Vector{String}}}(nothing)
     requestContext = Ref{Union{Nothing,EventRequestContext}}(nothing)
     headers = Ref{Union{Nothing,Dict{String,String}}}(nothing)
     body = Ref{Union{Nothing,String}}(nothing)
@@ -541,6 +567,10 @@ function json_make(::Type{LambdaEvent}, x::LazyVal)
         isnullval(v) && return nothing
         if k == "rawPath"
             s, p = json_string(v); rawPath[] = s; return p
+        elseif k == "rawQueryString"
+            s, p = json_string(v); rawQueryString[] = s; return p
+        elseif k == "cookies"
+            c, p = json_string_vector(v); cookies[] = c; return p
         elseif k == "requestContext"
             c, p = json_make(EventRequestContext, v); requestContext[] = c; return p
         elseif k == "headers"
@@ -552,8 +582,8 @@ function json_make(::Type{LambdaEvent}, x::LazyVal)
         end
         return nothing
     end
-    return LambdaEvent(rawPath[], requestContext[], headers[], body[],
-                       isBase64Encoded[]), pos::Int
+    return LambdaEvent(rawPath[], rawQueryString[], requestContext[], headers[], cookies[],
+                       body[], isBase64Encoded[]), pos::Int
 end
 
 # accessors shared between the raw-Dict event form (kept for interactive use and the
@@ -567,6 +597,18 @@ event_auth(event::AbstractDict) = begin
 end
 event_body(event::AbstractDict) = something(get(event, "body", ""), "")
 event_isbase64(event::AbstractDict) = get(event, "isBase64Encoded", false)
+event_query(event::AbstractDict) = something(get(event, "rawQueryString", ""), "")
+function event_header(event::AbstractDict, name::String)::Union{Nothing,String}
+    v = get(get(event, "headers", Dict()), name, nothing)
+    return v === nothing ? nothing : String(v)
+end
+function event_cookies(event::AbstractDict)
+    cookies = String[String(c) for c in get(event, "cookies", String[])]
+    headers = get(event, "headers", Dict())
+    header = get(headers, "cookie", get(headers, "Cookie", nothing))
+    header === nothing || push!(cookies, String(header))
+    return cookies
+end
 
 function event_method(event::LambdaEvent)
     requestContext = event.requestContext
@@ -583,6 +625,14 @@ function event_auth(event::LambdaEvent)
 end
 event_body(event::LambdaEvent) = something(event.body, "")
 event_isbase64(event::LambdaEvent) = something(event.isBase64Encoded, false)
+event_query(event::LambdaEvent) = something(event.rawQueryString, "")
+# payload format 2.0 lowercases header names
+function event_header(event::LambdaEvent, name::String)::Union{Nothing,String}
+    headers = event.headers
+    headers === nothing && return nothing
+    return get(headers, name, nothing)
+end
+event_cookies(event::LambdaEvent) = something(event.cookies, String[])
 
 "Handle one Lambda Function URL event, returning the Function URL response."
 function handle_event(event::Union{AbstractDict,LambdaEvent})
@@ -595,6 +645,8 @@ function handle_event(event::Union{AbstractDict,LambdaEvent})
             env("WORKER_TEAM"), env("SUBMITTER_TEAM")))
     elseif method == "POST" && path == "/creds"
         return handle_creds(event)
+    elseif path == "/submit" || path == "/submit/callback" || path == "/submit/review"
+        return handle_web(String(method), String(path), event)
     end
     return error_response(404, "not found")
 end
@@ -621,6 +673,34 @@ function json_make(::Type{RoleRequest}, x::LazyVal)
     return RoleRequest(role[]), pos::Int
 end
 
+"""
+    check_role(token, role) -> (login | nothing, status, message)
+
+Whether the token's user holds `role` (GitHub membership, checked with their own
+token). On refusal, the HTTP status and a message to show them.
+"""
+function check_role(token::String, role::String)::Tuple{Union{Nothing,String},Int,String}
+    requirement = role_requirement(role)
+    requirement === nothing && return (nothing, 400, "unknown role: $role")
+    org, team = something(requirement)
+
+    user = github_user(token)
+    user === nothing && return (nothing, 401, "invalid GitHub token")
+    login = something(user)
+    if team === nothing
+        org_member(token, org) ||
+            return (nothing, 403,
+                "@$login is not a member of the $org organization; membership " *
+                "(with the token granted read:org) is required for the '$role' role")
+    else
+        team_member(token, org, something(team)) ||
+            return (nothing, 403,
+                "@$login is not a member of $org/$(something(team)); membership in that " *
+                "team (with the token granted read:org) is required for the '$role' role")
+    end
+    return (login, 200, "")
+end
+
 function handle_creds(event)
     token = bearer_token(event)
     token === nothing && return error_response(401, "missing Authorization header")
@@ -634,23 +714,9 @@ function handle_creds(event)
     catch
         return error_response(400, "request body must be {\"role\": \"worker\"|\"submitter\"}")
     end
-    requirement = role_requirement(role)
-    requirement === nothing && return error_response(400, "unknown role: $role")
-    org, team = something(requirement)
-
-    user = github_user(token)
-    user === nothing && return error_response(401, "invalid GitHub token")
-    if team === nothing
-        org_member(token, org) ||
-            return error_response(403,
-                "@$user is not a member of the $org organization; membership " *
-                "(with the token granted read:org) is required for the '$role' role")
-    else
-        team_member(token, org, something(team)) ||
-            return error_response(403,
-                "@$user is not a member of $org/$(something(team)); membership in that " *
-                "team (with the token granted read:org) is required for the '$role' role")
-    end
+    checked, status, message = check_role(something(token), role)
+    checked === nothing && return error_response(status, message)
+    user = something(checked)
 
     duration = parse(Int, get(ENV, "CRED_DURATION", "3600"))
     credentials = assume_role(role_arn(role), user; duration)
@@ -741,5 +807,7 @@ function resp_header(resp::Downloads.Response, name::String)
     end
     error("missing $name header from the Lambda runtime API")
 end
+
+include("websubmit.jl")
 
 end # module

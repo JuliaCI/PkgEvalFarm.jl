@@ -80,6 +80,37 @@ bin/farm status <run-id>
 bin/farm report <run-id>    # aggregate results into a Nanosoldier-style report
 ```
 
+### From a browser (no farm login)
+
+The broker also takes submissions as a link, so that tools without farm credentials
+(an AI agent in a sandbox, a script, a chat message) only have to produce a URL:
+
+```
+https://pkgeval.julialang.org/submit?primary=JuliaLang/julia%23master&against=1.12.0&packages=Example,JSON&request=<fresh random id>
+```
+
+Opening it signs you in with GitHub (the farm's OAuth app, and the same membership
+check as `farm submit`), pins branch and tag refs to commits, and shows what would
+run. Nothing is submitted until you tick the confirmation box and click **Submit**.
+The run is created in your name as `web-<request>`, so whoever made the link knows
+the run id in advance, and a second click queues nothing new. Use a fresh random
+`request` for every link: a request id another link already used is refused.
+`farm submit --web ...` prints such a link.
+
+| Parameter | |
+|---|---|
+| `primary` | the Julia to evaluate: `nightly`, `stable`, a version (`1.12.0`), or `JuliaLang/julia#<ref>` |
+| `against` | optional Julia to compare with, in the same forms |
+| `packages` | comma-separated package names (at most 300); all compatible packages when absent |
+| `assertions` | `true` for assertions builds (JuliaLang/julia commits only; a version means its release tag) |
+| `fresh_baseline` | `true` re-evaluates `against` even when an earlier run's results would match |
+| `request` | 8–64 characters of `[A-Za-z0-9_-]`, naming the run `web-<request>`; generated when absent |
+
+Progress and the report are at `https://pkgeval-reports.julialang.org/?run=web-<request>`.
+The sign-in asks for `read:org` and `read:user`; the extra scope only keeps these
+short-lived tokens (revoked right after the membership check) apart from `farm
+login`'s, since GitHub keeps at most ten tokens per user, app and scope set.
+
 ## Job lifecycle
 
 1. `submit` writes the `runs` item and batch-writes `jobs` items (status `pending`),
@@ -106,8 +137,11 @@ scale within the machine via `--ninstances`.
 ## Deploying
 
 1. Create a **GitHub OAuth app** (Settings → Developer settings → OAuth Apps) for the
-   farm. Enable *Device Flow*; no callback URL or client secret is needed — the broker
-   never holds GitHub secrets. Note the client id.
+   farm. Enable *Device Flow* and note the client id; that is all the CLI needs. For
+   [web submission](#from-a-browser-no-farm-login), also set the *Authorization
+   callback URL* to `https://pkgeval.julialang.org/submit/callback`, generate a client
+   secret, and store it in SSM after the first apply (`terraform/web_submit.tf`);
+   until then `/submit` answers 503. It is the broker's only GitHub secret.
 2. Create the two GitHub teams (default `pkgeval-workers` and `pkgeval-submitters`) in
    your org. Membership in these teams is what authorizes people; enrolling a new
    worker operator is just a team invite.
