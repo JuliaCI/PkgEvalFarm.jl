@@ -18,7 +18,9 @@ const CLI_HELP = """
       bot      [--interval SECS] [--name NAME]    run the @pkgeval bot
 
     The broker URL can also be set via PKGEVAL_FARM_BROKER. Julia SPECs are release
-    names ("nightly", "v1.12.0") or repo specs ("JuliaLang/julia#0123abc").
+    names ("nightly", "v1.12.0") or repo specs ("JuliaLang/julia#0123abc"); a spec
+    naming a fork of JuliaLang/julia ("Owner/julia#branch") is pinned to the commit
+    the ref points at, which CI can build like any JuliaLang/julia commit.
     """
 
 function cli_main(args::Vector{String}=ARGS)
