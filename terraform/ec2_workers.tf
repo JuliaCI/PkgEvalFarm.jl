@@ -96,8 +96,9 @@ resource "aws_iam_role_policy" "ec2_worker_fleet" {
     Version = "2012-10-17"
     Statement = [
       {
+        # SetInstanceHealth: a worker whose disk fills up has itself replaced
         Effect   = "Allow"
-        Action   = "autoscaling:SetInstanceProtection"
+        Action   = ["autoscaling:SetInstanceProtection", "autoscaling:SetInstanceHealth"]
         Resource = "arn:aws:autoscaling:${var.region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${var.name_prefix}-ec2-worker"
       },
       {

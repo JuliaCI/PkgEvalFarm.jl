@@ -291,6 +291,18 @@ function sandbox_loss(log::AbstractString)
     return nothing
 end
 
+# Errors from the host's disk filling up; they say nothing about the package
+const HOST_DISK_FULL = (r"no space left on device"i, r"MDB_SHORT_WRITE")
+
+"An error in `log` showing the host ran out of disk, or `nothing`."
+function host_disk_full(log::AbstractString)
+    for pat in HOST_DISK_FULL
+        m = match(pat, log)
+        m === nothing || return String(m.match)
+    end
+    return nothing
+end
+
 # error_line heuristics, mirroring the log-tail highlighting in site/index.html
 # (analyzeTail): crash-class markers trump the first ERROR: line, which in turn
 # trumps a plain test failure location

@@ -294,6 +294,10 @@ function run_worker(; broker::Union{AbstractString,Nothing}=nothing,
     # so overcommit can never bleed into test/expand claims. Dies with `work`.
     spill_receiver = errormonitor(@async begin
         while nspill > 0 && !draining[] && isopen(work)
+            if fleet !== nothing && fleet.disk_full
+                sleep(30)
+                continue
+            end
             take!(spill_tokens)
             claimed = try
                 draining[] ? nothing : claim_seal_job(ctx)
@@ -418,6 +422,28 @@ Base.@kwdef mutable struct FleetDrain
     draining::Bool = false
     protected::Bool = true    # ASG launches instances protected
     last_check::Float64 = 0.0
+    disk_full::Bool = false
+    replaced::Bool = false
+end
+
+# The caches every job on a host shares (compilecaches, package and artifact
+# stores, sealed artifacts) only grow while the worker runs, and a full disk
+# fails jobs in ways that look like package failures. Below this much free
+# space the host stops taking work and is replaced once idle.
+disk_floor(total) = something(tryparse(Int, get(ENV, "PKGEVAL_DISK_FLOOR_GB", "")),
+                              max(40, total ÷ 10 ÷ 2^30)) * Int64(2)^30
+
+function disk_low()
+    for path in (tempdir(), DEPOT_PATH[1], get(ENV, "PKGEVAL_SEAL_CACHE", ""))
+        isdir(path) || continue
+        st = try
+            Base.diskstat(path)
+        catch
+            continue
+        end
+        st.available < disk_floor(st.total) && return true
+    end
+    return false
 end
 
 function fleet_drain_init(slots::Int)
@@ -558,6 +584,10 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
     now = time()
     if now - fleet.last_check >= 60
         fleet.last_check = now
+        if !fleet.disk_full && disk_low()
+            @warn "disk space is low; no longer claiming, and replacing this host once idle"
+            fleet.disk_full = true
+        end
         heartbeat_generation(ctx)
         try
             backlog = visible_backlog(ctx)
@@ -585,6 +615,19 @@ function pause_claiming!(ctx::FarmCtx, fleet::Union{FleetDrain,Nothing}, busy::I
         end
     catch err
         @warn "failed to update scale-in protection" err
+    end
+    if fleet.disk_full
+        if busy == 0 && !fleet.replaced
+            try
+                Auto_Scaling.set_instance_health("Unhealthy", fleet.instance_id;
+                                                 aws_config=ctx.aws)
+                fleet.replaced = true
+                @info "idle with a full disk; marked unhealthy for replacement"
+            catch err
+                @warn "failed to mark this host unhealthy" err
+            end
+        end
+        return true
     end
     return fleet.draining
 end
@@ -1025,6 +1068,9 @@ function process_job(ctx::FarmCtx, claimed::ClaimedJob, cpu::Int,
             lost = sandbox_loss(something(logtext, ""))
             lost === nothing ||
                 error("the sandbox lost its files: " * lost * "\n" * last(something(logtext, ""), 1000))
+            full = host_disk_full(something(logtext, ""))
+            full === nothing ||
+                error("the host ran out of disk: " * full * "\n" * last(something(logtext, ""), 1000))
         end
         JobResult(; status=String(r.status),
                   reason=refine_skip_reason(r.reason === missing ? nothing : String(r.reason), logtext),
