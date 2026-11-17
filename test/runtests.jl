@@ -333,6 +333,14 @@ end
         @test PEF.sandbox_loss("ERROR: could not load library \"/opt/julia/bin/../lib/julia/libLLVM-17jl.so\"") === nothing
         @test PEF.sandbox_loss("IOError: readdir(\"/opt/julia/share/julia/test/data\"): no such file or directory (ENOENT)") === nothing
         @test PEF.sandbox_loss("") === nothing
+        # lines from gh-6915896280, where hosts filled their disks
+        for line in ("ERROR: LoadError: SystemError: close: No space left on device",
+                     "ERROR: LoadError: objcache error (28): No space left on device",
+                     "ERROR: LoadError: IOError: write: no space left on device (ENOSPC)",
+                     "ERROR: LoadError: objcache error (-30793): MDB_SHORT_WRITE: Fewer bytes were written than requested")
+            @test PEF.host_disk_full("Precompiling packages...\n" * line * "\nStacktrace:") !== nothing
+        end
+        @test PEF.host_disk_full("Test Failed at /home/pkgeval/test.jl:3") === nothing
     end
 
     @testset "sig_hash" begin
