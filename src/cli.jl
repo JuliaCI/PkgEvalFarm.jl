@@ -9,10 +9,13 @@ const CLI_HELP = """
       login    [--broker URL]                     enroll this machine (GitHub device flow)
       worker   [--broker URL] [--ninstances N] [--once]
                                                   evaluate jobs from the queue
-      submit   --primary SPEC [--against SPEC] [--assertions] [--fresh-baseline] [PKG...]
+      submit   --primary SPEC [--against SPEC] [--assertions] [--fresh-baseline] [--web] [PKG...]
                                                   submit a run (all packages if none given);
                                                   --fresh-baseline re-evaluates the against
-                                                  side even when reusable results exist
+                                                  side even when reusable results exist;
+                                                  --web prints a link that submits the run
+                                                  once a member signs in and confirms it
+                                                  (no farm login needed)
       status   RUN_ID                             show run progress
       report   RUN_ID                             aggregate, upload and print the report
       bot      [--interval SECS] [--name NAME]    run the @pkgeval bot
@@ -29,7 +32,7 @@ function cli_main(args::Vector{String}=ARGS)
     # split --flag [value] options from positional arguments
     options = Dict{String,String}()
     positional = String[]
-    flags = Set(["--once", "--assertions", "--fresh-baseline"])
+    flags = Set(["--once", "--assertions", "--fresh-baseline", "--web"])
     i = 1
     while i <= length(rest)
         arg = rest[i]
@@ -54,6 +57,19 @@ function cli_main(args::Vector{String}=ARGS)
                    once=haskey(options, "--once"))
     elseif command == "submit"
         haskey(options, "--primary") || error("submit requires --primary")
+        if haskey(options, "--web")
+            link = web_submit_url(options["--primary"];
+                                  against=get(options, "--against", nothing),
+                                  packages=positional,
+                                  assertions=haskey(options, "--assertions"),
+                                  fresh_baseline=haskey(options, "--fresh-baseline"),
+                                  broker=something(broker, broker_url()))
+            println(link.url)
+            println(stderr, "Open the link to review and submit the run (GitHub sign-in). ",
+                    "Once submitted it is run $(link.run_id): ",
+                    "https://pkgeval-reports.julialang.org/?run=$(link.run_id)")
+            return 0
+        end
         buildflags = haskey(options, "--assertions") ?
             ["LLVM_ASSERTIONS=1", "FORCE_ASSERTIONS=1"] : String[]
         configs = build_configs(options["--primary"];

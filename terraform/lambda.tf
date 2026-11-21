@@ -65,6 +65,10 @@ resource "aws_lambda_function" "broker" {
       PKGEVAL_JOBS_TABLE             = aws_dynamodb_table.jobs.name
       PKGEVAL_BUCKET                 = aws_s3_bucket.results.bucket
       FARM_REGION                    = var.region
+      # web submission (web_submit.tf): where the client secret lives, and the
+      # broker's public origin for the OAuth redirect
+      GITHUB_CLIENT_SECRET_PARAM = var.github_client_secret_parameter
+      PUBLIC_URL                 = var.broker_domain == "" ? "" : "https://${var.broker_domain}"
     }
   }
 }

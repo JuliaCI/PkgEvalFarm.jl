@@ -45,6 +45,12 @@ variable "github_client_id" {
   default     = "Ov23lizNGZDa3XiWu3jh"
 }
 
+variable "github_client_secret_parameter" {
+  description = "SSM SecureString holding the OAuth app's client secret, needed only for web submission (broker /submit); see web_submit.tf. Empty disables web submission."
+  type        = string
+  default     = "/pkgeval/github-client-secret"
+}
+
 variable "cred_duration_seconds" {
   description = "Duration (in seconds) of the temporary AWS credentials the broker vends."
   type        = number
